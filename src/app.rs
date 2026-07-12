@@ -1903,11 +1903,19 @@ impl App {
             return;
         }
         let Some(path) = self.editor.path.as_ref() else { self.message = "Save the buffer before using LSP".to_string(); return };
-        let params = json!({
+        let mut params = json!({
             "textDocument": { "uri": lsp::file_uri(path) },
-            "position": { "line": self.editor.cursor.line, "character": self.editor.cursor.column },
-            "context": { "includeDeclaration": true, "diagnostics": [] }
+            "position": { "line": self.editor.cursor.line, "character": self.editor.cursor.column }
         });
+        if method == "textDocument/references" {
+            params["context"] = json!({ "includeDeclaration": true });
+        } else if method == "textDocument/codeAction" {
+            params["range"] = json!({
+                "start": { "line": self.editor.cursor.line, "character": self.editor.cursor.column },
+                "end": { "line": self.editor.cursor.line, "character": self.editor.cursor.column }
+            });
+            params["context"] = json!({ "diagnostics": [] });
+        }
         match self.lsp.as_mut().ok_or_else(|| "Start LSP first with :lsp".to_string()).and_then(|client| client.request(method, params).map_err(|error| error.to_string())) {
             Ok(id) => {
                 self.lsp_requests.insert(id, method.to_string());
