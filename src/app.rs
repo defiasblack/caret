@@ -1932,10 +1932,12 @@ impl App {
         }
         if request.as_deref() == Some("textDocument/definition") {
             let location = message["result"].as_array().and_then(|locations| locations.first()).unwrap_or(&message["result"]);
+            let uri = location["uri"].as_str().or_else(|| location["targetUri"].as_str());
+            let range = if location["range"].is_object() { &location["range"] } else { &location["targetSelectionRange"] };
             if let (Some(uri), Some(line), Some(character)) = (
-                location["uri"].as_str(),
-                location["range"]["start"]["line"].as_u64(),
-                location["range"]["start"]["character"].as_u64(),
+                uri,
+                range["start"]["line"].as_u64(),
+                range["start"]["character"].as_u64(),
             ) {
                 let path = PathBuf::from(uri.trim_start_matches("file:///").replace("%20", " "));
                 match self.editor.open_or_switch(&path) {
