@@ -8,6 +8,9 @@ use crate::theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     Rust,
+    Go,
+    CSharp,
+    Yaml,
     Json,
     Toml,
     Markdown,
@@ -30,6 +33,9 @@ impl Language {
 
         match extension.as_str() {
             "rs" => Self::Rust,
+            "go" => Self::Go,
+            "cs" => Self::CSharp,
+            "yaml" | "yml" => Self::Yaml,
             "json" | "jsonc" => Self::Json,
             "toml" => Self::Toml,
             "md" | "markdown" => Self::Markdown,
@@ -42,6 +48,9 @@ impl Language {
     pub fn name(self) -> &'static str {
         match self {
             Self::Rust => "Rust",
+            Self::Go => "Go",
+            Self::CSharp => "C#",
+            Self::Yaml => "YAML",
             Self::Json => "JSON",
             Self::Toml => "TOML",
             Self::Markdown => "Markdown",
@@ -53,8 +62,8 @@ impl Language {
 
     pub fn comment_delimiters(self) -> Option<(&'static str, Option<&'static str>)> {
         match self {
-            Self::Rust | Self::Json => Some(("//", None)),
-            Self::Toml | Self::Python | Self::Shell => Some(("#", None)),
+            Self::Rust | Self::Go | Self::CSharp | Self::Json => Some(("//", None)),
+            Self::Yaml | Self::Toml | Self::Python | Self::Shell => Some(("#", None)),
             Self::Markdown => Some(("<!--", Some("-->"))),
             Self::Plain => None,
         }
@@ -79,8 +88,8 @@ pub fn highlight_line(line: &str, language: Language, theme: &Theme) -> Vec<Colo
     }
 
     let comment_marker = match language {
-        Language::Rust | Language::Json => Some("//"),
-        Language::Toml | Language::Python | Language::Shell => Some("#"),
+        Language::Rust | Language::Go | Language::CSharp | Language::Json => Some("//"),
+        Language::Yaml | Language::Toml | Language::Python | Language::Shell => Some("#"),
         _ => None,
     };
 
@@ -206,6 +215,9 @@ fn apply_tree_sitter_highlights(line: &str, language: Language, theme: &Theme, c
 fn tree_sitter_language(language: Language) -> Option<TreeLanguage> {
     match language {
         Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+        Language::Go => Some(tree_sitter_go::LANGUAGE.into()),
+        Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        Language::Yaml => Some(tree_sitter_yaml::LANGUAGE.into()),
         Language::Json => Some(tree_sitter_json::LANGUAGE.into()),
         Language::Toml => Some(tree_sitter_toml_ng::LANGUAGE.into()),
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
@@ -451,6 +463,9 @@ mod tests {
     fn configured_tree_sitter_languages_parse_valid_source() {
         for (language, source) in [
             (Language::Rust, "fn main() { let value: u32 = 42; }"),
+            (Language::Go, "package main\nfunc main() { value := 42; _ = value }"),
+            (Language::CSharp, "class Program { static void Main() { var value = 42; } }"),
+            (Language::Yaml, "value: 42\nitems:\n  - one"),
             (Language::Json, r#"{"value": 42}"#),
             (Language::Toml, "value = 42"),
             (Language::Python, "def main():\n    return 42"),

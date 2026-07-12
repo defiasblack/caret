@@ -16,7 +16,7 @@ undo/redo.
 - `Ctrl-B` shows or hides the file tree
 - Rope-based text storage for efficient editing of large files
 - Normal and Insert modes
-- Tree-sitter parsing and syntax coloring for Rust, JSON, TOML, Python, and shell files
+- Tree-sitter parsing and syntax coloring for Rust, Go, C#, YAML, JSON, TOML, Python, and shell files
 - Incremental search with match highlighting
 - Undo and redo
 - Grouped undo for consecutive typing and deletion, split by navigation
