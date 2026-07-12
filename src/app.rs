@@ -103,6 +103,7 @@ pub struct App {
     lsp_requests: HashMap<u64, String>,
     lsp_initialized: bool,
     lsp_workspace_ready: bool,
+    lsp_last_text: String,
 }
 
 impl App {
@@ -181,6 +182,7 @@ impl App {
             lsp_requests: HashMap::new(),
             lsp_initialized: false,
             lsp_workspace_ready: false,
+            lsp_last_text: String::new(),
         })
     }
 
@@ -1843,6 +1845,7 @@ impl App {
                 self.lsp = Some(client);
                 self.lsp_initialized = false;
                 self.lsp_workspace_ready = server != "csharp-ls";
+                self.lsp_last_text.clear();
                 self.message = format!("Starting LSP: {server}");
             }
             Err(error) => self.message = format!("Could not start {server}: {error}"),
@@ -1882,11 +1885,16 @@ impl App {
         let Some(lsp) = &self.lsp else { return };
         if !self.lsp_initialized { return };
         let Some(path) = self.editor.path.as_ref() else { return };
+        let text = self.editor.text();
+        if text == self.lsp_last_text {
+            return;
+        }
         self.lsp_version += 1;
         let _ = lsp.notify("textDocument/didChange", json!({
             "textDocument": { "uri": lsp::file_uri(path), "version": self.lsp_version },
-            "contentChanges": [{ "text": self.editor.text() }]
+            "contentChanges": [{ "text": text }]
         }));
+        self.lsp_last_text = self.editor.text();
     }
 
     fn request_lsp_position(&mut self, method: &str) {
@@ -1974,6 +1982,7 @@ impl App {
             let language_id = lsp_language_id(crate::syntax::Language::from_path(Some(path)));
             if lsp.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lsp::file_uri(path), "languageId": language_id, "version": 1, "text": self.editor.text() } })).is_ok() {
                 self.lsp_initialized = true;
+                self.lsp_last_text = self.editor.text();
                 self.message = if self.lsp_workspace_ready {
                     "LSP ready".to_string()
                 } else {

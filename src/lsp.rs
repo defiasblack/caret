@@ -49,11 +49,13 @@ impl LspClient {
                 "workspace": { "configuration": true, "workspaceFolders": true },
                 "window": { "workDoneProgress": true },
                 "textDocument": {
+                    "definition": { "linkSupport": true },
                     "hover": { "contentFormat": ["plaintext", "markdown"] },
                     "publishDiagnostics": { "relatedInformation": true }
                 }
             }
         }))?;
+        client.next_id = 1_000;
         Ok(client)
     }
 
