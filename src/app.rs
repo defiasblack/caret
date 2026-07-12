@@ -1923,7 +1923,7 @@ impl App {
                 return;
             }
             let Some(path) = self.editor.path.as_ref() else { return };
-            let language_id = crate::syntax::Language::from_path(Some(path)).name().to_ascii_lowercase();
+            let language_id = lsp_language_id(crate::syntax::Language::from_path(Some(path)));
             if lsp.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lsp::file_uri(path), "languageId": language_id, "version": 1, "text": self.editor.text() } })).is_ok() {
                 self.lsp_initialized = true;
                 self.message = "LSP ready".to_string();
@@ -2083,6 +2083,21 @@ fn lsp_workspace_root(path: &Path) -> Option<PathBuf> {
             return None;
         }
         directory = parent;
+    }
+}
+
+fn lsp_language_id(language: crate::syntax::Language) -> &'static str {
+    match language {
+        crate::syntax::Language::CSharp => "csharp",
+        crate::syntax::Language::Go => "go",
+        crate::syntax::Language::Rust => "rust",
+        crate::syntax::Language::Python => "python",
+        crate::syntax::Language::Json => "json",
+        crate::syntax::Language::Yaml => "yaml",
+        crate::syntax::Language::Toml => "toml",
+        crate::syntax::Language::Shell => "shellscript",
+        crate::syntax::Language::Markdown => "markdown",
+        crate::syntax::Language::Plain => "plaintext",
     }
 }
 
