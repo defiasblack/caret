@@ -360,6 +360,103 @@ fn is_keyword(language: Language, token: &str) -> bool {
                 | "while"
                 | "yield"
         ),
+        Language::CSharp => matches!(
+            token,
+            "abstract"
+                | "as"
+                | "async"
+                | "await"
+                | "base"
+                | "break"
+                | "case"
+                | "catch"
+                | "checked"
+                | "class"
+                | "const"
+                | "continue"
+                | "default"
+                | "delegate"
+                | "do"
+                | "else"
+                | "enum"
+                | "event"
+                | "explicit"
+                | "extern"
+                | "finally"
+                | "fixed"
+                | "for"
+                | "foreach"
+                | "goto"
+                | "if"
+                | "implicit"
+                | "in"
+                | "interface"
+                | "internal"
+                | "is"
+                | "lock"
+                | "namespace"
+                | "new"
+                | "operator"
+                | "out"
+                | "override"
+                | "params"
+                | "private"
+                | "protected"
+                | "public"
+                | "readonly"
+                | "ref"
+                | "return"
+                | "sealed"
+                | "sizeof"
+                | "stackalloc"
+                | "static"
+                | "struct"
+                | "switch"
+                | "this"
+                | "throw"
+                | "try"
+                | "typeof"
+                | "unchecked"
+                | "unsafe"
+                | "using"
+                | "virtual"
+                | "void"
+                | "volatile"
+                | "while"
+                | "yield"
+                | "true"
+                | "false"
+                | "null"
+        ),
+        Language::Go => matches!(
+            token,
+            "break"
+                | "case"
+                | "chan"
+                | "const"
+                | "continue"
+                | "default"
+                | "defer"
+                | "else"
+                | "fallthrough"
+                | "for"
+                | "func"
+                | "go"
+                | "goto"
+                | "if"
+                | "import"
+                | "interface"
+                | "map"
+                | "package"
+                | "range"
+                | "return"
+                | "select"
+                | "struct"
+                | "switch"
+                | "type"
+                | "var"
+        ),
+        Language::Yaml => matches!(token, "true" | "false" | "null" | "yes" | "no"),
         Language::Json => matches!(token, "true" | "false" | "null"),
         Language::Toml => matches!(token, "true" | "false"),
         Language::Python => matches!(
@@ -450,6 +547,52 @@ fn is_type_name(language: Language, token: &str) -> bool {
                 | "Result"
                 | "Box"
         ),
+        Language::CSharp => matches!(
+            token,
+            "bool"
+                | "byte"
+                | "char"
+                | "decimal"
+                | "double"
+                | "dynamic"
+                | "float"
+                | "int"
+                | "long"
+                | "object"
+                | "sbyte"
+                | "short"
+                | "string"
+                | "uint"
+                | "ulong"
+                | "ushort"
+                | "var"
+                | "DateTime"
+                | "Guid"
+                | "Task"
+        ),
+        Language::Go => matches!(
+            token,
+            "bool"
+                | "byte"
+                | "complex64"
+                | "complex128"
+                | "error"
+                | "float32"
+                | "float64"
+                | "int"
+                | "int8"
+                | "int16"
+                | "int32"
+                | "int64"
+                | "rune"
+                | "string"
+                | "uint"
+                | "uint8"
+                | "uint16"
+                | "uint32"
+                | "uint64"
+                | "uintptr"
+        ),
         Language::Python => false,
         _ => false,
     }
@@ -478,5 +621,19 @@ mod tests {
             let tree = parser.parse(source, None).expect("parse source");
             assert!(!tree.root_node().has_error(), "{language:?}");
         }
+    }
+
+    #[test]
+    fn csharp_keywords_are_colored_as_keywords() {
+        let theme = Theme::for_kind(crate::theme::ThemeKind::Oxide);
+        let line = "public class CustomsValueService { private double value; }";
+        let colors = highlight_line(line, Language::CSharp, &theme);
+
+        for keyword in ["public", "class", "private"] {
+            let index = line.find(keyword).expect("keyword index");
+            assert_eq!(colors[index], theme.keyword, "{keyword}");
+        }
+        let type_index = line.find("double").expect("type index");
+        assert_eq!(colors[type_index], theme.type_name);
     }
 }
