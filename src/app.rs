@@ -1914,13 +1914,33 @@ impl App {
         let Some(lsp) = &self.lsp else {
             return;
         };
-        let mut latest = None;
-        while let Some(message) = lsp.try_recv() {
-            latest = Some(message);
-        }
-        let Some(message) = latest else {
+        let Some(message) = lsp.try_recv() else {
             return;
         };
+        if let (Some(id), Some(method)) = (
+            message.get("id"),
+            message.get("method").and_then(|method| method.as_str()),
+        ) {
+            let result = match method {
+                "workspace/configuration" => {
+                    let count = message["params"]["items"].as_array().map_or(0, Vec::len);
+                    json!(vec![json!({}); count])
+                }
+                "workspace/workspaceFolders" => {
+                    let root = self.editor.path.as_deref().and_then(lsp_workspace_root).unwrap_or_else(|| self.project.root.clone());
+                    json!([{
+                        "uri": lsp::file_uri(&root),
+                        "name": root.file_name().and_then(|name| name.to_str()).unwrap_or("workspace")
+                    }])
+                }
+                "client/registerCapability" | "client/unregisterCapability" | "window/workDoneProgress/create" => json!(null),
+                _ => json!(null),
+            };
+            if let Some(lsp) = &self.lsp {
+                let _ = lsp.respond(id, result);
+            }
+            return;
+        }
         let request = message.get("id").and_then(|id| id.as_u64()).and_then(|id| self.lsp_requests.remove(&id));
         if message.get("id").and_then(|id| id.as_u64()) == Some(1) {
             let Some(lsp) = &self.lsp else { return };

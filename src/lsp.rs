@@ -38,7 +38,10 @@ impl LspClient {
         client.request("initialize", json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
+            "workspaceFolders": [{ "uri": root_uri, "name": root.file_name().and_then(|name| name.to_str()).unwrap_or("workspace") }],
             "capabilities": {
+                "workspace": { "configuration": true, "workspaceFolders": true },
+                "window": { "workDoneProgress": true },
                 "textDocument": {
                     "hover": { "contentFormat": ["plaintext", "markdown"] },
                     "publishDiagnostics": { "relatedInformation": true }
@@ -57,6 +60,10 @@ impl LspClient {
 
     pub fn notify(&self, method: &str, params: Value) -> io::Result<()> {
         self.write(json!({"jsonrpc": "2.0", "method": method, "params": params}))
+    }
+
+    pub fn respond(&self, id: &Value, result: Value) -> io::Result<()> {
+        self.write(json!({"jsonrpc": "2.0", "id": id, "result": result}))
     }
 
     pub fn try_recv(&self) -> Option<Value> {
