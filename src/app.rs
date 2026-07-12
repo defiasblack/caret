@@ -100,6 +100,7 @@ pub struct App {
     last_editor_click: Option<(Instant, Cursor)>,
     lsp: Option<LspClient>,
     lsp_version: i64,
+    lsp_requests: HashMap<u64, String>,
 }
 
 impl App {
@@ -175,6 +176,7 @@ impl App {
             last_editor_click: None,
             lsp: None,
             lsp_version: 1,
+            lsp_requests: HashMap::new(),
         })
     }
 
@@ -1863,7 +1865,10 @@ impl App {
             "textDocument": { "uri": lsp::file_uri(path) },
             "position": { "line": self.editor.cursor.line, "character": self.editor.cursor.column }
         })) {
-            Ok(_) => self.message = "Hover requested".to_string(),
+            Ok(id) => {
+                self.lsp_requests.insert(id, "hover".to_string());
+                self.message = "Hover requested".to_string();
+            }
             Err(error) => self.message = format!("Hover request failed: {error}"),
         }
     }
@@ -1886,7 +1891,10 @@ impl App {
             "context": { "includeDeclaration": true, "diagnostics": [] }
         });
         match self.lsp.as_mut().ok_or_else(|| "Start LSP first with :lsp".to_string()).and_then(|client| client.request(method, params).map_err(|error| error.to_string())) {
-            Ok(_) => self.message = format!("LSP request: {method}"),
+            Ok(id) => {
+                self.lsp_requests.insert(id, method.to_string());
+                self.message = format!("LSP request: {method}");
+            }
             Err(error) => self.message = error,
         }
     }
@@ -1895,7 +1903,10 @@ impl App {
         let Some(path) = self.editor.path.as_ref() else { self.message = "Save the buffer before formatting".to_string(); return };
         let params = json!({ "textDocument": { "uri": lsp::file_uri(path) }, "options": { "tabSize": self.editor.tab_width, "insertSpaces": true } });
         match self.lsp.as_mut().ok_or_else(|| "Start LSP first with :lsp".to_string()).and_then(|client| client.request("textDocument/formatting", params).map_err(|error| error.to_string())) {
-            Ok(_) => self.message = "LSP formatting requested".to_string(),
+            Ok(id) => {
+                self.lsp_requests.insert(id, "textDocument/formatting".to_string());
+                self.message = "LSP formatting requested".to_string();
+            }
             Err(error) => self.message = error,
         }
     }
@@ -1911,6 +1922,26 @@ impl App {
         let Some(message) = latest else {
             return;
         };
+        let request = message.get("id").and_then(|id| id.as_u64()).and_then(|id| self.lsp_requests.remove(&id));
+        if request.as_deref() == Some("textDocument/definition") {
+            let location = message["result"].as_array().and_then(|locations| locations.first()).unwrap_or(&message["result"]);
+            if let (Some(uri), Some(line), Some(character)) = (
+                location["uri"].as_str(),
+                location["range"]["start"]["line"].as_u64(),
+                location["range"]["start"]["character"].as_u64(),
+            ) {
+                let path = PathBuf::from(uri.trim_start_matches("file:///").replace("%20", " "));
+                match self.editor.open_or_switch(&path) {
+                    Ok(_) => {
+                        self.editor.goto_line(line as usize);
+                        self.editor.cursor.column = character as usize;
+                        self.message = format!("Definition: {}", path.display());
+                    }
+                    Err(error) => self.message = format!("Cannot open definition: {error}"),
+                }
+                return;
+            }
+        }
         if message.get("method").and_then(|value| value.as_str()) == Some("textDocument/publishDiagnostics") {
             let count = message["params"]["diagnostics"].as_array().map_or(0, Vec::len);
             self.message = format!("LSP diagnostics: {count}");
