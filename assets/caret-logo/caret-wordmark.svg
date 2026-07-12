@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 520">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#05070D"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0.12" y1="0.1" x2="0.88" y2="0.9">
+      <stop offset="0" stop-color="#57E6FF"/>
+      <stop offset="0.48" stop-color="#7C8CFF"/>
+      <stop offset="1" stop-color="#B45CFF"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1800" height="520" rx="84" fill="url(#bg)"/>
+  <rect x="2" y="2" width="1796" height="516" rx="82" fill="none" stroke="#FFF" stroke-opacity=".07" stroke-width="4"/>
+
+  <g transform="translate(54,40) scale(.43)">
+    <path d="M700 267 C638 220 560 194 478 194 C288 194 174 330 174 512 C174 694 288 830 478 830 C560 830 638 804 700 757"
+          fill="none" stroke="url(#accent)" stroke-width="92" stroke-linecap="round" filter="url(#glow)"/>
+    <path d="M382 610 L512 386 L642 610"
+          fill="none" stroke="#F4F7FF" stroke-width="72" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="729" y="360" width="54" height="304" rx="27" fill="url(#accent)" filter="url(#glow)"/>
+  </g>
+
+  <text x="520" y="326" fill="#F5F7FF"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif"
+        font-size="218" font-weight="720" letter-spacing="-8">Caret</text>
+  <text x="535" y="406" fill="#A8B0C5"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="42" font-weight="500" letter-spacing="7">TERMINAL CODE EDITOR</text>
+</svg>

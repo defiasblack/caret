@@ -1,5 +1,7 @@
 # Caret
 
+![Caret terminal code editor](assets/caret-logo/caret-wordmark.svg)
+
 **Caret** is a polished terminal text editor written in Rust. It combines a
 friendly typing-first workflow with Vim-inspired navigation, a project folder
 tree, searchable commands, syntax coloring, mouse-wheel scrolling, and

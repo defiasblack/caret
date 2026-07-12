@@ -12,7 +12,7 @@ use crossterm::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, Mode},
+    app::{App, HoverTarget, Mode},
     editor::display_width,
     syntax::{self, Language},
 };
@@ -174,8 +174,8 @@ fn draw_top_bar<W: Write>(out: &mut W, app: &App, width: u16) -> io::Result<()> 
         .unwrap_or("[No Name]");
 
     let dirty = if app.editor.dirty { " ●" } else { "" };
-    let title = format!("  CARET  │  FILES  │  {filename}{dirty}");
-    let right = format!(" {}  │  F1 Help  │  Quit  ", app.project.root_name());
+    let title = format!("  CARET  │ [FILES] │  {filename}{dirty}");
+    let right = format!(" {}  │ [F1 Help] │ [Quit] ", app.project.root_name());
 
     queue!(
         out,
@@ -185,7 +185,27 @@ fn draw_top_bar<W: Write>(out: &mut W, app: &App, width: u16) -> io::Result<()> 
         SetAttribute(Attribute::Bold),
         Print(fit_bar(&title, &right, width as usize)),
         SetAttribute(Attribute::Reset)
-    )
+    )?;
+
+    for (target, x, label) in [
+        (HoverTarget::Files, 11u16, "[FILES]"),
+        (HoverTarget::Help, width.saturating_sub(19), "[F1 Help]"),
+        (HoverTarget::Quit, width.saturating_sub(7), "[Quit]"),
+    ] {
+        if app.hover_target == Some(target) {
+            queue!(
+                out,
+                MoveTo(x, 0),
+                SetBackgroundColor(app.theme.heading),
+                SetForegroundColor(app.theme.background),
+                SetAttribute(Attribute::Bold),
+                Print(label),
+                SetAttribute(Attribute::Reset)
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 fn draw_tab_bar<W: Write>(
@@ -826,17 +846,50 @@ fn draw_hotkey_bar<W: Write>(
         )?;
         x += key_width;
 
+        let clickable = *description == "Command";
+        let hovered = clickable && app.hover_target == Some(HoverTarget::Command);
         queue!(
             out,
             MoveTo(x as u16, row),
-            SetBackgroundColor(app.theme.current_line),
-            SetForegroundColor(app.theme.status_text),
+            SetBackgroundColor(if hovered {
+                app.theme.heading
+            } else if clickable {
+                mode_color
+            } else {
+                app.theme.current_line
+            }),
+            SetForegroundColor(if clickable {
+                app.theme.background
+            } else {
+                app.theme.status_text
+            }),
+            SetAttribute(if clickable { Attribute::Bold } else { Attribute::Reset }),
             Print(&description_text)
         )?;
         x += description_width;
     }
 
     Ok(())
+}
+
+pub fn hotkey_action_at(app: &App, width: u16, column: u16) -> Option<&'static str> {
+    let mut x = 1usize;
+    let column = column as usize;
+
+    for (key, description) in hotkeys_for_app(app) {
+        let key_width = UnicodeWidthStr::width(format!(" {key} ").as_str());
+        let description_width = UnicodeWidthStr::width(format!(" {description}  ").as_str());
+        let end = x + key_width + description_width;
+        if end > width as usize {
+            break;
+        }
+        if (x..end).contains(&column) {
+            return Some(*description);
+        }
+        x = end;
+    }
+
+    None
 }
 
 fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {

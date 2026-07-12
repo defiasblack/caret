@@ -29,6 +29,14 @@ pub enum Mode {
     QuitConfirm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoverTarget {
+    Files,
+    Help,
+    Quit,
+    Command,
+}
+
 impl Mode {
     pub fn label(self) -> &'static str {
         match self {
@@ -66,6 +74,7 @@ pub struct App {
     pub viewport_rows: usize,
     pub viewport_columns: usize,
     pub help_page: usize,
+    pub hover_target: Option<HoverTarget>,
     settings: Settings,
     pending_key: Option<char>,
     yank: String,
@@ -132,6 +141,7 @@ impl App {
             viewport_rows: 1,
             viewport_columns: 1,
             help_page: 0,
+            hover_target: None,
             settings,
             pending_key: None,
             yank: String::new(),
@@ -153,10 +163,14 @@ impl App {
                     MouseEventKind::ScrollUp
                         | MouseEventKind::ScrollDown
                         | MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Down(MouseButton::Right)
                         | MouseEventKind::Drag(MouseButton::Left)
                 ) => {
                 self.handle_mouse(mouse);
                 true
+            }
+            Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                self.update_hover(mouse.column, mouse.row)
             }
             Event::Resize(_, _) => true,
             _ => false,
@@ -209,6 +223,7 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.handle_left_click(mouse.column, mouse.row, width, height);
             }
+            MouseEventKind::Down(MouseButton::Right) => self.copy_selection_to_clipboard(),
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.handle_editor_drag(mouse.column, mouse.row, width, height);
             }
@@ -216,8 +231,45 @@ impl App {
         }
     }
 
+    fn update_hover(&mut self, column: u16, row: u16) -> bool {
+        let Ok((width, height)) = terminal::size() else {
+            return false;
+        };
+        let layout = crate::ui::screen_layout(self, width, height);
+        let target = if row == 0 && (9..=17).contains(&column) {
+            Some(HoverTarget::Files)
+        } else if row == 0 && column >= width.saturating_sub(8) {
+            Some(HoverTarget::Quit)
+        } else if row == 0 && column >= width.saturating_sub(20) {
+            Some(HoverTarget::Help)
+        } else if row == layout.hotkey_row
+            && crate::ui::hotkey_action_at(self, width, column) == Some("Command")
+        {
+            Some(HoverTarget::Command)
+        } else {
+            None
+        };
+
+        if self.hover_target == target {
+            false
+        } else {
+            self.hover_target = target;
+            true
+        }
+    }
+
     fn handle_left_click(&mut self, column: u16, row: u16, width: u16, height: u16) {
         let layout = crate::ui::screen_layout(self, width, height);
+
+        if row == layout.hotkey_row {
+            if crate::ui::hotkey_action_at(self, width, column) == Some("Command") {
+                self.explorer_focused = false;
+                self.command_input.clear();
+                self.mode = Mode::Command;
+                self.message = "Command".to_string();
+            }
+            return;
+        }
 
         // The FILES item in the title bar is a clickable explorer toggle.
         if row == 0 && (9..=17).contains(&column) {
@@ -348,6 +400,21 @@ impl App {
         };
     }
 
+    fn copy_selection_to_clipboard(&mut self) {
+        let Some(text) = self.editor.selected_text() else {
+            self.message = "Select text to copy".to_string();
+            return;
+        };
+
+        self.yank = text;
+        self.message = match arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(self.yank.clone()))
+        {
+            Ok(()) => "Copied selection to clipboard".to_string(),
+            Err(_) => "Copied selection (internal clipboard)".to_string(),
+        };
+    }
+
     pub fn active_search_query(&self) -> &str {
         if self.mode == Mode::Search {
             &self.search_input
@@ -441,17 +508,7 @@ impl App {
                     return true;
                 }
                 KeyCode::Char('c') => {
-                    if let Some(text) = self.editor.selected_text() {
-                        self.yank = text;
-                        self.message = match arboard::Clipboard::new()
-                            .and_then(|mut clipboard| clipboard.set_text(self.yank.clone()))
-                        {
-                            Ok(()) => "Copied selection to clipboard".to_string(),
-                            Err(_) => "Copied selection (internal clipboard)".to_string(),
-                        };
-                    } else {
-                        self.message = "Select text to copy".to_string();
-                    }
+                    self.copy_selection_to_clipboard();
                     return true;
                 }
                 KeyCode::Char('x') => {
@@ -939,7 +996,8 @@ impl App {
             }
             KeyCode::Char('n') => self.repeat_search(true),
             KeyCode::Char('N') => self.repeat_search(false),
-            KeyCode::Char(':') => {
+            KeyCode::Char(':')
+            | KeyCode::Char(';') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.command_input.clear();
                 self.mode = Mode::Command;
             }

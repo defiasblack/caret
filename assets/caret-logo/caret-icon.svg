@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#05070D"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0.12" y1="0.1" x2="0.88" y2="0.9">
+      <stop offset="0" stop-color="#57E6FF"/>
+      <stop offset="0.48" stop-color="#7C8CFF"/>
+      <stop offset="1" stop-color="#B45CFF"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="18" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="26" stdDeviation="28" flood-color="#000" flood-opacity=".45"/>
+    </filter>
+  </defs>
+
+  <rect x="72" y="72" width="880" height="880" rx="210" fill="url(#bg)" filter="url(#shadow)"/>
+  <rect x="74" y="74" width="876" height="876" rx="208" fill="none" stroke="#FFFFFF" stroke-opacity=".08" stroke-width="4"/>
+
+  <!-- restrained terminal prompt detail -->
+  <path d="M215 257h125" stroke="#57E6FF" stroke-opacity=".28" stroke-width="22" stroke-linecap="round"/>
+  <path d="M215 311h70" stroke="#B45CFF" stroke-opacity=".20" stroke-width="22" stroke-linecap="round"/>
+
+  <!-- Main C / code bracket -->
+  <path d="M700 267
+           C638 220 560 194 478 194
+           C288 194 174 330 174 512
+           C174 694 288 830 478 830
+           C560 830 638 804 700 757"
+        fill="none" stroke="url(#accent)" stroke-width="92"
+        stroke-linecap="round" filter="url(#glow)"/>
+
+  <!-- Caret -->
+  <path d="M382 610 L512 386 L642 610"
+        fill="none" stroke="#F4F7FF" stroke-width="72"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- insertion cursor -->
+  <rect x="729" y="360" width="54" height="304" rx="27" fill="url(#accent)" filter="url(#glow)"/>
+</svg>
