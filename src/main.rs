@@ -12,6 +12,7 @@ use std::{
     env,
     io::{self, stdout, Write},
     path::PathBuf,
+    time::Duration,
 };
 
 use app::App;
@@ -103,13 +104,15 @@ fn parse_args() -> Option<PathBuf> {
 }
 
 fn run<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
-    // Draw once, then block until an input or resize event occurs.
-    // This prevents the terminal from being cleared and repainted on a timer.
     ui::draw(out, app)?;
 
     while !app.should_quit {
-        let event = event::read()?;
-        if app.handle_event(event) && !app.should_quit {
+        let changed = if event::poll(Duration::from_millis(50))? {
+            app.handle_event(event::read()?)
+        } else {
+            app.poll_background()
+        };
+        if changed && !app.should_quit {
             ui::draw(out, app)?;
         }
     }

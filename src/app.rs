@@ -211,6 +211,12 @@ impl App {
         }
     }
 
+    pub fn poll_background(&mut self) -> bool {
+        let message = self.message.clone();
+        self.poll_lsp();
+        self.message != message
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.mode == Mode::QuitConfirm {
             return;
