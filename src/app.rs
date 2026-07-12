@@ -1829,7 +1829,7 @@ impl App {
             self.message = "No built-in LSP server for this file type".to_string();
             return;
         };
-        let root = self.project.root.clone();
+        let root = lsp_workspace_root(&path).unwrap_or_else(|| self.project.root.clone());
         match LspClient::start(server, &root) {
             Ok(client) => {
                 self.lsp = Some(client);
@@ -2060,6 +2060,29 @@ impl App {
             dirty.len(),
             dirty.join(", ")
         );
+    }
+}
+
+fn lsp_workspace_root(path: &Path) -> Option<PathBuf> {
+    let mut directory = path.parent()?.to_path_buf();
+    loop {
+        let has_workspace_file = std::fs::read_dir(&directory)
+            .ok()?
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "sln" | "csproj"))
+            });
+        if has_workspace_file {
+            return Some(directory);
+        }
+        let parent = directory.parent()?.to_path_buf();
+        if parent == directory {
+            return None;
+        }
+        directory = parent;
     }
 }
 
