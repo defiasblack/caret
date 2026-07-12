@@ -8,7 +8,6 @@ milestone.
 
 ## Coding intelligence
 
-- Tree-sitter parsing and syntax highlighting
 - Language Server Protocol integration: completion, hover, definitions,
   references, rename, formatting, code actions, and diagnostics
 - Code folding
