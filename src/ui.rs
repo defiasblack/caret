@@ -959,7 +959,7 @@ fn draw_help<W: Write>(
     terminal_height: u16,
 ) -> io::Result<()> {
     const PAGES: [&str; 4] = ["EDITING", "NAVIGATION", "FILES", "COMMANDS"];
-    const EDITING: [(&str, &str); 17] = [
+    const EDITING: [(&str, &str); 19] = [
         ("Type normally", "Enter text while in Insert mode"),
         ("Esc", "Switch to Normal mode"),
         ("F7", "Duplicate current line"),
@@ -976,6 +976,8 @@ fn draw_help<W: Write>(
         ("x / dd  (Normal)", "Delete character / line"),
         ("yy / p  (Normal)", "Copy line / paste below"),
         ("q{register} / @{register}", "Record / replay a macro in Normal mode"),
+        ("Tab / Shift-Tab  (Normal)", "Indent / outdent the line or selection"),
+        ("Ctrl-/", "Toggle language-aware comments"),
         ("u / Ctrl-R  (Normal)", "Undo / Redo"),
     ];
     const NAVIGATION: [(&str, &str); 11] = [

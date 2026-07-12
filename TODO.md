@@ -5,7 +5,6 @@ milestone.
 
 ## Editing
 
-- Indent/outdent selections and language-aware comment toggling
 
 ## Coding intelligence
 

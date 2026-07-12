@@ -147,6 +147,8 @@ read.
 | `D` | Duplicate current line |
 | `Alt-Up` / `Alt-Down` | Move current line up / down |
 | `Ctrl-J` | Join current line with the next line |
+| `Tab` / `Shift-Tab` | Indent / outdent the current line or selection |
+| `Ctrl-/` | Toggle comments using the active file's language |
 | `yy` | Yank line |
 | `p` | Paste yanked line below |
 | `q` + register | Start recording a macro (press `q` in Normal mode to stop) |
@@ -200,6 +202,8 @@ read.
 | `:new [file]` | Create a new buffer |
 | `:duplicate`, `:moveup`, `:movedown`, `:join` | Line operations |
 | `:sort` | Sort current line or selected lines |
+| `:indent` / `:outdent` | Indent or outdent the current line or selection |
+| `:comment` | Toggle comments using the active file's language |
 | `:42` | Jump to line 42 |
 | `:set treewidth=40` | Change sidebar width |
 | `:set number` / `:set nonumber` | Toggle line numbers |

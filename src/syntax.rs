@@ -49,6 +49,15 @@ impl Language {
             Self::Plain => "Plain Text",
         }
     }
+
+    pub fn comment_delimiters(self) -> Option<(&'static str, Option<&'static str>)> {
+        match self {
+            Self::Rust | Self::Json => Some(("//", None)),
+            Self::Toml | Self::Python | Self::Shell => Some(("#", None)),
+            Self::Markdown => Some(("<!--", Some("-->"))),
+            Self::Plain => None,
+        }
+    }
 }
 
 pub fn highlight_line(line: &str, language: Language, theme: &Theme) -> Vec<Color> {

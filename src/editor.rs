@@ -867,6 +867,117 @@ impl Editor {
         end - start + 1
     }
 
+    pub fn indent_selected_lines(&mut self) -> usize {
+        let (start, end, selected) = self.selected_line_range();
+        let width = self.tab_width;
+        self.begin_undo_group();
+
+        let mut lines = self.logical_lines();
+        for line in &mut lines[start..=end] {
+            line.insert_str(0, &" ".repeat(width));
+        }
+        self.replace_logical_lines(&lines, self.has_trailing_newline());
+        self.finish_line_edit(start, end, selected, width as isize);
+        end - start + 1
+    }
+
+    pub fn outdent_selected_lines(&mut self) -> usize {
+        let (start, end, selected) = self.selected_line_range();
+        self.begin_undo_group();
+
+        let mut lines = self.logical_lines();
+        let mut current_removed = 0usize;
+        for (offset, line) in lines[start..=end].iter_mut().enumerate() {
+            let removed = leading_indent_width(line, self.tab_width);
+            line.drain(..line_char_byte_index(line, removed));
+            if start + offset == self.cursor.line {
+                current_removed = removed;
+            }
+        }
+        self.replace_logical_lines(&lines, self.has_trailing_newline());
+        self.finish_line_edit(start, end, selected, -(current_removed as isize));
+        end - start + 1
+    }
+
+    pub fn toggle_line_comments(&mut self, prefix: &str, suffix: Option<&str>) -> Option<bool> {
+        let (start, end, selected) = self.selected_line_range();
+        let mut lines = self.logical_lines();
+        let nonblank = lines[start..=end]
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        if nonblank == 0 {
+            return None;
+        }
+
+        let uncomment = lines[start..=end]
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| is_commented(line, prefix, suffix));
+        self.begin_undo_group();
+
+        let mut current_delta = 0isize;
+        for (offset, line) in lines[start..=end].iter_mut().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let indent_end = line
+                .char_indices()
+                .find_map(|(index, character)| (!character.is_whitespace()).then_some(index))
+                .unwrap_or(line.len());
+            let (indent, content) = line.split_at(indent_end);
+            let replacement = if uncomment {
+                uncomment_line(content, prefix, suffix)
+            } else if let Some(suffix) = suffix {
+                format!("{prefix} {content} {suffix}")
+            } else {
+                format!("{prefix} {content}")
+            };
+            if start + offset == self.cursor.line {
+                current_delta = replacement.chars().count() as isize - content.chars().count() as isize;
+            }
+            *line = format!("{indent}{replacement}");
+        }
+
+        self.replace_logical_lines(&lines, self.has_trailing_newline());
+        self.finish_line_edit(start, end, selected, current_delta);
+        Some(!uncomment)
+    }
+
+    fn selected_line_range(&self) -> (usize, usize, bool) {
+        let maximum = self.logical_lines().len().saturating_sub(1);
+        let start = self.cursor.line.min(maximum);
+        let Some((selection_start, selection_end)) = self.selection_range() else {
+            return (start, start, false);
+        };
+        let start_cursor = self.cursor_from_char_index(selection_start);
+        let end_cursor = self.cursor_from_char_index(selection_end);
+        let start = start_cursor.line.min(maximum);
+        let mut end = end_cursor.line.min(maximum);
+        if end_cursor.column == 0 && end > start {
+            end -= 1;
+        }
+        (start, end.max(start), true)
+    }
+
+    fn finish_line_edit(&mut self, start: usize, end: usize, selected: bool, current_delta: isize) {
+        if selected {
+            self.selection_anchor = Some(Cursor { line: start, column: 0 });
+            self.cursor = Cursor {
+                line: end,
+                column: self.line_len_chars(end),
+            };
+        } else if current_delta.is_negative() {
+            self.cursor.column = self.cursor.column.saturating_sub(current_delta.unsigned_abs());
+        } else {
+            self.cursor.column = (self.cursor.column + current_delta as usize)
+                .min(self.line_len_chars(self.cursor.line));
+        }
+        self.secondary_cursors.clear();
+        self.dirty = true;
+        self.preferred_column = None;
+    }
+
     pub fn open_line_below(&mut self) {
         self.begin_undo_group();
         let insertion = if self.cursor.line + 1 < self.line_count() {
@@ -1240,6 +1351,40 @@ fn matching_close(character: char) -> Option<char> {
     }
 }
 
+fn leading_indent_width(line: &str, tab_width: usize) -> usize {
+    if line.starts_with('\t') {
+        1
+    } else {
+        line.chars().take_while(|character| *character == ' ').take(tab_width).count()
+    }
+}
+
+fn line_char_byte_index(line: &str, characters: usize) -> usize {
+    line.char_indices()
+        .nth(characters)
+        .map_or(line.len(), |(index, _)| index)
+}
+
+fn is_commented(line: &str, prefix: &str, suffix: Option<&str>) -> bool {
+    let content = line.trim_start();
+    content.starts_with(prefix)
+        && suffix.is_none_or(|suffix| content.trim_end().ends_with(suffix))
+}
+
+fn uncomment_line(content: &str, prefix: &str, suffix: Option<&str>) -> String {
+    let content = content.strip_prefix(prefix).unwrap_or(content).trim_start_matches(' ');
+    let content = if let Some(suffix) = suffix {
+        content
+            .trim_end()
+            .strip_suffix(suffix)
+            .unwrap_or(content)
+            .trim_end_matches(' ')
+    } else {
+        content
+    };
+    content.to_string()
+}
+
 pub fn display_width(text: &str, tab_width: usize) -> usize {
     let mut column = 0;
 
@@ -1367,5 +1512,41 @@ mod tests {
         assert_eq!(editor.buffer.to_string(), "abc");
         assert!(editor.undo());
         assert_eq!(editor.buffer.to_string(), "");
+    }
+
+    #[test]
+    fn indent_and_outdent_apply_to_all_selected_lines() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("one\n  two\nthree");
+        editor.cursor = Cursor { line: 2, column: 5 };
+        editor.selection_anchor = Some(Cursor { line: 0, column: 0 });
+
+        assert_eq!(editor.indent_selected_lines(), 3);
+        assert_eq!(editor.buffer.to_string(), "    one\n      two\n    three");
+        assert_eq!(editor.selection_anchor, Some(Cursor { line: 0, column: 0 }));
+        assert_eq!(editor.cursor, Cursor { line: 2, column: 9 });
+
+        assert_eq!(editor.outdent_selected_lines(), 3);
+        assert_eq!(editor.buffer.to_string(), "one\n  two\nthree");
+    }
+
+    #[test]
+    fn comments_selected_lines_and_preserves_markdown_delimiters() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("fn main() {}\n\n    run();");
+        editor.cursor = Cursor { line: 2, column: 10 };
+        editor.selection_anchor = Some(Cursor { line: 0, column: 0 });
+
+        assert_eq!(editor.toggle_line_comments("//", None), Some(true));
+        assert_eq!(editor.buffer.to_string(), "// fn main() {}\n\n    // run();");
+        assert_eq!(editor.toggle_line_comments("//", None), Some(false));
+        assert_eq!(editor.buffer.to_string(), "fn main() {}\n\n    run();");
+
+        editor.cursor = Cursor { line: 0, column: 0 };
+        editor.selection_anchor = None;
+        assert_eq!(editor.toggle_line_comments("<!--", Some("-->")), Some(true));
+        assert_eq!(editor.buffer.to_string(), "<!-- fn main() {} -->\n\n    run();");
+        assert_eq!(editor.toggle_line_comments("<!--", Some("-->")), Some(false));
+        assert_eq!(editor.buffer.to_string(), "fn main() {}\n\n    run();");
     }
 }

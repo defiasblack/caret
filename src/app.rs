@@ -17,6 +17,7 @@ use crate::{
     config::{self, Settings},
     editor::Cursor,
     project::ProjectTree,
+    syntax::Language,
     tabs::{OpenDisposition, Tabs},
     theme::{Theme, ThemeKind},
 };
@@ -676,6 +677,10 @@ impl App {
                     self.toggle_file_tree();
                     return true;
                 }
+                KeyCode::Char('/') => {
+                    self.toggle_comments();
+                    return true;
+                }
                 KeyCode::Char('e') => {
                     if !self.project.visible {
                         self.project.visible = true;
@@ -723,6 +728,34 @@ impl App {
         }
 
         false
+    }
+
+    fn indent_selection(&mut self, outdent: bool) {
+        self.editor.checkpoint();
+        let count = if outdent {
+            self.editor.outdent_selected_lines()
+        } else {
+            self.editor.indent_selected_lines()
+        };
+        self.message = format!(
+            "{} {count} line(s)",
+            if outdent { "Outdented" } else { "Indented" }
+        );
+    }
+
+    fn toggle_comments(&mut self) {
+        let language = Language::from_path(self.editor.path.as_deref());
+        let Some((prefix, suffix)) = language.comment_delimiters() else {
+            self.message = format!("{} has no configured line-comment syntax", language.name());
+            return;
+        };
+
+        self.editor.checkpoint();
+        self.message = match self.editor.toggle_line_comments(prefix, suffix) {
+            Some(true) => "Commented line(s)".to_string(),
+            Some(false) => "Uncommented line(s)".to_string(),
+            None => "No nonblank lines to comment".to_string(),
+        };
     }
 
     fn new_tab(&mut self, path: Option<PathBuf>) {
@@ -1142,6 +1175,11 @@ impl App {
             KeyCode::Char('b') => self.editor.move_word_backward(),
             KeyCode::Char('G') => self.editor.move_file_end(),
             KeyCode::Char('g') => self.pending_key = Some('g'),
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.indent_selection(true)
+            }
+            KeyCode::Tab => self.indent_selection(false),
+            KeyCode::BackTab => self.indent_selection(true),
             KeyCode::Char('q') if key.modifiers.is_empty() => {
                 self.macro_prefix = Some(MacroPrefix::Record);
                 self.message = "Record macro: choose a register".to_string();
@@ -1618,6 +1656,9 @@ impl App {
                 let count = self.editor.sort_selected_lines();
                 self.message = format!("Sorted {count} line(s)");
             }
+            "indent" => self.indent_selection(false),
+            "outdent" => self.indent_selection(true),
+            "comment" | "togglecomment" => self.toggle_comments(),
             "expandall" | "treeexpand" => match self.project.expand_all() {
                 Ok(count) => self.message = format!("Expanded {count} folder(s)"),
                 Err(error) => self.message = format!("Expand all failed: {error}"),
