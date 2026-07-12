@@ -82,6 +82,7 @@ pub struct App {
     pub theme: Theme,
     pub viewport_rows: usize,
     pub viewport_columns: usize,
+    pub follow_cursor: bool,
     pub help_page: usize,
     pub hover_target: Option<HoverTarget>,
     settings: Settings,
@@ -154,6 +155,7 @@ impl App {
             theme: Theme::for_kind(settings.theme),
             viewport_rows: 1,
             viewport_columns: 1,
+            follow_cursor: true,
             help_page: 0,
             hover_target: None,
             settings,
@@ -173,6 +175,7 @@ impl App {
     pub fn handle_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.follow_cursor = true;
                 self.handle_key(key);
                 true
             }
@@ -225,6 +228,7 @@ impl App {
                     self.project
                         .ensure_selected_visible(layout.content_height.saturating_sub(1));
                 } else {
+                    self.follow_cursor = false;
                     self.editor.scroll_vertical(-3, layout.content_height);
                 }
             }
@@ -236,6 +240,7 @@ impl App {
                     self.project
                         .ensure_selected_visible(layout.content_height.saturating_sub(1));
                 } else {
+                    self.follow_cursor = false;
                     self.editor.scroll_vertical(3, layout.content_height);
                 }
             }
@@ -278,6 +283,7 @@ impl App {
     }
 
     fn handle_left_click(&mut self, column: u16, row: u16, width: u16, height: u16) {
+        self.follow_cursor = true;
         let layout = crate::ui::screen_layout(self, width, height);
 
         if row == layout.hotkey_row {
@@ -355,6 +361,7 @@ impl App {
 
         let before = self.current_location();
         self.explorer_focused = false;
+        self.follow_cursor = true;
         self.mode = Mode::Insert;
         self.pending_key = None;
 
@@ -402,6 +409,7 @@ impl App {
         }
 
         self.explorer_focused = false;
+        self.follow_cursor = true;
         self.mode = Mode::Insert;
         self.editor.finish_undo_group();
         self.editor.begin_selection();
@@ -1910,5 +1918,15 @@ mod tests {
         app.handle_key(key('a'));
         assert_eq!(app.editor.line_text(0), "xx");
         assert_eq!(app.recording_macro, None);
+    }
+
+    #[test]
+    fn keyboard_input_resumes_cursor_following_after_viewport_scroll() {
+        let mut app = App::new(None).expect("create app");
+        app.follow_cursor = false;
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+
+        assert!(app.follow_cursor);
     }
 }

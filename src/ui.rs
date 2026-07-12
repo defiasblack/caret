@@ -88,8 +88,10 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
 
     app.viewport_rows = content_height.max(1);
     app.viewport_columns = content_width.max(1);
-    app.editor
-        .ensure_cursor_visible(app.viewport_rows, app.viewport_columns);
+    if app.follow_cursor {
+        app.editor
+            .ensure_cursor_visible(app.viewport_rows, app.viewport_columns);
+    }
     app.project
         .ensure_selected_visible(content_height.saturating_sub(1));
 
