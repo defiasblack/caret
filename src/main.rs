@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod editor;
+mod lsp;
 mod project;
 mod syntax;
 mod tabs;

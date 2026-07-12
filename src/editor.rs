@@ -242,6 +242,10 @@ impl Editor {
         self.buffer.len_chars()
     }
 
+    pub fn text(&self) -> String {
+        self.buffer.to_string()
+    }
+
     pub fn line_count(&self) -> usize {
         self.buffer.len_lines()
     }

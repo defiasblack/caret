@@ -12,10 +12,12 @@ use crossterm::{
     },
     terminal,
 };
+use serde_json::json;
 
 use crate::{
     config::{self, Settings},
     editor::Cursor,
+    lsp::{self, LspClient},
     project::ProjectTree,
     syntax::Language,
     tabs::{OpenDisposition, Tabs},
@@ -96,6 +98,7 @@ pub struct App {
     back_history: Vec<NavigationLocation>,
     forward_history: Vec<NavigationLocation>,
     last_editor_click: Option<(Instant, Cursor)>,
+    lsp: Option<LspClient>,
 }
 
 impl App {
@@ -169,10 +172,12 @@ impl App {
             back_history: Vec::new(),
             forward_history: Vec::new(),
             last_editor_click: None,
+            lsp: None,
         })
     }
 
     pub fn handle_event(&mut self, event: Event) -> bool {
+        self.poll_lsp();
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.follow_cursor = true;
@@ -1708,6 +1713,12 @@ impl App {
             "set" => self.execute_set(&argument),
             "theme" => self.execute_theme(&argument),
             "config" => self.message = config::config_path().display().to_string(),
+            "lsp" => self.start_lsp(),
+            "lspstop" => {
+                self.lsp = None;
+                self.message = "LSP stopped".to_string();
+            }
+            "hover" => self.request_hover(),
             "help" | "h" => self.mode = Mode::Help,
             _ => self.message = format!("Unknown command: {command}"),
         }
@@ -1794,6 +1805,82 @@ impl App {
                 self.message =
                     "Try :set number, :set tabstop=4, or :set treewidth=40".to_string()
             }
+        }
+    }
+
+    fn start_lsp(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.message = "Save the buffer before starting LSP".to_string();
+            return;
+        };
+        let Some(server) = lsp::server_for_extension(&path) else {
+            self.message = "No built-in LSP server for this file type".to_string();
+            return;
+        };
+        let root = self.project.root.clone();
+        match LspClient::start(server, &root) {
+            Ok(client) => {
+                let uri = lsp::file_uri(&path);
+                let language_id = crate::syntax::Language::from_path(Some(&path)).name().to_ascii_lowercase();
+                let open = client.notify("textDocument/didOpen", json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": language_id,
+                        "version": 1,
+                        "text": self.editor.text()
+                    }
+                }));
+                match open {
+                    Ok(()) => {
+                        self.lsp = Some(client);
+                        self.message = format!("LSP started: {server} · use :hover");
+                    }
+                    Err(error) => self.message = format!("LSP document sync failed: {error}"),
+                }
+            }
+            Err(error) => self.message = format!("Could not start {server}: {error}"),
+        }
+    }
+
+    fn request_hover(&mut self) {
+        let Some(lsp) = &mut self.lsp else {
+            self.message = "Start LSP first with :lsp".to_string();
+            return;
+        };
+        let Some(path) = self.editor.path.as_ref() else {
+            self.message = "Save the buffer before requesting hover".to_string();
+            return;
+        };
+        match lsp.request("textDocument/hover", json!({
+            "textDocument": { "uri": lsp::file_uri(path) },
+            "position": { "line": self.editor.cursor.line, "character": self.editor.cursor.column }
+        })) {
+            Ok(_) => self.message = "Hover requested".to_string(),
+            Err(error) => self.message = format!("Hover request failed: {error}"),
+        }
+    }
+
+    fn poll_lsp(&mut self) {
+        let Some(lsp) = &self.lsp else {
+            return;
+        };
+        let mut latest = None;
+        while let Some(message) = lsp.try_recv() {
+            latest = Some(message);
+        }
+        let Some(message) = latest else {
+            return;
+        };
+        if message.get("method").and_then(|value| value.as_str()) == Some("textDocument/publishDiagnostics") {
+            let count = message["params"]["diagnostics"].as_array().map_or(0, Vec::len);
+            self.message = format!("LSP diagnostics: {count}");
+        } else if let Some(result) = message.get("result") {
+            let text = result["contents"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| result["contents"]["value"].as_str().map(str::to_string))
+                .unwrap_or_else(|| result.to_string());
+            self.message = format!("LSP: {}", text.replace('\n', " ").chars().take(120).collect::<String>());
         }
     }
 
