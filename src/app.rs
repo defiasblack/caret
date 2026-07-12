@@ -102,6 +102,7 @@ pub struct App {
     lsp_version: i64,
     lsp_requests: HashMap<u64, String>,
     lsp_initialized: bool,
+    lsp_workspace_ready: bool,
 }
 
 impl App {
@@ -179,6 +180,7 @@ impl App {
             lsp_version: 1,
             lsp_requests: HashMap::new(),
             lsp_initialized: false,
+            lsp_workspace_ready: false,
         })
     }
 
@@ -1840,6 +1842,7 @@ impl App {
             Ok(client) => {
                 self.lsp = Some(client);
                 self.lsp_initialized = false;
+                self.lsp_workspace_ready = server != "csharp-ls";
                 self.message = format!("Starting LSP: {server}");
             }
             Err(error) => self.message = format!("Could not start {server}: {error}"),
@@ -1853,6 +1856,10 @@ impl App {
         };
         if !self.lsp_initialized {
             self.message = "LSP is still initializing".to_string();
+            return;
+        }
+        if !self.lsp_workspace_ready {
+            self.message = "LSP is still loading the workspace".to_string();
             return;
         }
         let Some(path) = self.editor.path.as_ref() else {
@@ -1883,6 +1890,10 @@ impl App {
     }
 
     fn request_lsp_position(&mut self, method: &str) {
+        if !self.lsp_workspace_ready {
+            self.message = "LSP is still loading the workspace".to_string();
+            return;
+        }
         let Some(path) = self.editor.path.as_ref() else { self.message = "Save the buffer before using LSP".to_string(); return };
         let params = json!({
             "textDocument": { "uri": lsp::file_uri(path) },
@@ -1917,6 +1928,17 @@ impl App {
         let Some(message) = lsp.try_recv() else {
             return;
         };
+        if message.get("method").and_then(|method| method.as_str()) == Some("$/progress") {
+            match message["params"]["value"]["kind"].as_str() {
+                Some("begin") => self.message = "LSP loading workspace…".to_string(),
+                Some("end") => {
+                    self.lsp_workspace_ready = true;
+                    self.message = "LSP ready".to_string();
+                }
+                _ => {}
+            }
+            return;
+        }
         if let (Some(id), Some(method)) = (
             message.get("id"),
             message.get("method").and_then(|method| method.as_str()),
@@ -1952,7 +1974,11 @@ impl App {
             let language_id = lsp_language_id(crate::syntax::Language::from_path(Some(path)));
             if lsp.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lsp::file_uri(path), "languageId": language_id, "version": 1, "text": self.editor.text() } })).is_ok() {
                 self.lsp_initialized = true;
-                self.message = "LSP ready".to_string();
+                self.message = if self.lsp_workspace_ready {
+                    "LSP ready".to_string()
+                } else {
+                    "LSP loading workspace…".to_string()
+                };
             }
             return;
         }
