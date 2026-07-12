@@ -99,6 +99,7 @@ pub struct App {
     forward_history: Vec<NavigationLocation>,
     last_editor_click: Option<(Instant, Cursor)>,
     lsp: Option<LspClient>,
+    lsp_version: i64,
 }
 
 impl App {
@@ -173,6 +174,7 @@ impl App {
             forward_history: Vec::new(),
             last_editor_click: None,
             lsp: None,
+            lsp_version: 1,
         })
     }
 
@@ -182,6 +184,7 @@ impl App {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.follow_cursor = true;
                 self.handle_key(key);
+                self.sync_lsp_document();
                 true
             }
             Event::Mouse(mouse)
@@ -1719,6 +1722,11 @@ impl App {
                 self.message = "LSP stopped".to_string();
             }
             "hover" => self.request_hover(),
+            "complete" => self.request_lsp_position("textDocument/completion"),
+            "definition" | "def" => self.request_lsp_position("textDocument/definition"),
+            "references" | "refs" => self.request_lsp_position("textDocument/references"),
+            "actions" => self.request_lsp_position("textDocument/codeAction"),
+            "format" => self.request_formatting(),
             "help" | "h" => self.mode = Mode::Help,
             _ => self.message = format!("Unknown command: {command}"),
         }
@@ -1857,6 +1865,38 @@ impl App {
         })) {
             Ok(_) => self.message = "Hover requested".to_string(),
             Err(error) => self.message = format!("Hover request failed: {error}"),
+        }
+    }
+
+    fn sync_lsp_document(&mut self) {
+        let Some(lsp) = &self.lsp else { return };
+        let Some(path) = self.editor.path.as_ref() else { return };
+        self.lsp_version += 1;
+        let _ = lsp.notify("textDocument/didChange", json!({
+            "textDocument": { "uri": lsp::file_uri(path), "version": self.lsp_version },
+            "contentChanges": [{ "text": self.editor.text() }]
+        }));
+    }
+
+    fn request_lsp_position(&mut self, method: &str) {
+        let Some(path) = self.editor.path.as_ref() else { self.message = "Save the buffer before using LSP".to_string(); return };
+        let params = json!({
+            "textDocument": { "uri": lsp::file_uri(path) },
+            "position": { "line": self.editor.cursor.line, "character": self.editor.cursor.column },
+            "context": { "includeDeclaration": true, "diagnostics": [] }
+        });
+        match self.lsp.as_mut().ok_or_else(|| "Start LSP first with :lsp".to_string()).and_then(|client| client.request(method, params).map_err(|error| error.to_string())) {
+            Ok(_) => self.message = format!("LSP request: {method}"),
+            Err(error) => self.message = error,
+        }
+    }
+
+    fn request_formatting(&mut self) {
+        let Some(path) = self.editor.path.as_ref() else { self.message = "Save the buffer before formatting".to_string(); return };
+        let params = json!({ "textDocument": { "uri": lsp::file_uri(path) }, "options": { "tabSize": self.editor.tab_width, "insertSpaces": true } });
+        match self.lsp.as_mut().ok_or_else(|| "Start LSP first with :lsp".to_string()).and_then(|client| client.request("textDocument/formatting", params).map_err(|error| error.to_string())) {
+            Ok(_) => self.message = "LSP formatting requested".to_string(),
+            Err(error) => self.message = error,
         }
     }
 
