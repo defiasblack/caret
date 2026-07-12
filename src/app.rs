@@ -101,6 +101,7 @@ pub struct App {
     lsp: Option<LspClient>,
     lsp_version: i64,
     lsp_requests: HashMap<u64, String>,
+    lsp_initialized: bool,
 }
 
 impl App {
@@ -177,6 +178,7 @@ impl App {
             lsp: None,
             lsp_version: 1,
             lsp_requests: HashMap::new(),
+            lsp_initialized: false,
         })
     }
 
@@ -1830,23 +1832,9 @@ impl App {
         let root = self.project.root.clone();
         match LspClient::start(server, &root) {
             Ok(client) => {
-                let uri = lsp::file_uri(&path);
-                let language_id = crate::syntax::Language::from_path(Some(&path)).name().to_ascii_lowercase();
-                let open = client.notify("textDocument/didOpen", json!({
-                    "textDocument": {
-                        "uri": uri,
-                        "languageId": language_id,
-                        "version": 1,
-                        "text": self.editor.text()
-                    }
-                }));
-                match open {
-                    Ok(()) => {
-                        self.lsp = Some(client);
-                        self.message = format!("LSP started: {server} · use :hover");
-                    }
-                    Err(error) => self.message = format!("LSP document sync failed: {error}"),
-                }
+                self.lsp = Some(client);
+                self.lsp_initialized = false;
+                self.message = format!("Starting LSP: {server}");
             }
             Err(error) => self.message = format!("Could not start {server}: {error}"),
         }
@@ -1857,6 +1845,10 @@ impl App {
             self.message = "Start LSP first with :lsp".to_string();
             return;
         };
+        if !self.lsp_initialized {
+            self.message = "LSP is still initializing".to_string();
+            return;
+        }
         let Some(path) = self.editor.path.as_ref() else {
             self.message = "Save the buffer before requesting hover".to_string();
             return;
@@ -1875,6 +1867,7 @@ impl App {
 
     fn sync_lsp_document(&mut self) {
         let Some(lsp) = &self.lsp else { return };
+        if !self.lsp_initialized { return };
         let Some(path) = self.editor.path.as_ref() else { return };
         self.lsp_version += 1;
         let _ = lsp.notify("textDocument/didChange", json!({
@@ -1923,6 +1916,20 @@ impl App {
             return;
         };
         let request = message.get("id").and_then(|id| id.as_u64()).and_then(|id| self.lsp_requests.remove(&id));
+        if message.get("id").and_then(|id| id.as_u64()) == Some(1) {
+            let Some(lsp) = &self.lsp else { return };
+            if lsp.notify("initialized", json!({})).is_err() {
+                self.message = "LSP initialization failed".to_string();
+                return;
+            }
+            let Some(path) = self.editor.path.as_ref() else { return };
+            let language_id = crate::syntax::Language::from_path(Some(path)).name().to_ascii_lowercase();
+            if lsp.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lsp::file_uri(path), "languageId": language_id, "version": 1, "text": self.editor.text() } })).is_ok() {
+                self.lsp_initialized = true;
+                self.message = "LSP ready".to_string();
+            }
+            return;
+        }
         if request.as_deref() == Some("textDocument/definition") {
             let location = message["result"].as_array().and_then(|locations| locations.first()).unwrap_or(&message["result"]);
             if let (Some(uri), Some(line), Some(character)) = (
@@ -1941,6 +1948,8 @@ impl App {
                 }
                 return;
             }
+            self.message = "No definition found at cursor".to_string();
+            return;
         }
         if message.get("method").and_then(|value| value.as_str()) == Some("textDocument/publishDiagnostics") {
             let count = message["params"]["diagnostics"].as_array().map_or(0, Vec::len);

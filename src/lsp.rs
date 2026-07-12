@@ -45,7 +45,6 @@ impl LspClient {
                 }
             }
         }))?;
-        client.notify("initialized", json!({}))?;
         Ok(client)
     }
 
