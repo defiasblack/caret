@@ -149,6 +149,8 @@ read.
 | `Ctrl-J` | Join current line with the next line |
 | `yy` | Yank line |
 | `p` | Paste yanked line below |
+| `q` + register | Start recording a macro (press `q` in Normal mode to stop) |
+| `@` + register | Replay a recorded macro |
 | `u` | Undo |
 | `Ctrl-r` | Redo |
 | `/` | Search |

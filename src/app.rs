@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -36,6 +37,12 @@ pub enum HoverTarget {
     Help,
     Quit,
     Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacroPrefix {
+    Record,
+    Replay,
 }
 
 impl Mode {
@@ -78,6 +85,10 @@ pub struct App {
     pub hover_target: Option<HoverTarget>,
     settings: Settings,
     pending_key: Option<char>,
+    macro_prefix: Option<MacroPrefix>,
+    recording_macro: Option<char>,
+    macros: HashMap<char, Vec<KeyEvent>>,
+    replaying_macro: bool,
     yank: String,
     search_origin: Cursor,
     back_history: Vec<NavigationLocation>,
@@ -146,6 +157,10 @@ impl App {
             hover_target: None,
             settings,
             pending_key: None,
+            macro_prefix: None,
+            recording_macro: None,
+            macros: HashMap::new(),
+            replaying_macro: false,
             yank: String::new(),
             search_origin: Cursor::default(),
             back_history: Vec::new(),
@@ -452,6 +467,19 @@ impl App {
             return;
         }
 
+        if self.handle_macro_prefix(key) {
+            return;
+        }
+
+        if self.is_macro_stop_key(key) {
+            self.stop_macro_recording();
+            return;
+        }
+
+        if let Some(register) = self.recording_macro.filter(|_| !self.replaying_macro) {
+            self.macros.entry(register).or_default().push(key);
+        }
+
         if self.handle_global_shortcut(key) {
             return;
         }
@@ -485,6 +513,72 @@ impl App {
             }
             Mode::QuitConfirm => {}
         }
+    }
+
+    fn is_plain_normal_key(&self, key: KeyEvent, character: char) -> bool {
+        self.mode == Mode::Normal
+            && !self.explorer_focused
+            && key.code == KeyCode::Char(character)
+            && key.modifiers.is_empty()
+    }
+
+    fn is_macro_stop_key(&self, key: KeyEvent) -> bool {
+        !self.replaying_macro
+            && self.recording_macro.is_some()
+            && self.is_plain_normal_key(key, 'q')
+    }
+
+    fn handle_macro_prefix(&mut self, key: KeyEvent) -> bool {
+        let Some(prefix) = self.macro_prefix.take() else {
+            return false;
+        };
+
+        let KeyCode::Char(register) = key.code else {
+            self.message = "Macro register must be a character".to_string();
+            return true;
+        };
+
+        match prefix {
+            MacroPrefix::Record => {
+                self.recording_macro = Some(register);
+                self.macros.insert(register, Vec::new());
+                self.message = format!("Recording macro @{register}; press q in Normal mode to stop");
+            }
+            MacroPrefix::Replay => {
+                if let Some(recording) = self.recording_macro.filter(|_| !self.replaying_macro) {
+                    self.macros.entry(recording).or_default().push(key);
+                }
+                self.play_macro(register);
+            }
+        }
+        true
+    }
+
+    fn stop_macro_recording(&mut self) {
+        let Some(register) = self.recording_macro.take() else {
+            return;
+        };
+        let count = self.macros.get(&register).map_or(0, Vec::len);
+        self.message = format!("Recorded macro @{register} ({count} key events)");
+    }
+
+    fn play_macro(&mut self, register: char) {
+        let Some(keys) = self.macros.get(&register).cloned() else {
+            self.message = format!("Macro @{register} is empty");
+            return;
+        };
+
+        if self.replaying_macro {
+            self.message = "Nested macro replay is not supported".to_string();
+            return;
+        }
+
+        self.replaying_macro = true;
+        for key in keys.into_iter().take(1_000) {
+            self.handle_key(key);
+        }
+        self.replaying_macro = false;
+        self.message = format!("Replayed macro @{register}");
     }
 
     fn handle_quit_confirmation(&mut self, key: KeyEvent) {
@@ -1048,6 +1142,14 @@ impl App {
             KeyCode::Char('b') => self.editor.move_word_backward(),
             KeyCode::Char('G') => self.editor.move_file_end(),
             KeyCode::Char('g') => self.pending_key = Some('g'),
+            KeyCode::Char('q') if key.modifiers.is_empty() => {
+                self.macro_prefix = Some(MacroPrefix::Record);
+                self.message = "Record macro: choose a register".to_string();
+            }
+            KeyCode::Char('@') if key.modifiers.is_empty() => {
+                self.macro_prefix = Some(MacroPrefix::Replay);
+                self.message = "Replay macro: choose a register".to_string();
+            }
             KeyCode::Char('d') => self.pending_key = Some('d'),
             KeyCode::Char('D') => {
                 self.editor.checkpoint();
@@ -1742,5 +1844,30 @@ impl App {
             dirty.len(),
             dirty.join(", ")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn records_and_replays_a_macro() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::Normal;
+
+        for key in [key('q'), key('a'), key('i'), key('x'), KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), key('q')] {
+            app.handle_key(key);
+        }
+        assert_eq!(app.editor.line_text(0), "x");
+
+        app.handle_key(key('@'));
+        app.handle_key(key('a'));
+        assert_eq!(app.editor.line_text(0), "xx");
+        assert_eq!(app.recording_macro, None);
     }
 }

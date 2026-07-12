@@ -6,7 +6,6 @@ milestone.
 ## Editing
 
 - Indent/outdent selections and language-aware comment toggling
-- Macro recording and replay
 
 ## Coding intelligence
 
