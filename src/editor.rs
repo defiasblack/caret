@@ -309,6 +309,27 @@ impl Editor {
         }
     }
 
+    pub fn select_word_at_cursor(&mut self) -> bool {
+        let characters = self.buffer.chars().collect::<Vec<_>>();
+        let mut start = self.current_char_index();
+        if start >= characters.len() || !is_word_character(characters[start]) {
+            if start == 0 || !is_word_character(characters[start - 1]) {
+                return false;
+            }
+            start -= 1;
+        }
+        while start > 0 && is_word_character(characters[start - 1]) {
+            start -= 1;
+        }
+        let mut end = start;
+        while end < characters.len() && is_word_character(characters[end]) {
+            end += 1;
+        }
+        self.set_cursor_from_char_index(end);
+        self.selection_anchor = Some(self.cursor_from_char_index(start));
+        true
+    }
+
     pub fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.secondary_cursors.clear();
@@ -468,6 +489,45 @@ impl Editor {
         self.preferred_column = None;
     }
 
+    pub fn insert_pair(&mut self, opening: char, closing: char) {
+        if let Some((start, end)) = self.selection_range() {
+            if self.secondary_cursors.is_empty() {
+                self.buffer.insert_char(end, closing);
+                self.buffer.insert_char(start, opening);
+                self.set_cursor_from_char_index(end + 2);
+                self.selection_anchor = None;
+                self.dirty = true;
+                self.preferred_column = None;
+                return;
+            }
+        }
+
+        if self.secondary_cursors.is_empty() {
+            let index = self.current_char_index();
+            self.delete_selection();
+            self.buffer.insert(index, &format!("{opening}{closing}"));
+            self.set_cursor_from_char_index(index + 1);
+            self.dirty = true;
+            self.preferred_column = None;
+        } else {
+            self.replace_at_cursors(&format!("{opening}{closing}"));
+            self.move_all_left();
+        }
+    }
+
+    pub fn skip_closing_character(&mut self, closing: char) -> bool {
+        if !self.secondary_cursors.is_empty() || self.selection_range().is_some() {
+            return false;
+        }
+        let index = self.current_char_index();
+        if self.buffer.get_char(index) == Some(closing) {
+            self.move_right();
+            true
+        } else {
+            false
+        }
+    }
+
     fn replace_at_cursors(&mut self, replacement: &str) {
         let primary = (self.current_char_index(), self.selection_range());
         let mut targets = self
@@ -518,6 +578,21 @@ impl Editor {
         self.preferred_column = None;
     }
 
+    fn move_all_left(&mut self) {
+        self.move_left();
+        self.secondary_cursors = self
+            .secondary_cursors
+            .iter()
+            .map(|cursor| {
+                let index = self.buffer.line_to_char(cursor.cursor.line) + cursor.cursor.column;
+                SecondaryCursor {
+                    cursor: self.cursor_from_char_index(index.saturating_sub(1)),
+                    selection_anchor: None,
+                }
+            })
+            .collect();
+    }
+
     pub fn insert_text(&mut self, text: &str) {
         for character in text.chars() {
             self.insert_char(character);
@@ -563,6 +638,24 @@ impl Editor {
         self.dirty = true;
         self.preferred_column = None;
         true
+    }
+
+    pub fn backspace_pair(&mut self) -> bool {
+        if !self.secondary_cursors.is_empty() || self.selection_range().is_some() {
+            return self.backspace();
+        }
+        let index = self.current_char_index();
+        if index > 0
+            && index < self.buffer.len_chars()
+            && matching_close(self.buffer.char(index - 1)) == Some(self.buffer.char(index))
+        {
+            self.buffer.remove(index - 1..index + 1);
+            self.set_cursor_from_char_index(index - 1);
+            self.dirty = true;
+            self.preferred_column = None;
+            return true;
+        }
+        self.backspace()
     }
 
     pub fn delete_at_cursor(&mut self) -> bool {
@@ -642,6 +735,93 @@ impl Editor {
         self.cursor.column = 0;
         self.dirty = true;
         self.preferred_column = None;
+    }
+
+    pub fn duplicate_line(&mut self) {
+        let mut lines = self.logical_lines();
+        let line = self.cursor.line.min(lines.len().saturating_sub(1));
+        lines.insert(line, lines[line].clone());
+        self.replace_logical_lines(&lines, self.has_trailing_newline());
+        self.cursor.line += 1;
+        self.selection_anchor = None;
+        self.secondary_cursors.clear();
+        self.dirty = true;
+        self.preferred_column = None;
+    }
+
+    pub fn move_line(&mut self, down: bool) -> bool {
+        let logical_line_count = self.logical_lines().len();
+        let line = self.cursor.line.min(logical_line_count.saturating_sub(1));
+        let target = if down {
+            line.checked_add(1).filter(|next| *next < logical_line_count)
+        } else {
+            line.checked_sub(1)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+
+        let mut lines = self.logical_lines();
+        lines.swap(line, target);
+        self.replace_logical_lines(&lines, self.has_trailing_newline());
+        self.cursor.line = target;
+        self.cursor.column = self.cursor.column.min(self.line_len_chars(target));
+        self.selection_anchor = None;
+        self.secondary_cursors.clear();
+        self.dirty = true;
+        self.preferred_column = None;
+        true
+    }
+
+    pub fn join_line_below(&mut self) -> bool {
+        let line = self.cursor.line;
+        if line + 1 >= self.line_count() {
+            return false;
+        }
+
+        let left = self.line_text(line);
+        let right = self.line_text(line + 1);
+        let line_end = self.buffer.line_to_char(line) + self.line_with_ending(line).chars().count();
+        let newline_start = line_end.saturating_sub(if self.line_with_ending(line).ends_with("\r\n") { 2 } else { 1 });
+        let mut right_start = 0;
+        for character in right.chars() {
+            if !character.is_whitespace() {
+                break;
+            }
+            right_start += 1;
+        }
+        self.buffer.remove(newline_start..line_end + right_start);
+        if !left.is_empty() && right.chars().nth(right_start).is_some() && !left.ends_with(char::is_whitespace) {
+            self.buffer.insert_char(newline_start, ' ');
+        }
+        self.cursor.column = self.cursor.column.min(self.line_len_chars(line));
+        self.selection_anchor = None;
+        self.secondary_cursors.clear();
+        self.dirty = true;
+        self.preferred_column = None;
+        true
+    }
+
+    pub fn sort_selected_lines(&mut self) -> usize {
+        let mut lines = self.logical_lines();
+        let start = self.cursor.line.min(lines.len().saturating_sub(1));
+        let mut end = start;
+        if let Some((_, selection_end)) = self.selection_range() {
+            let end_cursor = self.cursor_from_char_index(selection_end);
+            end = end_cursor.line.min(lines.len().saturating_sub(1));
+            if end_cursor.column == 0 && end > start {
+                end -= 1;
+            }
+        }
+        lines[start..=end].sort_by_key(|line| line.trim().to_lowercase());
+        self.replace_logical_lines(&lines, self.has_trailing_newline());
+        self.cursor.line = start;
+        self.cursor.column = self.cursor.column.min(self.line_len_chars(start));
+        self.selection_anchor = None;
+        self.secondary_cursors.clear();
+        self.dirty = true;
+        self.preferred_column = None;
+        end - start + 1
     }
 
     pub fn open_line_below(&mut self) {
@@ -794,6 +974,80 @@ impl Editor {
         self.set_cursor_from_char_index(index);
     }
 
+    pub fn jump_to_matching_bracket(&mut self) -> bool {
+        let characters = self.buffer.chars().collect::<Vec<_>>();
+        let mut index = self.current_char_index();
+        if index >= characters.len() || !is_bracket(characters[index]) {
+            if index == 0 || !is_bracket(characters[index - 1]) {
+                return false;
+            }
+            index -= 1;
+        }
+
+        let (opening, closing, forward) = match characters[index] {
+            '(' => ('(', ')', true),
+            '[' => ('[', ']', true),
+            '{' => ('{', '}', true),
+            ')' => ('(', ')', false),
+            ']' => ('[', ']', false),
+            '}' => ('{', '}', false),
+            _ => return false,
+        };
+        let mut depth = 0usize;
+        if forward {
+            for (offset, character) in characters[index..].iter().enumerate() {
+                if *character == opening {
+                    depth += 1;
+                } else if *character == closing {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.set_cursor_from_char_index(index + offset);
+                        return true;
+                    }
+                }
+            }
+        } else {
+            for target in (0..=index).rev() {
+                if characters[target] == closing {
+                    depth += 1;
+                } else if characters[target] == opening {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.set_cursor_from_char_index(target);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn extend_word_forward(&mut self) {
+        let characters = self.buffer.chars().collect::<Vec<_>>();
+        let mut index = self.current_char_index();
+
+        while index < characters.len() && !is_word_character(characters[index]) {
+            index += 1;
+        }
+        while index < characters.len() && is_word_character(characters[index]) {
+            index += 1;
+        }
+        self.set_cursor_from_char_index(index);
+    }
+
+    pub fn extend_word_backward(&mut self) {
+        let characters = self.buffer.chars().collect::<Vec<_>>();
+        let mut index = self.current_char_index();
+
+        while index > 0 && !is_word_character(characters[index - 1]) {
+            index -= 1;
+        }
+        while index > 0 && is_word_character(characters[index - 1]) {
+            index -= 1;
+        }
+        self.set_cursor_from_char_index(index);
+    }
+
     pub fn goto_line(&mut self, line: usize) {
         self.cursor.line = line.min(self.line_count().saturating_sub(1));
         self.cursor.column = self.cursor.column.min(self.line_len_chars(self.cursor.line));
@@ -876,10 +1130,55 @@ impl Editor {
         self.cursor.line = self.cursor.line.min(self.line_count().saturating_sub(1));
         self.cursor.column = self.cursor.column.min(self.line_len_chars(self.cursor.line));
     }
+
+    fn has_trailing_newline(&self) -> bool {
+        self.buffer.len_chars() > 0 && self.buffer.char(self.buffer.len_chars() - 1) == '\n'
+    }
+
+    fn line_ending(&self) -> &'static str {
+        if self.buffer.to_string().contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        }
+    }
+
+    fn logical_lines(&self) -> Vec<String> {
+        let count = self.line_count().saturating_sub(self.has_trailing_newline() as usize);
+        if count == 0 {
+            vec![String::new()]
+        } else {
+            (0..count).map(|line| self.line_text(line)).collect()
+        }
+    }
+
+    fn replace_logical_lines(&mut self, lines: &[String], trailing_newline: bool) {
+        let ending = self.line_ending();
+        let mut text = lines.join(ending);
+        if trailing_newline {
+            text.push_str(ending);
+        }
+        self.buffer = Rope::from_str(&text);
+    }
 }
 
 fn is_word_character(character: char) -> bool {
     character == '_' || character.is_alphanumeric()
+}
+
+fn is_bracket(character: char) -> bool {
+    matches!(character, '(' | ')' | '[' | ']' | '{' | '}')
+}
+
+fn matching_close(character: char) -> Option<char> {
+    match character {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '\'' => Some('\''),
+        '"' => Some('"'),
+        _ => None,
+    }
 }
 
 pub fn display_width(text: &str, tab_width: usize) -> usize {
@@ -914,5 +1213,79 @@ mod tests {
         assert_eq!(editor.buffer.to_string(), "z beta z z");
         editor.insert_char('!');
         assert_eq!(editor.buffer.to_string(), "z! beta z! z!");
+    }
+
+    #[test]
+    fn line_operations_preserve_line_boundaries() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("beta\nalpha\ngamma");
+
+        editor.duplicate_line();
+        assert_eq!(editor.buffer.to_string(), "beta\nbeta\nalpha\ngamma");
+        assert!(editor.move_line(true));
+        assert_eq!(editor.buffer.to_string(), "beta\nalpha\nbeta\ngamma");
+        editor.cursor = Cursor { line: 0, column: 0 };
+        assert!(editor.join_line_below());
+        assert_eq!(editor.buffer.to_string(), "beta alpha\nbeta\ngamma");
+
+        editor.set_cursor_from_char_index(0);
+        assert_eq!(editor.sort_selected_lines(), 1);
+        assert_eq!(editor.buffer.to_string(), "beta alpha\nbeta\ngamma");
+    }
+
+    #[test]
+    fn sorting_a_selection_sorts_the_selected_lines() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("zebra\nAlpha\nmiddle\n");
+        editor.cursor = Cursor { line: 0, column: 0 };
+        editor.selection_anchor = Some(Cursor { line: 2, column: 6 });
+
+        assert_eq!(editor.sort_selected_lines(), 3);
+        assert_eq!(editor.buffer.to_string(), "Alpha\nmiddle\nzebra\n");
+    }
+
+    #[test]
+    fn selecting_word_at_cursor_selects_the_whole_word() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("one two_three");
+        editor.set_cursor_from_char_index(6);
+
+        assert!(editor.select_word_at_cursor());
+        assert_eq!(editor.selected_text().as_deref(), Some("two_three"));
+    }
+
+    #[test]
+    fn extending_by_word_stops_at_word_boundaries() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("version = \"2.2.0\"");
+        editor.begin_selection();
+        editor.extend_word_forward();
+        assert_eq!(editor.selected_text().as_deref(), Some("version"));
+
+        editor.clear_selection();
+        editor.set_cursor_from_char_index(7);
+        editor.begin_selection();
+        editor.extend_word_backward();
+        assert_eq!(editor.selected_text().as_deref(), Some("version"));
+    }
+
+    #[test]
+    fn pairs_skip_delete_and_find_matching_brackets() {
+        let mut editor = Editor::blank();
+        editor.insert_pair('(', ')');
+        assert_eq!(editor.buffer.to_string(), "()");
+        assert!(editor.skip_closing_character(')'));
+        assert_eq!(editor.current_char_index(), 2);
+        editor.move_left();
+        assert!(editor.backspace_pair());
+        assert_eq!(editor.buffer.to_string(), "");
+
+        editor.buffer = Rope::from_str("fn main() { call([1]); }");
+        editor.set_cursor_from_char_index(7);
+        assert!(editor.jump_to_matching_bracket());
+        assert_eq!(editor.current_char_index(), 8);
+        editor.set_cursor_from_char_index(17);
+        assert!(editor.jump_to_matching_bracket());
+        assert_eq!(editor.current_char_index(), 19);
     }
 }

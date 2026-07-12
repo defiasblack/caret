@@ -959,9 +959,13 @@ fn draw_help<W: Write>(
     terminal_height: u16,
 ) -> io::Result<()> {
     const PAGES: [&str; 4] = ["EDITING", "NAVIGATION", "FILES", "COMMANDS"];
-    const EDITING: [(&str, &str); 12] = [
+    const EDITING: [(&str, &str); 16] = [
         ("Type normally", "Enter text while in Insert mode"),
         ("Esc", "Switch to Normal mode"),
+        ("F7", "Duplicate current line"),
+        ("Ctrl + Left / Right", "Move by word"),
+        ("Ctrl + Shift + Left / Right", "Select by word"),
+        ("Double-click", "Select the clicked word"),
         ("Shift + Arrow/Home/End", "Select text with the keyboard"),
         ("Mouse drag", "Select text with the mouse"),
         ("Ctrl-C / Ctrl-X / Ctrl-V", "Copy / Cut / Paste selection"),

@@ -143,12 +143,16 @@ read.
 | `gg` / `G` | Top / bottom of file |
 | `x` | Delete character |
 | `dd` | Delete line |
+| `D` | Duplicate current line |
+| `Alt-Up` / `Alt-Down` | Move current line up / down |
+| `Ctrl-J` | Join current line with the next line |
 | `yy` | Yank line |
 | `p` | Paste yanked line below |
 | `u` | Undo |
 | `Ctrl-r` | Redo |
 | `/` | Search |
 | `n` / `N` | Next / previous result |
+| `%` | Jump to the matching bracket |
 | `:` | Command prompt |
 | `F1` | Help |
 
@@ -160,6 +164,12 @@ read.
 | `Ctrl-s` | Save |
 | `Ctrl-q` | Quit |
 | `Tab` | Insert spaces using current tab width |
+| `F7` | Duplicate current line and remain in Insert mode |
+| `(`, `[`, `{`, `'`, `"` | Insert a matching pair; typing its closer skips over it |
+| `Backspace` | Remove an empty matching pair together |
+| `Ctrl` + Left / Right | Move to previous / next word |
+| `Ctrl` + `Shift` + Left / Right | Select previous / next word |
+| Double-click | Select the clicked word |
 | `Shift` + arrows / Home / End | Select text with the keyboard |
 | Drag with left mouse button | Select text with the mouse |
 | `Ctrl-C` / `Ctrl-X` / `Ctrl-V` | Copy / cut / paste selected text |
@@ -185,6 +195,8 @@ read.
 | `:treewidth 44` | Set sidebar width directly |
 | `:reveal` | Reveal the active file in the project tree |
 | `:new [file]` | Create a new buffer |
+| `:duplicate`, `:moveup`, `:movedown`, `:join` | Line operations |
+| `:sort` | Sort current line or selected lines |
 | `:42` | Jump to line 42 |
 | `:set treewidth=40` | Change sidebar width |
 | `:set number` / `:set nonumber` | Toggle line numbers |

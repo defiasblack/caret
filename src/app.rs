@@ -1,6 +1,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -81,6 +82,7 @@ pub struct App {
     search_origin: Cursor,
     back_history: Vec<NavigationLocation>,
     forward_history: Vec<NavigationLocation>,
+    last_editor_click: Option<(Instant, Cursor)>,
 }
 
 impl App {
@@ -148,6 +150,7 @@ impl App {
             search_origin: Cursor::default(),
             back_history: Vec::new(),
             forward_history: Vec::new(),
+            last_editor_click: None,
         })
     }
 
@@ -352,6 +355,14 @@ impl App {
         self.editor.clear_selection();
         self.editor
             .set_cursor_from_display_position(line, display_column);
+        let cursor = self.editor.cursor;
+        let double_click = self.last_editor_click.is_some_and(|(time, previous)| {
+            previous == cursor && time.elapsed() <= Duration::from_millis(500)
+        });
+        self.last_editor_click = Some((Instant::now(), cursor));
+        if double_click {
+            self.editor.select_word_at_cursor();
+        }
         self.search_origin = self.editor.cursor;
         self.commit_navigation(before);
         self.message = format!(
@@ -891,7 +902,29 @@ impl App {
     }
 
     fn handle_normal(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::SHIFT) && self.extend_selection(key.code) {
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.extend_selection(key.code)
+        {
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            let moved = match key.code {
+                KeyCode::Up => {
+                    self.editor.checkpoint();
+                    self.editor.move_line(false)
+                }
+                KeyCode::Down => {
+                    self.editor.checkpoint();
+                    self.editor.move_line(true)
+                }
+                _ => return,
+            };
+            self.message = if moved {
+                "Moved line".to_string()
+            } else {
+                "Line cannot move further".to_string()
+            };
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -913,6 +946,32 @@ impl App {
                         );
                     } else {
                         self.message = "No next occurrence".to_string();
+                    }
+                }
+                KeyCode::Char('j') => {
+                    self.editor.checkpoint();
+                    self.message = if self.editor.join_line_below() {
+                        "Joined lines".to_string()
+                    } else {
+                        "No line below to join".to_string()
+                    };
+                }
+                KeyCode::Left => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.editor.begin_selection();
+                        self.editor.extend_word_backward();
+                    } else {
+                        self.editor.clear_selection();
+                        self.editor.move_word_backward();
+                    }
+                }
+                KeyCode::Right => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.editor.begin_selection();
+                        self.editor.extend_word_forward();
+                    } else {
+                        self.editor.clear_selection();
+                        self.editor.move_word_forward();
                     }
                 }
                 _ => {}
@@ -963,10 +1022,22 @@ impl App {
                 self.pending_key = None;
                 self.message.clear();
             }
-            KeyCode::Left | KeyCode::Char('h') => self.editor.move_left(),
-            KeyCode::Down | KeyCode::Char('j') => self.editor.move_down(),
-            KeyCode::Up | KeyCode::Char('k') => self.editor.move_up(),
-            KeyCode::Right | KeyCode::Char('l') => self.editor.move_right(),
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.editor.clear_selection();
+                self.editor.move_left();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.editor.clear_selection();
+                self.editor.move_down();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.editor.clear_selection();
+                self.editor.move_up();
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.editor.clear_selection();
+                self.editor.move_right();
+            }
             KeyCode::Home | KeyCode::Char('0') => self.editor.move_line_start(),
             KeyCode::End | KeyCode::Char('$') => self.editor.move_line_end(),
             KeyCode::PageUp => self.editor.page_up(self.viewport_rows.saturating_sub(1)),
@@ -976,6 +1047,11 @@ impl App {
             KeyCode::Char('G') => self.editor.move_file_end(),
             KeyCode::Char('g') => self.pending_key = Some('g'),
             KeyCode::Char('d') => self.pending_key = Some('d'),
+            KeyCode::Char('D') => {
+                self.editor.checkpoint();
+                self.editor.duplicate_line();
+                self.message = "Duplicated line".to_string();
+            }
             KeyCode::Char('y') => self.pending_key = Some('y'),
             KeyCode::Char('x') | KeyCode::Delete => {
                 self.editor.checkpoint();
@@ -1006,6 +1082,11 @@ impl App {
             }
             KeyCode::Char('n') => self.repeat_search(true),
             KeyCode::Char('N') => self.repeat_search(false),
+            KeyCode::Char('%') => {
+                if !self.editor.jump_to_matching_bracket() {
+                    self.message = "No matching bracket".to_string();
+                }
+            }
             KeyCode::Char(':')
             | KeyCode::Char(';') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.command_input.clear();
@@ -1025,7 +1106,10 @@ impl App {
     }
 
     fn handle_insert(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::SHIFT) && self.extend_selection(key.code) {
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.extend_selection(key.code)
+        {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1042,6 +1126,24 @@ impl App {
                         self.message = "No next occurrence".to_string();
                     }
                 }
+                KeyCode::Left => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.editor.begin_selection();
+                        self.editor.extend_word_backward();
+                    } else {
+                        self.editor.clear_selection();
+                        self.editor.move_word_backward();
+                    }
+                }
+                KeyCode::Right => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.editor.begin_selection();
+                        self.editor.extend_word_forward();
+                    } else {
+                        self.editor.clear_selection();
+                        self.editor.move_word_forward();
+                    }
+                }
                 _ => {}
             }
             return;
@@ -1049,24 +1151,64 @@ impl App {
 
         match key.code {
             KeyCode::F(1) => self.mode = Mode::Help,
+            KeyCode::F(7) => {
+                self.editor.checkpoint();
+                self.editor.duplicate_line();
+                self.message = "Duplicated line".to_string();
+            }
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.message = "-- NORMAL --".to_string();
             }
             KeyCode::Enter => self.editor.insert_char('\n'),
             KeyCode::Backspace => {
-                self.editor.backspace();
+                self.editor.backspace_pair();
             }
             KeyCode::Delete => {
                 self.editor.delete_at_cursor();
             }
             KeyCode::Tab => self.editor.insert_tab(),
-            KeyCode::Left => self.editor.move_left(),
-            KeyCode::Right => self.editor.move_right(),
-            KeyCode::Up => self.editor.move_up(),
-            KeyCode::Down => self.editor.move_down(),
+            KeyCode::Left => {
+                self.editor.clear_selection();
+                self.editor.move_left();
+            }
+            KeyCode::Right => {
+                self.editor.clear_selection();
+                self.editor.move_right();
+            }
+            KeyCode::Up => {
+                self.editor.clear_selection();
+                self.editor.move_up();
+            }
+            KeyCode::Down => {
+                self.editor.clear_selection();
+                self.editor.move_down();
+            }
             KeyCode::Home => self.editor.move_line_start(),
             KeyCode::End => self.editor.move_line_end(),
+            KeyCode::Char('(') => self.editor.insert_pair('(', ')'),
+            KeyCode::Char('[') => self.editor.insert_pair('[', ']'),
+            KeyCode::Char('{') => self.editor.insert_pair('{', '}'),
+            KeyCode::Char(')') => {
+                if !self.editor.skip_closing_character(')') {
+                    self.editor.insert_char(')');
+                }
+            }
+            KeyCode::Char(']') => {
+                if !self.editor.skip_closing_character(']') {
+                    self.editor.insert_char(']');
+                }
+            }
+            KeyCode::Char('}') => {
+                if !self.editor.skip_closing_character('}') {
+                    self.editor.insert_char('}');
+                }
+            }
+            KeyCode::Char(quote @ ('\'' | '"')) => {
+                if !self.editor.skip_closing_character(quote) {
+                    self.editor.insert_pair(quote, quote);
+                }
+            }
             KeyCode::Char(character)
                 if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
@@ -1337,6 +1479,40 @@ impl App {
             "pwd" => self.message = self.project.root.display().to_string(),
             "back" | "previous" => self.go_back(),
             "forward" | "nextlocation" => self.go_forward(),
+            "duplicate" | "dup" => {
+                self.editor.checkpoint();
+                self.editor.duplicate_line();
+                self.message = "Duplicated line".to_string();
+            }
+            "moveup" => {
+                self.editor.checkpoint();
+                self.message = if self.editor.move_line(false) {
+                    "Moved line up".to_string()
+                } else {
+                    "Line is already first".to_string()
+                };
+            }
+            "movedown" => {
+                self.editor.checkpoint();
+                self.message = if self.editor.move_line(true) {
+                    "Moved line down".to_string()
+                } else {
+                    "Line is already last".to_string()
+                };
+            }
+            "join" => {
+                self.editor.checkpoint();
+                self.message = if self.editor.join_line_below() {
+                    "Joined lines".to_string()
+                } else {
+                    "No line below to join".to_string()
+                };
+            }
+            "sort" => {
+                self.editor.checkpoint();
+                let count = self.editor.sort_selected_lines();
+                self.message = format!("Sorted {count} line(s)");
+            }
             "expandall" | "treeexpand" => match self.project.expand_all() {
                 Ok(count) => self.message = format!("Expanded {count} folder(s)"),
                 Err(error) => self.message = format!("Expand all failed: {error}"),
