@@ -34,3 +34,8 @@ milestone.
 - Recent-project dashboard
 - Better progress, notification, and background-task status UI
 - Accessibility audit and terminal compatibility test matrix
+
+## Known bugs
+
+- C# `:def` returns no definition in Caret even though the same `csharp-ls`
+  request succeeds against the loaded solution in an isolated protocol test.
