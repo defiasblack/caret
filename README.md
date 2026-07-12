@@ -163,6 +163,7 @@ read.
 | `Shift` + arrows / Home / End | Select text with the keyboard |
 | Drag with left mouse button | Select text with the mouse |
 | `Ctrl-C` / `Ctrl-X` / `Ctrl-V` | Copy / cut / paste selected text |
+| `Ctrl-D` | Select the next occurrence of the current word or selection |
 | `Delete` / `Backspace` | Delete selected text |
 
 ## Commands

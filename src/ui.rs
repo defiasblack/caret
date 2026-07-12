@@ -566,7 +566,7 @@ fn draw_editor<W: Write>(
         let search_hits = search_hit_map(&line, search_query);
         let text_width = editor_width.saturating_sub(gutter_width as u16) as usize;
         let line_start = app.editor.buffer_line_to_char(line_index);
-        let selection = app.editor.selection_range();
+        let selections = app.editor.selection_ranges();
 
         render_line_text(
             out,
@@ -582,7 +582,7 @@ fn draw_editor<W: Write>(
             app.theme.search_foreground,
             app.theme.search_background,
             line_start,
-            selection,
+            &selections,
         )?;
     }
 
@@ -604,7 +604,7 @@ fn render_line_text<W: Write>(
     search_foreground: Color,
     search_background: Color,
     line_start: usize,
-    selection: Option<(usize, usize)>,
+    selections: &[(usize, usize)],
 ) -> io::Result<()> {
     if viewport_width == 0 {
         return Ok(());
@@ -635,9 +635,9 @@ fn render_line_text<W: Write>(
         }
 
         let highlighted = search_hits.get(character_index).copied().unwrap_or(false);
-        let selected = selection
-            .map(|(start, end)| (start..end).contains(&(line_start + character_index)))
-            .unwrap_or(false);
+        let selected = selections.iter().any(|(start, end)| {
+            (*start..*end).contains(&(line_start + character_index))
+        });
         let foreground = if highlighted {
             search_foreground
         } else {
@@ -959,12 +959,13 @@ fn draw_help<W: Write>(
     terminal_height: u16,
 ) -> io::Result<()> {
     const PAGES: [&str; 4] = ["EDITING", "NAVIGATION", "FILES", "COMMANDS"];
-    const EDITING: [(&str, &str); 11] = [
+    const EDITING: [(&str, &str); 12] = [
         ("Type normally", "Enter text while in Insert mode"),
         ("Esc", "Switch to Normal mode"),
         ("Shift + Arrow/Home/End", "Select text with the keyboard"),
         ("Mouse drag", "Select text with the mouse"),
         ("Ctrl-C / Ctrl-X / Ctrl-V", "Copy / Cut / Paste selection"),
+        ("Ctrl-D", "Select next occurrence; type to edit all selections"),
         ("Backspace / Delete", "Delete text or selection"),
         ("Ctrl-S", "Save the current file"),
         ("i / a  (Normal)", "Insert before / after cursor"),

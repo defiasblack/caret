@@ -905,6 +905,16 @@ impl App {
                         self.message = "Nothing to redo".to_string();
                     }
                 }
+                KeyCode::Char('d') => {
+                    if self.editor.select_next_occurrence() {
+                        self.message = format!(
+                            "Selected {} occurrences",
+                            self.editor.selection_ranges().len()
+                        );
+                    } else {
+                        self.message = "No next occurrence".to_string();
+                    }
+                }
                 _ => {}
             }
             return;
@@ -1022,6 +1032,16 @@ impl App {
             match key.code {
                 KeyCode::Char('s') => self.save(),
                 KeyCode::Char('q') => self.request_quit(false),
+                KeyCode::Char('d') => {
+                    if self.editor.select_next_occurrence() {
+                        self.message = format!(
+                            "Selected {} occurrences",
+                            self.editor.selection_ranges().len()
+                        );
+                    } else {
+                        self.message = "No next occurrence".to_string();
+                    }
+                }
                 _ => {}
             }
             return;

@@ -18,7 +18,14 @@ struct Snapshot {
     buffer: Rope,
     cursor: Cursor,
     selection_anchor: Option<Cursor>,
+    secondary_cursors: Vec<SecondaryCursor>,
     dirty: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecondaryCursor {
+    pub cursor: Cursor,
+    pub selection_anchor: Option<Cursor>,
 }
 
 pub struct Editor {
@@ -26,6 +33,7 @@ pub struct Editor {
     pub path: Option<PathBuf>,
     pub cursor: Cursor,
     pub selection_anchor: Option<Cursor>,
+    pub secondary_cursors: Vec<SecondaryCursor>,
     pub scroll_line: usize,
     pub scroll_column: usize,
     pub dirty: bool,
@@ -45,6 +53,7 @@ impl Editor {
                 path: Some(path.to_path_buf()),
                 cursor: Cursor::default(),
                 selection_anchor: None,
+                secondary_cursors: Vec::new(),
                 scroll_line: 0,
                 scroll_column: 0,
                 dirty: false,
@@ -64,6 +73,7 @@ impl Editor {
             path: None,
             cursor: Cursor::default(),
             selection_anchor: None,
+            secondary_cursors: Vec::new(),
             scroll_line: 0,
             scroll_column: 0,
             dirty: false,
@@ -82,6 +92,7 @@ impl Editor {
             path: Some(path.to_path_buf()),
             cursor: Cursor::default(),
             selection_anchor: None,
+            secondary_cursors: Vec::new(),
             scroll_line: 0,
             scroll_column: 0,
             dirty: false,
@@ -146,6 +157,7 @@ impl Editor {
             buffer: self.buffer.clone(),
             cursor: self.cursor,
             selection_anchor: self.selection_anchor,
+            secondary_cursors: self.secondary_cursors.clone(),
             dirty: self.dirty,
         });
 
@@ -166,12 +178,14 @@ impl Editor {
             buffer: self.buffer.clone(),
             cursor: self.cursor,
             selection_anchor: self.selection_anchor,
+            secondary_cursors: self.secondary_cursors.clone(),
             dirty: self.dirty,
         });
 
         self.buffer = snapshot.buffer;
         self.cursor = snapshot.cursor;
         self.selection_anchor = snapshot.selection_anchor;
+        self.secondary_cursors = snapshot.secondary_cursors;
         self.dirty = snapshot.dirty;
         self.clamp_cursor();
         true
@@ -186,12 +200,14 @@ impl Editor {
             buffer: self.buffer.clone(),
             cursor: self.cursor,
             selection_anchor: self.selection_anchor,
+            secondary_cursors: self.secondary_cursors.clone(),
             dirty: self.dirty,
         });
 
         self.buffer = snapshot.buffer;
         self.cursor = snapshot.cursor;
         self.selection_anchor = snapshot.selection_anchor;
+        self.secondary_cursors = snapshot.secondary_cursors;
         self.dirty = snapshot.dirty;
         self.clamp_cursor();
         true
@@ -265,16 +281,21 @@ impl Editor {
     }
 
     pub fn selection_range(&self) -> Option<(usize, usize)> {
-        let anchor = self.selection_anchor?;
-        let anchor_index = self.buffer.line_to_char(anchor.line) + anchor.column;
-        let cursor_index = self.current_char_index();
-        (anchor_index != cursor_index).then(|| {
-            if anchor_index < cursor_index {
-                (anchor_index, cursor_index)
-            } else {
-                (cursor_index, anchor_index)
-            }
-        })
+        Self::cursor_selection_range(&self.buffer, self.cursor, self.selection_anchor)
+    }
+
+    pub fn selection_ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges = self
+            .secondary_cursors
+            .iter()
+            .filter_map(|cursor| {
+                Self::cursor_selection_range(&self.buffer, cursor.cursor, cursor.selection_anchor)
+            })
+            .collect::<Vec<_>>();
+        if let Some(range) = self.selection_range() {
+            ranges.push(range);
+        }
+        ranges
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -290,6 +311,61 @@ impl Editor {
 
     pub fn clear_selection(&mut self) {
         self.selection_anchor = None;
+        self.secondary_cursors.clear();
+    }
+
+    pub fn select_next_occurrence(&mut self) -> bool {
+        let query = if let Some(text) = self.selected_text() {
+            text
+        } else {
+            let characters = self.buffer.chars().collect::<Vec<_>>();
+            let mut start = self.current_char_index();
+            if start >= characters.len() || !is_word_character(characters[start]) {
+                if start == 0 || !is_word_character(characters[start - 1]) {
+                    return false;
+                }
+                start -= 1;
+            }
+            while start > 0 && is_word_character(characters[start - 1]) {
+                start -= 1;
+            }
+            let mut end = start;
+            while end < characters.len() && is_word_character(characters[end]) {
+                end += 1;
+            }
+            if start == end {
+                return false;
+            }
+            let text = self.buffer.slice(start..end).to_string();
+            self.set_cursor_from_char_index(end);
+            self.selection_anchor = Some(self.cursor_from_char_index(start));
+            text
+        };
+
+        let query_len = query.chars().count();
+        let text = self.buffer.to_string();
+        let occupied = self.selection_ranges();
+        let after = self.selection_range().map(|(_, end)| end).unwrap_or(0);
+        let mut matches = text
+            .match_indices(&query)
+            .map(|(byte, _)| text[..byte].chars().count())
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|start| (*start < after, *start));
+
+        let Some(start) = matches.into_iter().find(|start| {
+            let end = *start + query_len;
+            !occupied.iter().any(|(used_start, used_end)| *start < *used_end && end > *used_start)
+        }) else {
+            return false;
+        };
+
+        self.secondary_cursors.push(SecondaryCursor {
+            cursor: self.cursor,
+            selection_anchor: self.selection_anchor,
+        });
+        self.set_cursor_from_char_index(start + query_len);
+        self.selection_anchor = Some(self.cursor_from_char_index(start));
+        true
     }
 
     pub fn delete_selection(&mut self) -> Option<String> {
@@ -300,6 +376,28 @@ impl Editor {
         self.selection_anchor = None;
         self.dirty = true;
         Some(text)
+    }
+
+    fn cursor_selection_range(
+        buffer: &Rope,
+        cursor: Cursor,
+        anchor: Option<Cursor>,
+    ) -> Option<(usize, usize)> {
+        let anchor = anchor?;
+        let anchor_index = buffer.line_to_char(anchor.line) + anchor.column;
+        let cursor_index = buffer.line_to_char(cursor.line) + cursor.column;
+        (anchor_index != cursor_index).then(|| (anchor_index.min(cursor_index), anchor_index.max(cursor_index)))
+    }
+
+    fn cursor_from_char_index(&self, index: usize) -> Cursor {
+        let index = index.min(self.buffer.len_chars());
+        let line = self.buffer.char_to_line(index);
+        Cursor {
+            line,
+            column: index
+                .saturating_sub(self.buffer.line_to_char(line))
+                .min(self.line_len_chars(line)),
+        }
     }
 
     pub fn set_cursor_from_char_index(&mut self, index: usize) {
@@ -350,6 +448,10 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, character: char) {
+        if !self.secondary_cursors.is_empty() {
+            self.replace_at_cursors(&character.to_string());
+            return;
+        }
         self.delete_selection();
         let index = self.current_char_index();
 
@@ -362,6 +464,56 @@ impl Editor {
             self.cursor.column += 1;
         }
 
+        self.dirty = true;
+        self.preferred_column = None;
+    }
+
+    fn replace_at_cursors(&mut self, replacement: &str) {
+        let primary = (self.current_char_index(), self.selection_range());
+        let mut targets = self
+            .secondary_cursors
+            .iter()
+            .map(|cursor| {
+                let index = self.buffer.line_to_char(cursor.cursor.line) + cursor.cursor.column;
+                let range = Self::cursor_selection_range(
+                    &self.buffer,
+                    cursor.cursor,
+                    cursor.selection_anchor,
+                );
+                (false, index, range)
+            })
+            .collect::<Vec<_>>();
+        targets.push((true, primary.0, primary.1));
+        targets.sort_by_key(|(_, index, range)| range.map(|(start, _)| start).unwrap_or(*index));
+
+        let replacement_len = replacement.chars().count();
+        let mut offset: isize = 0;
+        let mut primary_index = 0;
+        let mut secondary_indices = Vec::new();
+        for (is_primary, index, range) in targets {
+            let (start, end) = range.unwrap_or((index, index));
+            let start = (start as isize + offset) as usize;
+            let end = (end as isize + offset) as usize;
+            self.buffer.remove(start..end);
+            self.buffer.insert(start, replacement);
+            let next = start + replacement_len;
+            if is_primary {
+                primary_index = next;
+            } else {
+                secondary_indices.push(next);
+            }
+            offset += replacement_len as isize - (end - start) as isize;
+        }
+
+        self.set_cursor_from_char_index(primary_index);
+        self.selection_anchor = None;
+        self.secondary_cursors = secondary_indices
+            .into_iter()
+            .map(|index| SecondaryCursor {
+                cursor: self.cursor_from_char_index(index),
+                selection_anchor: None,
+            })
+            .collect();
         self.dirty = true;
         self.preferred_column = None;
     }
@@ -742,4 +894,25 @@ pub fn display_width(text: &str, tab_width: usize) -> usize {
     }
 
     column
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_next_occurrence_and_replace_all() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("alpha beta alpha alpha");
+        editor.set_cursor_from_char_index(0);
+
+        assert!(editor.select_next_occurrence());
+        assert!(editor.select_next_occurrence());
+        assert_eq!(editor.selection_ranges().len(), 3);
+
+        editor.insert_char('z');
+        assert_eq!(editor.buffer.to_string(), "z beta z z");
+        editor.insert_char('!');
+        assert_eq!(editor.buffer.to_string(), "z! beta z! z!");
+    }
 }
