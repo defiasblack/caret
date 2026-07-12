@@ -17,8 +17,14 @@ pub struct LspClient {
 
 impl LspClient {
     pub fn start(command: &str, root: &Path) -> io::Result<Self> {
-        let mut child = Command::new(command)
-            .current_dir(root)
+        let mut process = Command::new(command);
+        process.current_dir(root);
+        if command == "csharp-ls" {
+            if let Some(solution) = find_solution(root) {
+                process.arg("--solution").arg(solution);
+            }
+        }
+        let mut child = process
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -78,6 +84,21 @@ impl LspClient {
         input.write_all(&body)?;
         input.flush()
     }
+}
+
+fn find_solution(root: &Path) -> Option<std::path::PathBuf> {
+    let mut solutions = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("sln"))
+        })
+        .collect::<Vec<_>>();
+    solutions.sort();
+    solutions.into_iter().next()
 }
 
 impl Drop for LspClient {
