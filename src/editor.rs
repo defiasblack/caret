@@ -41,6 +41,7 @@ pub struct Editor {
     pub tab_width: usize,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    undo_group_active: bool,
     preferred_column: Option<usize>,
 }
 
@@ -61,6 +62,7 @@ impl Editor {
                 tab_width: 4,
                 undo: Vec::new(),
                 redo: Vec::new(),
+                undo_group_active: false,
                 preferred_column: None,
             }),
             None => Ok(Self::blank()),
@@ -81,6 +83,7 @@ impl Editor {
             tab_width: 4,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_group_active: false,
             preferred_column: None,
         }
     }
@@ -100,6 +103,7 @@ impl Editor {
             tab_width: 4,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_group_active: false,
             preferred_column: None,
         })
     }
@@ -153,6 +157,25 @@ impl Editor {
     }
 
     pub fn checkpoint(&mut self) {
+        self.push_undo_snapshot();
+        self.undo_group_active = true;
+    }
+
+    /// Starts an undo group unless one is already active.  Consecutive typing
+    /// and deletion operations share a single undo entry until navigation or
+    /// a mode change ends the group.
+    fn begin_undo_group(&mut self) {
+        if !self.undo_group_active {
+            self.push_undo_snapshot();
+            self.undo_group_active = true;
+        }
+    }
+
+    pub fn finish_undo_group(&mut self) {
+        self.undo_group_active = false;
+    }
+
+    fn push_undo_snapshot(&mut self) {
         self.undo.push(Snapshot {
             buffer: self.buffer.clone(),
             cursor: self.cursor,
@@ -170,6 +193,7 @@ impl Editor {
     }
 
     pub fn undo(&mut self) -> bool {
+        self.finish_undo_group();
         let Some(snapshot) = self.undo.pop() else {
             return false;
         };
@@ -192,6 +216,7 @@ impl Editor {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.finish_undo_group();
         let Some(snapshot) = self.redo.pop() else {
             return false;
         };
@@ -391,6 +416,7 @@ impl Editor {
 
     pub fn delete_selection(&mut self) -> Option<String> {
         let (start, end) = self.selection_range()?;
+        self.begin_undo_group();
         let text = self.buffer.slice(start..end).to_string();
         self.buffer.remove(start..end);
         self.set_cursor_from_char_index(start);
@@ -469,6 +495,7 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, character: char) {
+        self.begin_undo_group();
         if !self.secondary_cursors.is_empty() {
             self.replace_at_cursors(&character.to_string());
             return;
@@ -490,6 +517,7 @@ impl Editor {
     }
 
     pub fn insert_pair(&mut self, opening: char, closing: char) {
+        self.begin_undo_group();
         if let Some((start, end)) = self.selection_range() {
             if self.secondary_cursors.is_empty() {
                 self.buffer.insert_char(end, closing);
@@ -529,6 +557,7 @@ impl Editor {
     }
 
     fn replace_at_cursors(&mut self, replacement: &str) {
+        self.begin_undo_group();
         let primary = (self.current_char_index(), self.selection_range());
         let mut targets = self
             .secondary_cursors
@@ -615,6 +644,8 @@ impl Editor {
             return false;
         }
 
+        self.begin_undo_group();
+
         if self.cursor.column > 0 {
             self.buffer.remove(index - 1..index);
             self.cursor.column -= 1;
@@ -649,6 +680,7 @@ impl Editor {
             && index < self.buffer.len_chars()
             && matching_close(self.buffer.char(index - 1)) == Some(self.buffer.char(index))
         {
+            self.begin_undo_group();
             self.buffer.remove(index - 1..index + 1);
             self.set_cursor_from_char_index(index - 1);
             self.dirty = true;
@@ -667,6 +699,8 @@ impl Editor {
         if index >= self.buffer.len_chars() {
             return false;
         }
+
+        self.begin_undo_group();
 
         let current = self.buffer.char(index);
 
@@ -688,6 +722,8 @@ impl Editor {
         if self.line_count() == 0 {
             return None;
         }
+
+        self.begin_undo_group();
 
         let line = self.cursor.line;
         let removed = self.line_with_ending(line);
@@ -712,6 +748,7 @@ impl Editor {
     }
 
     pub fn paste_line_below(&mut self, text: &str) {
+        self.begin_undo_group();
         let mut line_text = text.to_string();
         if !line_text.ends_with('\n') {
             line_text.push('\n');
@@ -738,6 +775,7 @@ impl Editor {
     }
 
     pub fn duplicate_line(&mut self) {
+        self.begin_undo_group();
         let mut lines = self.logical_lines();
         let line = self.cursor.line.min(lines.len().saturating_sub(1));
         lines.insert(line, lines[line].clone());
@@ -761,6 +799,8 @@ impl Editor {
             return false;
         };
 
+        self.begin_undo_group();
+
         let mut lines = self.logical_lines();
         lines.swap(line, target);
         self.replace_logical_lines(&lines, self.has_trailing_newline());
@@ -778,6 +818,8 @@ impl Editor {
         if line + 1 >= self.line_count() {
             return false;
         }
+
+        self.begin_undo_group();
 
         let left = self.line_text(line);
         let right = self.line_text(line + 1);
@@ -803,6 +845,7 @@ impl Editor {
     }
 
     pub fn sort_selected_lines(&mut self) -> usize {
+        self.begin_undo_group();
         let mut lines = self.logical_lines();
         let start = self.cursor.line.min(lines.len().saturating_sub(1));
         let mut end = start;
@@ -825,6 +868,7 @@ impl Editor {
     }
 
     pub fn open_line_below(&mut self) {
+        self.begin_undo_group();
         let insertion = if self.cursor.line + 1 < self.line_count() {
             self.buffer.line_to_char(self.cursor.line + 1)
         } else {
@@ -848,6 +892,7 @@ impl Editor {
     }
 
     pub fn open_line_above(&mut self) {
+        self.begin_undo_group();
         let insertion = self.buffer.line_to_char(self.cursor.line);
         self.buffer.insert_char(insertion, '\n');
         self.cursor.column = 0;
@@ -856,6 +901,7 @@ impl Editor {
     }
 
     pub fn move_left(&mut self) {
+        self.finish_undo_group();
         if self.cursor.column > 0 {
             self.cursor.column -= 1;
         } else if self.cursor.line > 0 {
@@ -866,6 +912,7 @@ impl Editor {
     }
 
     pub fn move_right(&mut self) {
+        self.finish_undo_group();
         let line_length = self.line_len_chars(self.cursor.line);
 
         if self.cursor.column < line_length {
@@ -878,6 +925,7 @@ impl Editor {
     }
 
     pub fn move_up(&mut self) {
+        self.finish_undo_group();
         if self.cursor.line == 0 {
             return;
         }
@@ -889,6 +937,7 @@ impl Editor {
     }
 
     pub fn move_down(&mut self) {
+        self.finish_undo_group();
         if self.cursor.line + 1 >= self.line_count() {
             return;
         }
@@ -900,39 +949,46 @@ impl Editor {
     }
 
     pub fn page_up(&mut self, amount: usize) {
+        self.finish_undo_group();
         for _ in 0..amount {
             self.move_up();
         }
     }
 
     pub fn page_down(&mut self, amount: usize) {
+        self.finish_undo_group();
         for _ in 0..amount {
             self.move_down();
         }
     }
 
     pub fn move_line_start(&mut self) {
+        self.finish_undo_group();
         self.cursor.column = 0;
         self.preferred_column = None;
     }
 
     pub fn move_line_end(&mut self) {
+        self.finish_undo_group();
         self.cursor.column = self.line_len_chars(self.cursor.line);
         self.preferred_column = None;
     }
 
     pub fn move_file_start(&mut self) {
+        self.finish_undo_group();
         self.cursor = Cursor::default();
         self.preferred_column = None;
     }
 
     pub fn move_file_end(&mut self) {
+        self.finish_undo_group();
         self.cursor.line = self.line_count().saturating_sub(1);
         self.cursor.column = self.line_len_chars(self.cursor.line);
         self.preferred_column = None;
     }
 
     pub fn move_word_forward(&mut self) {
+        self.finish_undo_group();
         let characters: Vec<char> = self.buffer.chars().collect();
         let mut index = self.current_char_index();
 
@@ -954,6 +1010,7 @@ impl Editor {
     }
 
     pub fn move_word_backward(&mut self) {
+        self.finish_undo_group();
         let characters: Vec<char> = self.buffer.chars().collect();
         let mut index = self.current_char_index();
 
@@ -975,6 +1032,7 @@ impl Editor {
     }
 
     pub fn jump_to_matching_bracket(&mut self) -> bool {
+        self.finish_undo_group();
         let characters = self.buffer.chars().collect::<Vec<_>>();
         let mut index = self.current_char_index();
         if index >= characters.len() || !is_bracket(characters[index]) {
@@ -1049,6 +1107,7 @@ impl Editor {
     }
 
     pub fn goto_line(&mut self, line: usize) {
+        self.finish_undo_group();
         self.cursor.line = line.min(self.line_count().saturating_sub(1));
         self.cursor.column = self.cursor.column.min(self.line_len_chars(self.cursor.line));
         self.preferred_column = None;
@@ -1287,5 +1346,26 @@ mod tests {
         editor.set_cursor_from_char_index(17);
         assert!(editor.jump_to_matching_bracket());
         assert_eq!(editor.current_char_index(), 19);
+    }
+
+    #[test]
+    fn undo_groups_consecutive_edits_and_splits_after_navigation() {
+        let mut editor = Editor::blank();
+
+        editor.insert_char('a');
+        editor.insert_char('b');
+        editor.insert_char('c');
+        assert_eq!(editor.buffer.to_string(), "abc");
+        assert!(editor.undo());
+        assert_eq!(editor.buffer.to_string(), "");
+
+        assert!(editor.redo());
+        editor.move_left();
+        editor.insert_char('!');
+        assert_eq!(editor.buffer.to_string(), "ab!c");
+        assert!(editor.undo());
+        assert_eq!(editor.buffer.to_string(), "abc");
+        assert!(editor.undo());
+        assert_eq!(editor.buffer.to_string(), "");
     }
 }

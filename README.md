@@ -19,6 +19,7 @@ undo/redo.
 - Rust, JSON, TOML, Markdown, Python, and shell syntax coloring
 - Incremental search with match highlighting
 - Undo and redo
+- Grouped undo for consecutive typing and deletion, split by navigation
 - Line numbers and horizontal/vertical scrolling
 - Context-sensitive hotkey strip
 - Mouse-wheel scrolling

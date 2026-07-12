@@ -1,15 +1,11 @@
 # Caret Roadmap
 
-This list tracks the features discussed for Caret that are not part of the
-current productivity milestone.
+This list tracks Caret features that remain after the completed productivity
+milestone.
 
 ## Editing
 
-- Multiple cursors and select-next-occurrence editing
-- Duplicate, move, join, and sort lines
-- Automatic bracket/quote pairing and matching-bracket navigation
 - Indent/outdent selections and language-aware comment toggling
-- More granular, grouped undo history
 - Macro recording and replay
 
 ## Coding intelligence

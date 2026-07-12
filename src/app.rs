@@ -353,6 +353,7 @@ impl App {
         };
 
         self.editor.clear_selection();
+        self.editor.finish_undo_group();
         self.editor
             .set_cursor_from_display_position(line, display_column);
         let cursor = self.editor.cursor;
@@ -386,6 +387,7 @@ impl App {
 
         self.explorer_focused = false;
         self.mode = Mode::Insert;
+        self.editor.finish_undo_group();
         self.editor.begin_selection();
         let screen_row = (row - layout.content_top) as usize;
         let line = (self.editor.scroll_line + screen_row)
@@ -1158,6 +1160,7 @@ impl App {
             }
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
+                self.editor.finish_undo_group();
                 self.message = "-- NORMAL --".to_string();
             }
             KeyCode::Enter => self.editor.insert_char('\n'),
