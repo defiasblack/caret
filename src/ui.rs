@@ -106,15 +106,30 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         draw_vertical_separator(out, app, sidebar_width as u16, content_top, content_height)?;
     }
 
-    draw_editor(
-        out,
-        app,
-        content_top,
-        content_height,
-        editor_x as u16,
-        editor_width as u16,
-        gutter_width,
-    )?;
+    if let Some(views) = app.split_views {
+        let focused = (app.editor.active_index(), app.editor.cursor, app.editor.scroll_line, app.editor.scroll_column);
+        if views.vertical {
+            let pane_width = editor_width.saturating_sub(1) / 2;
+            let pane_gutter = app.editor.line_number_width().min(pane_width.saturating_sub(1));
+            app.editor.select(views.primary.tab_index); app.editor.cursor = views.primary.cursor; app.editor.scroll_line = views.primary.scroll_line; app.editor.scroll_column = views.primary.scroll_column;
+            draw_editor(out, app, content_top, content_height, editor_x as u16, pane_width as u16, pane_gutter)?;
+            let divider = editor_x + pane_width;
+            draw_vertical_separator(out, app, divider as u16, content_top, content_height)?;
+            app.editor.select(views.secondary.tab_index); app.editor.cursor = views.secondary.cursor; app.editor.scroll_line = views.secondary.scroll_line; app.editor.scroll_column = views.secondary.scroll_column;
+            draw_editor(out, app, content_top, content_height, (divider + 1) as u16, pane_width as u16, pane_gutter)?;
+        } else {
+            let pane_rows = content_height.saturating_sub(1) / 2;
+            app.editor.select(views.primary.tab_index); app.editor.cursor = views.primary.cursor; app.editor.scroll_line = views.primary.scroll_line; app.editor.scroll_column = views.primary.scroll_column;
+            draw_editor(out, app, content_top, pane_rows, editor_x as u16, editor_width as u16, gutter_width)?;
+            let divider = content_top + pane_rows as u16;
+            queue!(out, MoveTo(editor_x as u16, divider), SetBackgroundColor(app.theme.background), SetForegroundColor(app.theme.border), Print("─".repeat(editor_width)))?;
+            app.editor.select(views.secondary.tab_index); app.editor.cursor = views.secondary.cursor; app.editor.scroll_line = views.secondary.scroll_line; app.editor.scroll_column = views.secondary.scroll_column;
+            draw_editor(out, app, divider + 1, pane_rows, editor_x as u16, editor_width as u16, gutter_width)?;
+        }
+        app.editor.select(focused.0); app.editor.cursor = focused.1; app.editor.scroll_line = focused.2; app.editor.scroll_column = focused.3;
+    } else {
+        draw_editor(out, app, content_top, content_height, editor_x as u16, editor_width as u16, gutter_width)?;
+    }
     draw_status_bar(out, app, layout.status_row, width)?;
     draw_command_palette(out, app, width, height)?;
     draw_prompt_bar(out, app, layout.prompt_row, width)?;
@@ -124,14 +139,26 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         draw_help(out, app, width, height)?;
     }
 
+    let (cursor_editor_x, cursor_editor_width, cursor_gutter_width) = if let Some(views) = app.split_views {
+        let pane_width = editor_width.saturating_sub(1) / 2;
+        let pane_gutter = app.editor.line_number_width().min(pane_width.saturating_sub(1));
+        let x = if views.vertical && views.secondary_active { editor_x + pane_width + 1 } else { editor_x };
+        (x, pane_width, pane_gutter)
+    } else { (editor_x, editor_width, gutter_width) };
+    let (cursor_content_top, cursor_content_height) = if let Some(views) = app.split_views {
+        if !views.vertical && views.secondary_active {
+            let pane_rows = content_height.saturating_sub(1) / 2;
+            (content_top + pane_rows as u16 + 1, pane_rows)
+        } else if !views.vertical { (content_top, content_height.saturating_sub(1) / 2) } else { (content_top, content_height) }
+    } else { (content_top, content_height) };
     place_cursor(
         out,
         app,
-        content_top,
-        content_height,
-        editor_x,
-        editor_width,
-        gutter_width,
+        cursor_content_top,
+        cursor_content_height,
+        cursor_editor_x,
+        cursor_editor_width,
+        cursor_gutter_width,
         width,
         height,
     )?;

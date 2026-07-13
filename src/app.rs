@@ -73,6 +73,22 @@ struct NavigationLocation {
     scroll_column: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EditorView {
+    pub tab_index: usize,
+    pub cursor: Cursor,
+    pub scroll_line: usize,
+    pub scroll_column: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SplitViews {
+    pub primary: EditorView,
+    pub secondary: EditorView,
+    pub secondary_active: bool,
+    pub vertical: bool,
+}
+
 pub struct App {
     pub editor: Tabs,
     pub project: ProjectTree,
@@ -92,6 +108,7 @@ pub struct App {
     pub viewport_rows: usize,
     pub viewport_columns: usize,
     pub follow_cursor: bool,
+    pub split_views: Option<SplitViews>,
     pub help_page: usize,
     pub hover_target: Option<HoverTarget>,
     settings: Settings,
@@ -177,6 +194,7 @@ impl App {
             viewport_rows: 1,
             viewport_columns: 1,
             follow_cursor: true,
+            split_views: None,
             help_page: 0,
             hover_target: None,
             settings,
@@ -203,8 +221,10 @@ impl App {
         self.poll_lsp();
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.activate_focused_view();
                 self.follow_cursor = true;
                 self.handle_key(key);
+                self.sync_focused_view();
                 self.sync_lsp_document();
                 true
             }
@@ -218,7 +238,9 @@ impl App {
                         | MouseEventKind::Drag(MouseButton::Left)
                 ) =>
             {
+                self.activate_focused_view();
                 self.handle_mouse(mouse);
+                self.sync_focused_view();
                 true
             }
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
@@ -419,6 +441,16 @@ impl App {
             return;
         }
 
+        if let Some(mut views) = self.split_views {
+            views.secondary_active = if views.vertical {
+                column > layout.editor_x + layout.editor_width.saturating_sub(1) / 2
+            } else {
+                row >= layout.content_top + layout.content_height.saturating_sub(1) as u16 / 2 + 1
+            };
+            self.split_views = Some(views);
+            self.activate_focused_view();
+        }
+
         let before = self.current_location();
         self.explorer_focused = false;
         self.follow_cursor = true;
@@ -547,6 +579,34 @@ impl App {
             }
         } else {
             self.mode.label()
+        }
+    }
+
+    fn activate_focused_view(&mut self) {
+        let Some(views) = self.split_views else { return; };
+        let view = if views.secondary_active { views.secondary } else { views.primary };
+        self.editor.select(view.tab_index);
+        self.editor.cursor = view.cursor;
+        self.editor.scroll_line = view.scroll_line;
+        self.editor.scroll_column = view.scroll_column;
+    }
+
+    fn sync_focused_view(&mut self) {
+        let Some(mut views) = self.split_views else { return; };
+        let view = EditorView { tab_index: self.editor.active_index(), cursor: self.editor.cursor, scroll_line: self.editor.scroll_line, scroll_column: self.editor.scroll_column };
+        if views.secondary_active { views.secondary = view; } else { views.primary = view; }
+        self.split_views = Some(views);
+    }
+
+    fn open_split(&mut self, vertical: bool) {
+        if let Some(mut views) = self.split_views {
+            views.vertical = vertical;
+            self.split_views = Some(views);
+            self.message = if vertical { "Vertical split" } else { "Horizontal split" }.to_string();
+        } else {
+            let view = EditorView { tab_index: self.editor.active_index(), cursor: self.editor.cursor, scroll_line: self.editor.scroll_line, scroll_column: self.editor.scroll_column };
+            self.split_views = Some(SplitViews { primary: view, secondary: view, secondary_active: false, vertical });
+            self.message = if vertical { "Vertical split opened · Ctrl-\\ switches panes" } else { "Horizontal split opened · Ctrl-\\ switches panes" }.to_string();
         }
     }
 
@@ -696,6 +756,10 @@ impl App {
     fn handle_global_shortcut(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('\\') => {
+                    if let Some(mut views) = self.split_views { self.sync_focused_view(); views.secondary_active = !views.secondary_active; self.split_views = Some(views); self.activate_focused_view(); }
+                    return true;
+                }
                 KeyCode::Char('a') => {
                     self.editor.clear_selection();
                     self.editor.move_file_start();
@@ -1694,7 +1758,7 @@ impl App {
     }
 
     pub fn command_suggestions(&self) -> Vec<&'static str> {
-        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "refresh", "symbols", "outline", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set number", "set nonumber", "set", "theme", "help"];
+        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "refresh", "symbols", "outline", "split", "vsplit", "only", "unsplit", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set number", "set nonumber", "set", "theme", "help"];
         let query = self.command_input.trim().to_ascii_lowercase();
         COMMANDS.iter().copied().filter(|command| command.contains(&query)).collect()
     }
@@ -1892,6 +1956,9 @@ impl App {
             "outdent" => self.indent_selection(true),
             "comment" | "togglecomment" => self.toggle_comments(),
             "symbols" | "outline" => self.show_symbols(),
+            "split" => self.open_split(false),
+            "vsplit" => self.open_split(true),
+            "only" | "unsplit" => { self.split_views = None; self.message = "Split closed".to_string(); }
             "fold" | "foldclose" => self.close_fold(),
             "foldopen" => self.open_fold(),
             "foldtoggle" => self.toggle_fold(),
