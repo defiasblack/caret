@@ -3,6 +3,7 @@ use std::{
     fs,
     io,
     path::{Path, PathBuf},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -33,6 +34,8 @@ pub enum Mode {
     Command,
     Help,
     QuitConfirm,
+    ReloadConfirm,
+    GitDiff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +64,8 @@ impl Mode {
             Self::Command => "COMMAND",
             Self::Help => "HELP",
             Self::QuitConfirm => "QUIT?",
+            Self::ReloadConfirm => "RELOAD?",
+            Self::GitDiff => "DIFF",
         }
     }
 }
@@ -133,6 +138,9 @@ pub struct App {
     lsp_initialized: bool,
     lsp_workspace_ready: bool,
     lsp_last_text: String,
+    pending_save_after_disk_change: bool,
+    pub git_diff_lines: Vec<String>,
+    pub git_diff_scroll: usize,
 }
 
 impl App {
@@ -168,6 +176,7 @@ impl App {
         project.width = settings.tree_width.clamp(22, 80);
         project.show_hidden = settings.show_hidden_files;
         let _ = project.refresh();
+        project.refresh_git_status();
         let mode = if explorer_focused {
             Mode::Normal
         } else {
@@ -223,6 +232,9 @@ impl App {
             lsp_initialized: false,
             lsp_workspace_ready: false,
             lsp_last_text: String::new(),
+            pending_save_after_disk_change: false,
+            git_diff_lines: Vec::new(),
+            git_diff_scroll: 0,
         })
     }
 
@@ -263,6 +275,10 @@ impl App {
     pub fn poll_background(&mut self) -> bool {
         let message = self.message.clone();
         self.poll_lsp();
+        if self.mode != Mode::ReloadConfirm && self.editor.changed_on_disk() {
+            self.mode = Mode::ReloadConfirm;
+            self.message = "File changed on disk — [R] Reload   [K] Keep buffer   [Esc] Later".to_string();
+        }
         self.message != message
     }
 
@@ -445,6 +461,8 @@ impl App {
                 self.last_project_click = Some((Instant::now(), path));
                 if double_click {
                     self.begin_rename_selected();
+                } else {
+                    self.activate_project_entry();
                 }
             }
             return;
@@ -636,6 +654,21 @@ impl App {
             self.handle_quit_confirmation(key);
             return;
         }
+        if self.mode == Mode::ReloadConfirm {
+            self.handle_reload_confirmation(key);
+            return;
+        }
+        if self.mode == Mode::GitDiff {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                KeyCode::Up | KeyCode::Char('k') => self.git_diff_scroll = self.git_diff_scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => self.git_diff_scroll = (self.git_diff_scroll + 1).min(self.git_diff_lines.len().saturating_sub(1)),
+                KeyCode::PageUp => self.git_diff_scroll = self.git_diff_scroll.saturating_sub(self.viewport_rows.saturating_sub(2)),
+                KeyCode::PageDown => self.git_diff_scroll = (self.git_diff_scroll + self.viewport_rows.saturating_sub(2)).min(self.git_diff_lines.len().saturating_sub(1)),
+                _ => {}
+            }
+            return;
+        }
 
         if self.handle_macro_prefix(key) {
             return;
@@ -679,7 +712,7 @@ impl App {
                 }
                 _ => {}
             },
-            Mode::QuitConfirm => {}
+            Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff => {}
         }
     }
 
@@ -768,6 +801,29 @@ impl App {
                     self.mode = Mode::Normal;
                 }
             }
+            _ => {}
+        }
+    }
+
+    fn handle_reload_confirmation(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Char('R') => match self.editor.reload_from_disk() {
+                Ok(()) => { self.pending_save_after_disk_change = false; self.mode = Mode::Normal; self.message = "Reloaded changed file".to_string(); }
+                Err(error) => self.message = format!("Reload failed: {error}"),
+            },
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                if self.pending_save_after_disk_change {
+                    self.pending_save_after_disk_change = false;
+                    self.editor.clear_pending_external_change();
+                    self.mode = Mode::Normal;
+                    self.save_internal();
+                } else {
+                    self.editor.keep_disk_change();
+                    self.mode = Mode::Normal;
+                    self.message = "Kept current buffer; save will ask before overwriting disk changes".to_string();
+                }
+            }
+            KeyCode::Esc => { self.pending_save_after_disk_change = false; self.editor.acknowledge_disk_change(); self.mode = Mode::Normal; self.message = "Reload deferred".to_string(); }
             _ => {}
         }
     }
@@ -1055,6 +1111,38 @@ impl App {
         let Some(path) = self.selected_project_path() else { self.message = "Select a file or folder first".to_string(); return; };
         let result = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
         match result { Ok(()) => { let _ = self.project.refresh(); self.message = format!("Deleted {}", path.display()); }, Err(error) => self.message = format!("Delete failed: {error}"), }
+    }
+
+    fn git_selected(&mut self, stage: bool) {
+        let Some(path) = self.selected_project_path() else { self.message = "Select a file first".to_string(); return; };
+        let relative = path.strip_prefix(&self.project.root).unwrap_or(&path);
+        let relative = relative.to_string_lossy().to_string();
+        let mut command = Command::new("git");
+        command.arg("-C").arg(&self.project.root);
+        if stage { command.args(["add", "--", &relative]); } else { command.args(["restore", "--staged", "--", &relative]); }
+        match command.output() {
+            Ok(output) if output.status.success() => { self.project.refresh_git_status(); self.message = if stage { "Staged selected file" } else { "Unstaged selected file" }.to_string(); }
+            Ok(output) => self.message = format!("Git failed: {}", String::from_utf8_lossy(&output.stderr).trim()),
+            Err(error) => self.message = format!("Git failed: {error}"),
+        }
+    }
+
+    fn show_git_diff(&mut self) {
+        let path = self.selected_project_path().or_else(|| self.editor.path.clone());
+        let Some(path) = path else { self.message = "Select or open a file first".to_string(); return; };
+        let relative = path.strip_prefix(&self.project.root).unwrap_or(&path).to_string_lossy().to_string();
+        let run = |staged| {
+            let mut command = Command::new("git");
+            command.arg("-C").arg(&self.project.root).arg("diff");
+            if staged { command.arg("--cached"); }
+            command.args(["--", &relative]).output()
+        };
+        let output = run(false).ok().filter(|output| output.status.success()).or_else(|| run(true).ok());
+        let Some(output) = output else { self.message = "Git diff failed".to_string(); return; };
+        let text = String::from_utf8_lossy(&output.stdout);
+        self.git_diff_lines = if text.is_empty() { vec!["No unstaged or staged changes for this file.".to_string()] } else { text.lines().map(str::to_string).collect() };
+        self.git_diff_scroll = 0;
+        self.mode = Mode::GitDiff;
     }
 
     fn close_fold(&mut self) {
@@ -1356,6 +1444,8 @@ impl App {
             KeyCode::F(2) => self.begin_rename_selected(),
             KeyCode::Char('n') => { self.command_input = "newfile ".to_string(); self.command_suggestion = 0; self.mode = Mode::Command; }
             KeyCode::Delete => self.delete_selected_project_entry(false),
+            KeyCode::Char('s') => self.git_selected(true),
+            KeyCode::Char('u') => self.git_selected(false),
             _ => {}
         }
     }
@@ -1899,7 +1989,7 @@ impl App {
     }
 
     pub fn command_suggestions(&self) -> Vec<&'static str> {
-        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "newfile", "newdir", "rename", "copy", "move", "delete", "delete!", "refresh", "symbols", "outline", "split", "vsplit", "only", "unsplit", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set number", "set nonumber", "set", "theme", "help"];
+        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "newfile", "newdir", "rename", "copy", "move", "delete", "delete!", "refresh", "gitrefresh", "stage", "unstage", "diff", "symbols", "outline", "split", "vsplit", "only", "unsplit", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set number", "set nonumber", "set", "theme", "help"];
         let query = self.command_input.trim().to_ascii_lowercase();
         COMMANDS.iter().copied().filter(|command| command.contains(&query)).collect()
     }
@@ -2070,9 +2160,13 @@ impl App {
             "delete" | "rm" => self.delete_selected_project_entry(false),
             "delete!" | "rm!" => self.delete_selected_project_entry(true),
             "refresh" | "reloadtree" => match self.project.refresh() {
-                Ok(()) => self.message = "File tree refreshed".to_string(),
+                Ok(()) => { self.project.refresh_git_status(); self.message = "File tree refreshed".to_string() },
                 Err(error) => self.message = format!("Refresh failed: {error}"),
             },
+            "gitrefresh" => { self.project.refresh_git_status(); self.message = "Git status refreshed".to_string(); },
+            "stage" => self.git_selected(true),
+            "unstage" => self.git_selected(false),
+            "diff" => self.show_git_diff(),
             "pwd" => self.message = self.project.root.display().to_string(),
             "back" | "previous" => self.go_back(),
             "forward" | "nextlocation" => self.go_forward(),
@@ -2641,6 +2735,12 @@ impl App {
     }
 
     fn save_internal(&mut self) -> bool {
+        if self.editor.has_pending_external_change() {
+            self.pending_save_after_disk_change = true;
+            self.mode = Mode::ReloadConfirm;
+            self.message = "Disk changes were kept — [R] Reload   [K] Overwrite with current buffer   [Esc] Cancel".to_string();
+            return false;
+        }
         match self.editor.save() {
             Ok(()) => {
                 let _ = self.project.refresh();

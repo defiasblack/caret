@@ -14,6 +14,8 @@ public static class FoldingDemo
             if (value % 2 == 0)
             {
                 Console.WriteLine($"Even: {value}");
+                Console.WriteLine("Party Time!");
+                Console.WriteLine("I like poopies!");
             }
             else
             {

@@ -3,6 +3,7 @@ use std::{
     fs,
     io,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 const MAX_EXPAND_ALL_DIRECTORIES: usize = 5_000;
@@ -14,7 +15,11 @@ pub struct ProjectEntry {
     pub depth: usize,
     pub is_dir: bool,
     pub expanded: bool,
+    pub git_status: Option<GitStatus>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitStatus { Modified, Added, Deleted, Untracked }
 
 #[derive(Debug)]
 pub struct ProjectTree {
@@ -93,6 +98,23 @@ impl ProjectTree {
 
         self.clamp_scroll(1);
         Ok(())
+    }
+
+    pub fn refresh_git_status(&mut self) {
+        let Ok(output) = Command::new("git").args(["-C"]).arg(&self.root).args(["status", "--porcelain"]).output() else { return; };
+        if !output.status.success() { return; }
+        for entry in &mut self.entries { entry.git_status = None; }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if line.len() < 4 { continue; }
+            let code = &line[..2];
+            let path = self.root.join(&line[3..]);
+            let status = if code == "??" { Some(GitStatus::Untracked) }
+                else if code.contains('D') { Some(GitStatus::Deleted) }
+                else if code.contains('A') { Some(GitStatus::Added) }
+                else if code.contains('M') { Some(GitStatus::Modified) }
+                else { None };
+            if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) { entry.git_status = status; }
+        }
     }
 
     pub fn set_root(&mut self, root: PathBuf) -> io::Result<()> {
@@ -393,6 +415,7 @@ fn collect_entries(
             depth,
             is_dir: child.is_dir,
             expanded: is_expanded,
+            git_status: None,
         });
 
         if is_expanded {

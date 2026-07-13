@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use ropey::Rope;
@@ -40,6 +41,8 @@ pub struct Editor {
     pub dirty: bool,
     pub show_line_numbers: bool,
     pub tab_width: usize,
+    disk_modified: Option<SystemTime>,
+    external_change_pending: bool,
     folded_ranges: BTreeMap<usize, usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -62,6 +65,8 @@ impl Editor {
                 dirty: false,
                 show_line_numbers: true,
                 tab_width: 4,
+                disk_modified: None,
+                external_change_pending: false,
                 folded_ranges: BTreeMap::new(),
                 undo: Vec::new(),
                 redo: Vec::new(),
@@ -84,6 +89,8 @@ impl Editor {
             dirty: false,
             show_line_numbers: true,
             tab_width: 4,
+            disk_modified: None,
+            external_change_pending: false,
             folded_ranges: BTreeMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -105,6 +112,8 @@ impl Editor {
             dirty: false,
             show_line_numbers: true,
             tab_width: 4,
+            disk_modified: fs::metadata(path).and_then(|metadata| metadata.modified()).ok(),
+            external_change_pending: false,
             folded_ranges: BTreeMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -158,6 +167,38 @@ impl Editor {
 
         self.path = Some(path.to_path_buf());
         self.dirty = false;
+        self.disk_modified = fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
+        self.external_change_pending = false;
+        Ok(())
+    }
+
+    pub fn changed_on_disk(&self) -> bool {
+        let Some(path) = &self.path else { return false; };
+        let modified = fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
+        modified.is_some() && modified != self.disk_modified
+    }
+
+    pub fn acknowledge_disk_change(&mut self) {
+        self.disk_modified = self.path.as_ref().and_then(|path| fs::metadata(path).and_then(|metadata| metadata.modified()).ok());
+    }
+
+    pub fn keep_disk_change(&mut self) {
+        self.acknowledge_disk_change();
+        self.external_change_pending = true;
+    }
+
+    pub fn has_pending_external_change(&self) -> bool { self.external_change_pending }
+
+    pub fn clear_pending_external_change(&mut self) { self.external_change_pending = false; }
+
+    pub fn reload_from_disk(&mut self) -> io::Result<()> {
+        let Some(path) = self.path.clone() else { return Ok(()); };
+        let replacement = Self::from_file(&path)?;
+        let show_line_numbers = self.show_line_numbers;
+        let tab_width = self.tab_width;
+        *self = replacement;
+        self.show_line_numbers = show_line_numbers;
+        self.tab_width = tab_width;
         Ok(())
     }
 

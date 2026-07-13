@@ -13,6 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::{App, HoverTarget, Mode, SidebarView},
     editor::display_width,
+    project::GitStatus,
     syntax::{self, Language},
 };
 
@@ -137,6 +138,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
 
     if app.mode == Mode::Help {
         draw_help(out, app, width, height)?;
+    }
+    if app.mode == Mode::GitDiff {
+        draw_git_diff(out, app, width, height)?;
     }
 
     let (cursor_editor_x, cursor_editor_width, cursor_gutter_width) = if let Some(views) = app.split_views {
@@ -480,11 +484,18 @@ fn draw_project_tree<W: Write>(
         } else {
             "·"
         };
+        let git = match entry.git_status {
+            Some(GitStatus::Modified) => "M",
+            Some(GitStatus::Added) => "A",
+            Some(GitStatus::Deleted) => "D",
+            Some(GitStatus::Untracked) => "?",
+            None => " ",
+        };
         let indent = "│  ".repeat(entry.depth);
         let branch = "├─";
         let suffix = if entry.is_dir { "/" } else { "" };
         let kind = if entry.is_dir { "DIR" } else { "   " };
-        let label = format!(" {indent}{branch}{icon} {kind} {}{suffix}", entry.name);
+        let label = format!(" {indent}{branch}{icon} {git} {kind} {}{suffix}", entry.name);
 
         queue!(
             out,
@@ -772,7 +783,8 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Insert => app.theme.insert_mode,
             Mode::Search => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
-            Mode::QuitConfirm => app.theme.error,
+            Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
+            Mode::GitDiff => app.theme.command_mode,
         }
     };
 
@@ -830,6 +842,22 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
     Ok(())
 }
 
+fn draw_git_diff<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
+    let panel_width = width.saturating_sub(6) as usize;
+    let panel_height = height.saturating_sub(4) as usize;
+    let x = 3u16;
+    let y = 2u16;
+    for row in 0..panel_height {
+        queue!(out, MoveTo(x, y + row as u16), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.overlay_text), Print(" ".repeat(panel_width)))?;
+    }
+    queue!(out, MoveTo(x, y), SetAttribute(Attribute::Bold), SetForegroundColor(app.theme.top_bar_text), Print(pad_or_truncate(" GIT DIFF  ·  Esc closes  ·  ↑↓ scroll", panel_width)), SetAttribute(Attribute::Reset))?;
+    for (row, line) in app.git_diff_lines.iter().skip(app.git_diff_scroll).take(panel_height.saturating_sub(2)).enumerate() {
+        let color = if line.starts_with('+') { app.theme.success } else if line.starts_with('-') { app.theme.error } else if line.starts_with("@@") { app.theme.heading } else { app.theme.overlay_text };
+        queue!(out, MoveTo(x, y + 1 + row as u16), SetForegroundColor(color), Print(pad_or_truncate(line, panel_width)))?;
+    }
+    Ok(())
+}
+
 fn draw_command_palette<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
     if app.mode != Mode::Command { return Ok(()); }
     let suggestions = app.command_suggestions();
@@ -876,6 +904,11 @@ fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             app.theme.error,
             app.theme.background,
         ),
+        Mode::ReloadConfirm => (
+            format!(" {}", app.message),
+            app.theme.error,
+            app.theme.background,
+        ),
         _ => (
             format!(" {}", app.message),
             app.theme.prompt_bar,
@@ -907,7 +940,8 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Insert => app.theme.insert_mode,
             Mode::Search => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
-            Mode::QuitConfirm => app.theme.error,
+            Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
+            Mode::GitDiff => app.theme.command_mode,
         }
     };
 
@@ -1056,6 +1090,8 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("F1", "Close"),
         ],
         Mode::QuitConfirm => &[("S", "Save+Quit"), ("D", "Discard+Quit"), ("Esc", "Cancel")],
+        Mode::ReloadConfirm => &[("R", "Reload"), ("K", "Keep"), ("Esc", "Later")],
+        Mode::GitDiff => &[("↑↓", "Scroll"), ("Esc", "Close")],
     }
 }
 
@@ -1273,7 +1309,7 @@ fn place_cursor<W: Write>(
     terminal_width: u16,
     terminal_height: u16,
 ) -> io::Result<()> {
-    if matches!(app.mode, Mode::Help | Mode::QuitConfirm)
+    if matches!(app.mode, Mode::Help | Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff)
         || (app.explorer_focused && !matches!(app.mode, Mode::Command | Mode::Search)) {
         return queue!(out, Hide);
     }
