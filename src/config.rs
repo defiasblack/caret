@@ -15,6 +15,7 @@ pub struct Settings {
     pub show_hidden_files: bool,
     pub restore_session: bool,
     pub max_search_results: usize,
+    pub format_on_save: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +28,7 @@ impl Default for Settings {
             show_hidden_files: false,
             restore_session: true,
             max_search_results: 500,
+            format_on_save: false,
         }
     }
 }

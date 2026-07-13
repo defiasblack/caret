@@ -11,7 +11,7 @@ use crossterm::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, HoverTarget, Mode},
+    app::{App, HoverTarget, Mode, SidebarView},
     editor::display_width,
     syntax::{self, Language},
 };
@@ -98,7 +98,11 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     draw_tab_bar(out, app, 1, width)?;
 
     if sidebar_width > 0 {
-        draw_project_tree(out, app, content_top, content_height, sidebar_width)?;
+        if app.sidebar_view == SidebarView::Files {
+            draw_project_tree(out, app, content_top, content_height, sidebar_width)?;
+        } else {
+            draw_outline(out, app, content_top, content_height, sidebar_width)?;
+        }
         draw_vertical_separator(out, app, sidebar_width as u16, content_top, content_height)?;
     }
 
@@ -112,6 +116,7 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         gutter_width,
     )?;
     draw_status_bar(out, app, layout.status_row, width)?;
+    draw_command_palette(out, app, width, height)?;
     draw_prompt_bar(out, app, layout.prompt_row, width)?;
     draw_hotkey_bar(out, app, layout.hotkey_row, width)?;
 
@@ -163,7 +168,9 @@ fn draw_top_bar<W: Write>(out: &mut W, app: &App, width: u16) -> io::Result<()> 
         .unwrap_or("[No Name]");
 
     let dirty = if app.editor.dirty { " ●" } else { "" };
-    let title = format!("  CARET  │ [FILES] │  {filename}{dirty}");
+    let breadcrumb = app.current_breadcrumbs();
+    let location = if breadcrumb.is_empty() { String::new() } else { format!("  › {breadcrumb}") };
+    let title = format!("  CARET  │ [FILES] │  {filename}{dirty}{location}");
     let right = format!(" {}  │ [F1 Help] │ [Quit] ", app.project.root_name());
 
     queue!(
@@ -470,6 +477,26 @@ fn draw_project_tree<W: Write>(
     Ok(())
 }
 
+fn draw_outline<W: Write>(out: &mut W, app: &App, top: u16, rows: usize, width: usize) -> io::Result<()> {
+    let symbols = app.outline_symbols();
+    for row in 0..rows {
+        let y = top + row as u16;
+        queue!(out, MoveTo(0, y), SetBackgroundColor(app.theme.prompt_bar), Print(" ".repeat(width)))?;
+        if row == 0 {
+            queue!(out, MoveTo(0, y), SetForegroundColor(app.theme.top_bar_text), SetAttribute(Attribute::Bold), Print(pad_or_truncate(&format!(" SYMBOLS ▾ {} items", symbols.len()), width)), SetAttribute(Attribute::Reset))?;
+            continue;
+        }
+        let index = app.outline_scroll + row - 1;
+        let Some(symbol) = symbols.get(index) else { continue; };
+        let selected = index == app.outline_selected;
+        let background = if selected && app.explorer_focused { app.theme.normal_mode } else if selected { app.theme.current_line } else { app.theme.prompt_bar };
+        let foreground = if selected && app.explorer_focused { app.theme.background } else if symbol.kind == "type" { app.theme.type_name } else { app.theme.foreground };
+        let label = format!(" {}{} {}  {}", "  ".repeat(symbol.depth), if symbol.kind == "type" { "◆" } else { "ƒ" }, symbol.name, symbol.start_line + 1);
+        queue!(out, MoveTo(0, y), SetBackgroundColor(background), SetForegroundColor(foreground), SetAttribute(if selected { Attribute::Bold } else { Attribute::Reset }), Print(pad_or_truncate(&label, width)), SetAttribute(Attribute::Reset))?;
+    }
+    Ok(())
+}
+
 fn draw_vertical_separator<W: Write>(
     out: &mut W,
     app: &App,
@@ -759,6 +786,26 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
     )
 }
 
+fn draw_command_palette<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
+    if app.mode != Mode::Command { return Ok(()); }
+    let suggestions = app.command_suggestions();
+    let rows = suggestions.len().min(8);
+    let panel_width = 30usize.min(width.saturating_sub(2) as usize);
+    let start_row = height.saturating_sub(2 + rows as u16);
+    for (index, command) in suggestions.into_iter().take(rows).enumerate() {
+        let selected = index == app.command_suggestion;
+        queue!(out, MoveTo(1, start_row + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print(pad_or_truncate(&format!("  :{command}"), panel_width)))?;
+    }
+    Ok(())
+}
+
+pub fn command_suggestion_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<usize> {
+    if app.mode != Mode::Command || column == 0 || column as usize > 30usize.min(width.saturating_sub(2) as usize) { return None; }
+    let rows = app.command_suggestions().len().min(8);
+    let start = height.saturating_sub(2 + rows as u16);
+    (row >= start && row < start + rows as u16).then_some((row - start) as usize)
+}
+
 fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
     let (prompt, background, foreground) = match app.mode {
         Mode::Search => (
@@ -900,6 +947,16 @@ pub fn hotkey_action_at(app: &App, width: u16, column: u16) -> Option<&'static s
 
 fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
     if app.explorer_focused {
+        if app.sidebar_view == SidebarView::Outline {
+            return &[
+                ("↑↓ / j k", "Select"),
+                ("Enter", "Jump"),
+                ("PgUp/Dn", "Page"),
+                ("Home/End", "Ends"),
+                ("Ctrl-O", "Files"),
+                ("Ctrl-E / Esc", "Editor"),
+            ];
+        }
         return &[
             ("↑↓", "Move"),
             ("Enter", "Open"),

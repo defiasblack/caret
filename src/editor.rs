@@ -252,6 +252,14 @@ impl Editor {
         self.buffer.to_string()
     }
 
+    pub fn replace_text(&mut self, text: &str) {
+        self.finish_undo_group();
+        self.push_undo_snapshot();
+        self.buffer = Rope::from_str(text);
+        self.dirty = true;
+        self.clamp_cursor();
+    }
+
     pub fn line_count(&self) -> usize {
         self.buffer.len_lines()
     }

@@ -19,6 +19,15 @@ pub enum Language {
     Plain,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: &'static str,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub depth: usize,
+}
+
 impl Language {
     pub fn from_path(path: Option<&Path>) -> Self {
         let Some(path) = path else {
@@ -267,6 +276,55 @@ pub fn fold_ranges(source: &str, language: Language) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
     ranges.dedup();
     ranges
+}
+
+pub fn symbols(source: &str, language: Language) -> Vec<Symbol> {
+    let Some(tree_language) = tree_sitter_language(language) else { return Vec::new(); };
+    let mut parser = Parser::new();
+    if parser.set_language(&tree_language).is_err() { return Vec::new(); }
+    let Some(tree) = parser.parse(source, None) else { return Vec::new(); };
+    let mut output = Vec::new();
+    collect_symbols(tree.root_node(), source, 0, &mut output);
+    output
+}
+
+pub fn breadcrumbs(source: &str, language: Language, line: usize) -> Vec<Symbol> {
+    symbols(source, language).into_iter().filter(|symbol|
+        symbol.start_line <= line && line <= symbol.end_line).collect()
+}
+
+fn collect_symbols(node: Node<'_>, source: &str, depth: usize, output: &mut Vec<Symbol>) {
+    if let Some(kind) = symbol_kind(node.kind()) {
+        let name = node.child_by_field_name("name")
+            .or_else(|| first_identifier(node))
+            .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+            .unwrap_or(node.kind())
+            .to_string();
+        output.push(Symbol { name, kind, start_line: node.start_position().row, end_line: node.end_position().row, depth });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_symbols(child, source, depth + usize::from(symbol_kind(node.kind()).is_some()), output);
+    }
+}
+
+fn first_identifier(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let identifier = node
+        .children(&mut cursor)
+        .find(|child| child.kind().contains("identifier"));
+    identifier
+}
+
+fn symbol_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "namespace_declaration" | "file_scoped_namespace_declaration" | "module" => Some("module"),
+        "class_declaration" | "struct_declaration" | "interface_declaration" | "enum_declaration"
+        | "record_declaration" => Some("type"),
+        "function_declaration" | "function_definition" | "method_declaration"
+        | "constructor_declaration" => Some("function"),
+        _ => None,
+    }
 }
 
 fn collect_fold_ranges(node: Node<'_>, root_id: usize, ranges: &mut Vec<(usize, usize)>) {
@@ -709,5 +767,15 @@ mod tests {
         );
         assert!(ranges.contains(&(0, 4)));
         assert!(ranges.contains(&(1, 3)));
+    }
+
+    #[test]
+    fn extracts_nested_csharp_symbols_for_outline_and_breadcrumbs() {
+        let source = "namespace Demo { class Program { void Run() { } } }";
+        let symbols = symbols(source, Language::CSharp);
+        assert!(symbols.iter().any(|symbol| symbol.name == "Demo"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "Program"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "Run"));
+        assert_eq!(breadcrumbs(source, Language::CSharp, 0).last().map(|symbol| symbol.name.as_str()), Some("Run"));
     }
 }

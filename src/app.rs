@@ -43,6 +43,9 @@ pub enum HoverTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarView { Files, Outline }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MacroPrefix {
     Record,
     Replay,
@@ -74,9 +77,13 @@ pub struct App {
     pub editor: Tabs,
     pub project: ProjectTree,
     pub explorer_focused: bool,
+    pub sidebar_view: SidebarView,
+    pub outline_selected: usize,
+    pub outline_scroll: usize,
     pub mode: Mode,
     pub should_quit: bool,
     pub command_input: String,
+    pub command_suggestion: usize,
     pub search_input: String,
     pub last_search: String,
     pub message: String,
@@ -149,9 +156,13 @@ impl App {
             editor,
             project,
             explorer_focused,
+            sidebar_view: SidebarView::Files,
+            outline_selected: 0,
+            outline_scroll: 0,
             mode,
             should_quit: false,
             command_input: String::new(),
+            command_suggestion: 0,
             search_input: String::new(),
             last_search: String::new(),
             message: config_message.unwrap_or_else(|| {
@@ -235,6 +246,17 @@ impl App {
 
         if width < 44 || height < 8 {
             return;
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(index) = crate::ui::command_suggestion_at(self, width, height, mouse.column, mouse.row) {
+                if let Some(command) = self.command_suggestions().get(index) {
+                    self.command_input = (*command).to_string();
+                    self.command_suggestion = index;
+                    self.message = "Command selected; press Enter to run".to_string();
+                }
+                return;
+            }
         }
 
         let layout = crate::ui::screen_layout(self, width, height);
@@ -360,6 +382,20 @@ impl App {
             self.mode = Mode::Normal;
 
             let screen_row = (row - layout.content_top) as usize;
+            if self.sidebar_view == SidebarView::Outline {
+                if screen_row > 0 {
+                    let symbols = self.outline_symbols();
+                    let index = self.outline_scroll + screen_row - 1;
+                    if let Some(symbol) = symbols.get(index) {
+                        self.outline_selected = index;
+                        self.editor.goto_line(symbol.start_line);
+                        self.editor.move_line_start();
+                        self.follow_cursor = true;
+                        self.message = format!("{} · line {}", symbol.name, symbol.start_line + 1);
+                    }
+                }
+                return;
+            }
             if screen_row == 0 {
                 self.message = format!("Project: {}", self.project.root.display());
                 return;
@@ -505,7 +541,10 @@ impl App {
 
     pub fn active_panel_label(&self) -> &'static str {
         if self.explorer_focused {
-            "FILES"
+            match self.sidebar_view {
+                SidebarView::Files => "FILES",
+                SidebarView::Outline => "SYMBOLS",
+            }
         } else {
             self.mode.label()
         }
@@ -727,6 +766,21 @@ impl App {
                     self.toggle_file_tree();
                     return true;
                 }
+                KeyCode::Char('o') => {
+                    self.project.visible = true;
+                    self.sidebar_view = if self.sidebar_view == SidebarView::Outline {
+                        SidebarView::Files
+                    } else {
+                        SidebarView::Outline
+                    };
+                    self.explorer_focused = true;
+                    self.mode = Mode::Normal;
+                    self.message = match self.sidebar_view {
+                        SidebarView::Outline => "SYMBOLS · Enter jumps · Ctrl-E returns to editor",
+                        SidebarView::Files => "FILES · Enter opens · Ctrl-E returns to editor",
+                    }.to_string();
+                    return true;
+                }
                 KeyCode::Char('/') => {
                     self.toggle_comments();
                     return true;
@@ -811,6 +865,30 @@ impl App {
     fn available_fold_ranges(&self) -> Vec<(usize, usize)> {
         let language = Language::from_path(self.editor.path.as_deref());
         crate::syntax::fold_ranges(&self.editor.text(), language)
+    }
+
+    pub fn current_breadcrumbs(&self) -> String {
+        let language = Language::from_path(self.editor.path.as_deref());
+        crate::syntax::breadcrumbs(&self.editor.text(), language, self.editor.cursor.line)
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect::<Vec<_>>()
+            .join(" › ")
+    }
+
+    pub fn outline_symbols(&self) -> Vec<crate::syntax::Symbol> {
+        let language = Language::from_path(self.editor.path.as_deref());
+        crate::syntax::symbols(&self.editor.text(), language)
+    }
+
+    fn show_symbols(&mut self) {
+        let language = Language::from_path(self.editor.path.as_deref());
+        let symbols = crate::syntax::symbols(&self.editor.text(), language);
+        self.message = if symbols.is_empty() {
+            "No symbols in this file".to_string()
+        } else {
+            symbols.into_iter().take(8).map(|symbol| format!("{}:{}", symbol.name, symbol.start_line + 1)).collect::<Vec<_>>().join("  ·  ")
+        };
     }
 
     fn close_fold(&mut self) {
@@ -1020,6 +1098,22 @@ impl App {
             match key.code {
                 KeyCode::Char('s') => self.save(),
                 KeyCode::Char('q') => self.request_quit(false),
+                _ => {}
+            }
+            return;
+        }
+
+        if self.sidebar_view == SidebarView::Outline {
+            let symbols = self.outline_symbols();
+            match key.code {
+                KeyCode::Esc => { self.explorer_focused = false; self.mode = Mode::Normal; }
+                KeyCode::Up | KeyCode::Char('k') => self.outline_selected = self.outline_selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => self.outline_selected = (self.outline_selected + 1).min(symbols.len().saturating_sub(1)),
+                KeyCode::PageUp => self.outline_selected = self.outline_selected.saturating_sub(self.viewport_rows.saturating_sub(2)),
+                KeyCode::PageDown => self.outline_selected = (self.outline_selected + self.viewport_rows.saturating_sub(2)).min(symbols.len().saturating_sub(1)),
+                KeyCode::Home => self.outline_selected = 0,
+                KeyCode::End => self.outline_selected = symbols.len().saturating_sub(1),
+                KeyCode::Enter => if let Some(symbol) = symbols.get(self.outline_selected) { self.editor.goto_line(symbol.start_line); self.editor.move_line_start(); self.follow_cursor = true; self.message = format!("{} · line {}", symbol.name, symbol.start_line + 1); },
                 _ => {}
             }
             return;
@@ -1577,22 +1671,38 @@ impl App {
                 self.message = "Command cancelled".to_string();
             }
             KeyCode::Enter => {
-                let command = self.command_input.trim().to_string();
+                let command = self.selected_command().unwrap_or_else(|| self.command_input.trim().to_string());
                 self.mode = Mode::Normal;
                 self.execute_command(&command);
             }
             KeyCode::Backspace => {
                 self.command_input.pop();
+                self.command_suggestion = 0;
             }
+            KeyCode::Up => self.command_suggestion = self.command_suggestion.saturating_sub(1),
+            KeyCode::Down => self.command_suggestion = (self.command_suggestion + 1).min(self.command_suggestions().len().saturating_sub(1)),
             KeyCode::Char(character)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.command_input.push(character);
+                self.command_suggestion = 0;
             }
             _ => {}
         }
+    }
+
+    pub fn command_suggestions(&self) -> Vec<&'static str> {
+        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "refresh", "symbols", "outline", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set number", "set nonumber", "set", "theme", "help"];
+        let query = self.command_input.trim().to_ascii_lowercase();
+        COMMANDS.iter().copied().filter(|command| command.contains(&query)).collect()
+    }
+
+    fn selected_command(&self) -> Option<String> {
+        let suggestions = self.command_suggestions();
+        if self.command_input.trim().is_empty() || suggestions.iter().any(|value| *value == self.command_input.trim()) { None }
+        else { suggestions.get(self.command_suggestion).map(|value| (*value).to_string()) }
     }
 
     fn execute_command(&mut self, command: &str) {
@@ -1781,6 +1891,7 @@ impl App {
             "indent" => self.indent_selection(false),
             "outdent" => self.indent_selection(true),
             "comment" | "togglecomment" => self.toggle_comments(),
+            "symbols" | "outline" => self.show_symbols(),
             "fold" | "foldclose" => self.close_fold(),
             "foldopen" => self.open_fold(),
             "foldtoggle" => self.toggle_fold(),
@@ -1890,6 +2001,16 @@ impl App {
                 self.persist_settings();
                 self.message = "Line numbers disabled".to_string();
             }
+            "formatonsave" | "fos" => {
+                self.settings.format_on_save = true;
+                self.persist_settings();
+                self.message = "Format on save enabled".to_string();
+            }
+            "noformatonsave" | "nofos" => {
+                self.settings.format_on_save = false;
+                self.persist_settings();
+                self.message = "Format on save disabled".to_string();
+            }
             value if value.starts_with("tabstop=") || value.starts_with("ts=") => {
                 let number = value
                     .split_once('=')
@@ -1920,7 +2041,7 @@ impl App {
                     _ => self.message = "Tree width must be between 22 and 80".to_string(),
                 }
             }
-            _ => self.message = "Try :set number, :set tabstop=4, or :set treewidth=40".to_string(),
+            _ => self.message = "Try :set number, :set formatonsave, or :set tabstop=4".to_string(),
         }
     }
 
@@ -1938,7 +2059,10 @@ impl App {
             Ok(client) => {
                 self.lsp = Some(client);
                 self.lsp_initialized = false;
-                self.lsp_workspace_ready = server != "csharp-ls";
+                // csharp-ls may keep reporting workspace progress indefinitely
+                // for a standalone file. Initialization is sufficient for
+                // position and formatting requests, so never block on it.
+                self.lsp_workspace_ready = true;
                 self.lsp_last_text.clear();
                 self.message = format!("Starting LSP: {server}");
             }
@@ -2061,6 +2185,12 @@ impl App {
         }
     }
 
+    fn request_formatting_after_save(&mut self) {
+        if self.settings.format_on_save {
+            self.request_formatting();
+        }
+    }
+
     fn poll_lsp(&mut self) {
         let Some(lsp) = &self.lsp else {
             return;
@@ -2127,11 +2257,7 @@ impl App {
             if lsp.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lsp::file_uri(path), "languageId": language_id, "version": 1, "text": self.editor.text() } })).is_ok() {
                 self.lsp_initialized = true;
                 self.lsp_last_text = self.editor.text();
-                self.message = if self.lsp_workspace_ready {
-                    "LSP ready".to_string()
-                } else {
-                    "LSP loading workspace…".to_string()
-                };
+                self.message = "LSP ready".to_string();
             }
             return;
         }
@@ -2167,6 +2293,17 @@ impl App {
             self.message = "No definition found at cursor".to_string();
             return;
         }
+        if request.as_deref() == Some("textDocument/formatting") {
+            if self.apply_formatting_edits(&message["result"]) {
+                match self.editor.save() {
+                    Ok(()) => self.message = "Formatted and saved".to_string(),
+                    Err(error) => self.message = format!("Formatted but save failed: {error}"),
+                }
+            } else {
+                self.message = "No formatting changes".to_string();
+            }
+            return;
+        }
         if message.get("method").and_then(|value| value.as_str())
             == Some("textDocument/publishDiagnostics")
         {
@@ -2188,6 +2325,31 @@ impl App {
                     .collect::<String>()
             );
         }
+    }
+
+    fn apply_formatting_edits(&mut self, result: &serde_json::Value) -> bool {
+        let Some(edits) = result.as_array() else { return false; };
+        let mut text = self.editor.text();
+        let mut changes = Vec::new();
+        for edit in edits {
+            let Some(replacement) = edit["newText"].as_str() else { continue; };
+            let range = &edit["range"];
+            let Some(start_line) = range["start"]["line"].as_u64() else { continue; };
+            let Some(start_character) = range["start"]["character"].as_u64() else { continue; };
+            let Some(end_line) = range["end"]["line"].as_u64() else { continue; };
+            let Some(end_character) = range["end"]["character"].as_u64() else { continue; };
+            let Some(start) = lsp_text_offset(&text, start_line as usize, start_character as usize) else { continue; };
+            let Some(end) = lsp_text_offset(&text, end_line as usize, end_character as usize) else { continue; };
+            changes.push((start, end, replacement.to_string()));
+        }
+        changes.sort_by_key(|(start, _, _)| *start);
+        if changes.is_empty() { return false; }
+        for (start, end, replacement) in changes.into_iter().rev() {
+            if start <= end && end <= text.len() { text.replace_range(start..end, &replacement); }
+        }
+        if text == self.editor.text() { return false; }
+        self.editor.replace_text(&text);
+        true
     }
 
     fn execute_theme(&mut self, argument: &str) {
@@ -2247,6 +2409,7 @@ impl App {
             Ok(()) => {
                 let _ = self.project.refresh();
                 self.message = format!("Saved {}", path.display());
+                self.request_formatting_after_save();
             }
             Err(error) => self.message = format!("Save failed: {error}"),
         }
@@ -2263,6 +2426,7 @@ impl App {
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "[No Name]".to_string());
                 self.message = format!("Saved {name}");
+                self.request_formatting_after_save();
                 true
             }
             Err(error) => {
@@ -2309,6 +2473,14 @@ fn lsp_workspace_root(path: &Path) -> Option<PathBuf> {
         }
         directory = parent;
     }
+}
+
+fn lsp_text_offset(text: &str, line: usize, character: usize) -> Option<usize> {
+    let line_start = if line == 0 { 0 } else { text.match_indices('\n').nth(line - 1).map(|(index, _)| index + 1)? };
+    let line_end = text[line_start..].find('\n').map_or(text.len(), |offset| line_start + offset);
+    let prefix = &text[line_start..line_end];
+    let byte_offset = prefix.char_indices().nth(character).map_or(prefix.len(), |(offset, _)| offset);
+    Some(line_start + byte_offset)
 }
 
 fn lsp_language_id(language: crate::syntax::Language) -> &'static str {

@@ -4,7 +4,7 @@ using System.Collections.Generic;
 namespace CaretExamples;
 
 public static class FoldingDemo
-{
+{ 
     public static void Main()
     {
         var values = new List<int> { 1, 2, 3 };
