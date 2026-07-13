@@ -57,6 +57,16 @@ impl Tabs {
         self.active
     }
 
+    pub fn editor_for_path_mut(&mut self, path: &Path) -> Option<&mut Editor> {
+        self.tabs.iter_mut().find_map(|tab| {
+            tab.editor
+                .path
+                .as_deref()
+                .filter(|candidate| *candidate == path)?;
+            Some(&mut tab.editor)
+        })
+    }
+
     pub fn active_title(&self) -> String {
         self.tab_title(self.active)
     }
@@ -157,10 +167,6 @@ impl Tabs {
             untitled_id: 0,
         });
         self.active = self.tabs.len() - 1;
-    }
-
-    pub fn open(&mut self, path: &Path) -> io::Result<()> {
-        self.open_or_switch(path).map(|_| ())
     }
 
     pub fn open_or_switch(&mut self, path: &Path) -> io::Result<OpenDisposition> {

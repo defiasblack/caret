@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme::ThemeKind;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeymapProfile {
+    #[default]
     Caret,
     Vim,
     Conventional,
@@ -33,10 +34,6 @@ impl KeymapProfile {
     }
 }
 
-impl Default for KeymapProfile {
-    fn default() -> Self { Self::Caret }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -49,6 +46,7 @@ pub struct Settings {
     pub restore_session: bool,
     pub recent_projects: Vec<PathBuf>,
     pub reduced_motion: bool,
+    pub custom_theme: Option<String>,
     pub max_search_results: usize,
     pub format_on_save: bool,
 }
@@ -65,6 +63,7 @@ impl Default for Settings {
             restore_session: true,
             recent_projects: Vec::new(),
             reduced_motion: false,
+            custom_theme: None,
             max_search_results: 500,
             format_on_save: false,
         }
@@ -102,6 +101,13 @@ pub fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("caret-config.toml"))
 }
 
+pub fn plugins_dir() -> PathBuf {
+    config_path()
+        .parent()
+        .map(|parent| parent.join("plugins"))
+        .unwrap_or_else(|| PathBuf::from("plugins"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,8 +120,10 @@ mod tests {
 
     #[test]
     fn keymap_profiles_round_trip_through_toml() {
-        let mut settings = Settings::default();
-        settings.keymap = KeymapProfile::Conventional;
+        let settings = Settings {
+            keymap: KeymapProfile::Conventional,
+            ..Settings::default()
+        };
         let encoded = toml::to_string(&settings).expect("encode settings");
         let decoded: Settings = toml::from_str(&encoded).expect("decode settings");
         assert_eq!(decoded.keymap, KeymapProfile::Conventional);

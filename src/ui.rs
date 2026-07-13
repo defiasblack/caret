@@ -12,7 +12,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{App, BackgroundState, HoverTarget, Mode, SidebarView},
-    config::{KeymapProfile},
+    config::KeymapProfile,
     editor::display_width,
     project::GitStatus,
     syntax::{self, Language},
@@ -91,6 +91,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     }
 
     let layout = screen_layout(app, width, height);
+    if layout.terminal_height > 0 {
+        app.resize_terminal(layout.terminal_height, width as usize);
+    }
     let content_top = layout.content_top;
     let content_height = layout.content_height;
     let sidebar_width = layout.sidebar_width;
@@ -121,28 +124,97 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     }
 
     if let Some(views) = app.split_views {
-        let focused = (app.editor.active_index(), app.editor.cursor, app.editor.scroll_line, app.editor.scroll_column);
+        let focused = (
+            app.editor.active_index(),
+            app.editor.cursor,
+            app.editor.scroll_line,
+            app.editor.scroll_column,
+        );
         if views.vertical {
             let pane_width = editor_width.saturating_sub(1) / 2;
-            let pane_gutter = app.editor.line_number_width().min(pane_width.saturating_sub(1));
-            app.editor.select(views.primary.tab_index); app.editor.cursor = views.primary.cursor; app.editor.scroll_line = views.primary.scroll_line; app.editor.scroll_column = views.primary.scroll_column;
-            draw_editor(out, app, content_top, content_height, editor_x as u16, pane_width as u16, pane_gutter)?;
+            let pane_gutter = app
+                .editor
+                .line_number_width()
+                .min(pane_width.saturating_sub(1));
+            app.editor.select(views.primary.tab_index);
+            app.editor.cursor = views.primary.cursor;
+            app.editor.scroll_line = views.primary.scroll_line;
+            app.editor.scroll_column = views.primary.scroll_column;
+            draw_editor(
+                out,
+                app,
+                content_top,
+                content_height,
+                editor_x as u16,
+                pane_width as u16,
+                pane_gutter,
+            )?;
             let divider = editor_x + pane_width;
             draw_vertical_separator(out, app, divider as u16, content_top, content_height)?;
-            app.editor.select(views.secondary.tab_index); app.editor.cursor = views.secondary.cursor; app.editor.scroll_line = views.secondary.scroll_line; app.editor.scroll_column = views.secondary.scroll_column;
-            draw_editor(out, app, content_top, content_height, (divider + 1) as u16, pane_width as u16, pane_gutter)?;
+            app.editor.select(views.secondary.tab_index);
+            app.editor.cursor = views.secondary.cursor;
+            app.editor.scroll_line = views.secondary.scroll_line;
+            app.editor.scroll_column = views.secondary.scroll_column;
+            draw_editor(
+                out,
+                app,
+                content_top,
+                content_height,
+                (divider + 1) as u16,
+                pane_width as u16,
+                pane_gutter,
+            )?;
         } else {
             let pane_rows = content_height.saturating_sub(1) / 2;
-            app.editor.select(views.primary.tab_index); app.editor.cursor = views.primary.cursor; app.editor.scroll_line = views.primary.scroll_line; app.editor.scroll_column = views.primary.scroll_column;
-            draw_editor(out, app, content_top, pane_rows, editor_x as u16, editor_width as u16, gutter_width)?;
+            app.editor.select(views.primary.tab_index);
+            app.editor.cursor = views.primary.cursor;
+            app.editor.scroll_line = views.primary.scroll_line;
+            app.editor.scroll_column = views.primary.scroll_column;
+            draw_editor(
+                out,
+                app,
+                content_top,
+                pane_rows,
+                editor_x as u16,
+                editor_width as u16,
+                gutter_width,
+            )?;
             let divider = content_top + pane_rows as u16;
-            queue!(out, MoveTo(editor_x as u16, divider), SetBackgroundColor(app.theme.background), SetForegroundColor(app.theme.border), Print("─".repeat(editor_width)))?;
-            app.editor.select(views.secondary.tab_index); app.editor.cursor = views.secondary.cursor; app.editor.scroll_line = views.secondary.scroll_line; app.editor.scroll_column = views.secondary.scroll_column;
-            draw_editor(out, app, divider + 1, pane_rows, editor_x as u16, editor_width as u16, gutter_width)?;
+            queue!(
+                out,
+                MoveTo(editor_x as u16, divider),
+                SetBackgroundColor(app.theme.background),
+                SetForegroundColor(app.theme.border),
+                Print("─".repeat(editor_width))
+            )?;
+            app.editor.select(views.secondary.tab_index);
+            app.editor.cursor = views.secondary.cursor;
+            app.editor.scroll_line = views.secondary.scroll_line;
+            app.editor.scroll_column = views.secondary.scroll_column;
+            draw_editor(
+                out,
+                app,
+                divider + 1,
+                pane_rows,
+                editor_x as u16,
+                editor_width as u16,
+                gutter_width,
+            )?;
         }
-        app.editor.select(focused.0); app.editor.cursor = focused.1; app.editor.scroll_line = focused.2; app.editor.scroll_column = focused.3;
+        app.editor.select(focused.0);
+        app.editor.cursor = focused.1;
+        app.editor.scroll_line = focused.2;
+        app.editor.scroll_column = focused.3;
     } else {
-        draw_editor(out, app, content_top, content_height, editor_x as u16, editor_width as u16, gutter_width)?;
+        draw_editor(
+            out,
+            app,
+            content_top,
+            content_height,
+            editor_x as u16,
+            editor_width as u16,
+            gutter_width,
+        )?;
     }
     if layout.terminal_height > 0 {
         draw_terminal(out, app, layout.terminal_top, layout.terminal_height, width)?;
@@ -173,22 +245,45 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if app.mode == Mode::Dashboard {
         draw_dashboard(out, app, width, height)?;
     }
+    if app.lsp_panel.is_some() {
+        draw_lsp_panel(out, app, width, height)?;
+    }
 
-    let (cursor_editor_x, cursor_editor_width, cursor_gutter_width) = if let Some(views) = app.split_views {
-        let pane_width = editor_width.saturating_sub(1) / 2;
-        let pane_gutter = app.editor.line_number_width().min(pane_width.saturating_sub(1));
-        let x = if views.vertical && views.secondary_active { editor_x + pane_width + 1 } else { editor_x };
-        (x, pane_width, pane_gutter)
-    } else { (editor_x, editor_width, gutter_width) };
+    let (cursor_editor_x, cursor_editor_width, cursor_gutter_width) =
+        if let Some(views) = app.split_views {
+            let pane_width = editor_width.saturating_sub(1) / 2;
+            let pane_gutter = app
+                .editor
+                .line_number_width()
+                .min(pane_width.saturating_sub(1));
+            let x = if views.vertical && views.secondary_active {
+                editor_x + pane_width + 1
+            } else {
+                editor_x
+            };
+            (x, pane_width, pane_gutter)
+        } else {
+            (editor_x, editor_width, gutter_width)
+        };
     let (cursor_content_top, cursor_content_height) = if let Some(views) = app.split_views {
         if !views.vertical && views.secondary_active {
             let pane_rows = content_height.saturating_sub(1) / 2;
             (content_top + pane_rows as u16 + 1, pane_rows)
-        } else if !views.vertical { (content_top, content_height.saturating_sub(1) / 2) } else { (content_top, content_height) }
-    } else { (content_top, content_height) };
-    if app.terminal_focused && layout.terminal_height > 0 {
-        let x = app.terminal_cursor_column().min(width.saturating_sub(1) as usize) as u16;
-        queue!(out, MoveTo(x, layout.terminal_top + layout.terminal_height.saturating_sub(1) as u16), Show)?;
+        } else if !views.vertical {
+            (content_top, content_height.saturating_sub(1) / 2)
+        } else {
+            (content_top, content_height)
+        }
+    } else {
+        (content_top, content_height)
+    };
+    if app.lsp_panel.is_some() {
+        queue!(out, Hide)?;
+    } else if app.terminal_focused && layout.terminal_height > 0 {
+        let (row, column) = app.terminal_cursor_position();
+        let x = column.min(width.saturating_sub(1) as usize) as u16;
+        let y = layout.terminal_top + row.min(layout.terminal_height.saturating_sub(1)) as u16;
+        queue!(out, MoveTo(x, y), Show)?;
     } else {
         place_cursor(
             out,
@@ -236,9 +331,16 @@ fn draw_top_bar<W: Write>(out: &mut W, app: &App, width: u16) -> io::Result<()> 
 
     let dirty = if app.editor.dirty { " ●" } else { "" };
     let breadcrumb = app.current_breadcrumbs();
-    let location = if breadcrumb.is_empty() { String::new() } else { format!("  › {breadcrumb}") };
+    let location = if breadcrumb.is_empty() {
+        String::new()
+    } else {
+        format!("  › {breadcrumb}")
+    };
     let title = format!("  CARET  │ [FILES] │  {filename}{dirty}{location}");
-    let right = format!(" {}  │ [Themes] │ [F1 Help] │ [Quit] ", app.project.root_name());
+    let right = format!(
+        " {}  │ [Themes] │ [F1 Help] │ [Quit] ",
+        app.project.root_name()
+    );
 
     queue!(
         out,
@@ -532,7 +634,10 @@ fn draw_project_tree<W: Write>(
         let branch = "├─";
         let suffix = if entry.is_dir { "/" } else { "" };
         let kind = if entry.is_dir { "DIR" } else { "   " };
-        let label = format!(" {indent}{branch}{icon} {git} {kind} {}{suffix}", entry.name);
+        let label = format!(
+            " {indent}{branch}{icon} {git} {kind} {}{suffix}",
+            entry.name
+        );
 
         queue!(
             out,
@@ -552,22 +657,75 @@ fn draw_project_tree<W: Write>(
     Ok(())
 }
 
-fn draw_outline<W: Write>(out: &mut W, app: &App, top: u16, rows: usize, width: usize) -> io::Result<()> {
+fn draw_outline<W: Write>(
+    out: &mut W,
+    app: &App,
+    top: u16,
+    rows: usize,
+    width: usize,
+) -> io::Result<()> {
     let symbols = app.outline_symbols();
     for row in 0..rows {
         let y = top + row as u16;
-        queue!(out, MoveTo(0, y), SetBackgroundColor(app.theme.prompt_bar), Print(" ".repeat(width)))?;
+        queue!(
+            out,
+            MoveTo(0, y),
+            SetBackgroundColor(app.theme.prompt_bar),
+            Print(" ".repeat(width))
+        )?;
         if row == 0 {
-            queue!(out, MoveTo(0, y), SetForegroundColor(app.theme.top_bar_text), SetAttribute(Attribute::Bold), Print(pad_or_truncate(&format!(" SYMBOLS ▾ {} items", symbols.len()), width)), SetAttribute(Attribute::Reset))?;
+            queue!(
+                out,
+                MoveTo(0, y),
+                SetForegroundColor(app.theme.top_bar_text),
+                SetAttribute(Attribute::Bold),
+                Print(pad_or_truncate(
+                    &format!(" SYMBOLS ▾ {} items", symbols.len()),
+                    width
+                )),
+                SetAttribute(Attribute::Reset)
+            )?;
             continue;
         }
         let index = app.outline_scroll + row - 1;
-        let Some(symbol) = symbols.get(index) else { continue; };
+        let Some(symbol) = symbols.get(index) else {
+            continue;
+        };
         let selected = index == app.outline_selected;
-        let background = if selected && app.explorer_focused { app.theme.normal_mode } else if selected { app.theme.current_line } else { app.theme.prompt_bar };
-        let foreground = if selected && app.explorer_focused { app.theme.background } else if symbol.kind == "type" { app.theme.type_name } else { app.theme.foreground };
-        let label = format!(" {}{} {}  {}", "  ".repeat(symbol.depth), if symbol.kind == "type" { "◆" } else { "ƒ" }, symbol.name, symbol.start_line + 1);
-        queue!(out, MoveTo(0, y), SetBackgroundColor(background), SetForegroundColor(foreground), SetAttribute(if selected { Attribute::Bold } else { Attribute::Reset }), Print(pad_or_truncate(&label, width)), SetAttribute(Attribute::Reset))?;
+        let background = if selected && app.explorer_focused {
+            app.theme.normal_mode
+        } else if selected {
+            app.theme.current_line
+        } else {
+            app.theme.prompt_bar
+        };
+        let foreground = if selected && app.explorer_focused {
+            app.theme.background
+        } else if symbol.kind == "type" {
+            app.theme.type_name
+        } else {
+            app.theme.foreground
+        };
+        let label = format!(
+            " {}{} {}  {}",
+            "  ".repeat(symbol.depth),
+            if symbol.kind == "type" { "◆" } else { "ƒ" },
+            symbol.name,
+            symbol.start_line + 1
+        );
+        queue!(
+            out,
+            MoveTo(0, y),
+            SetBackgroundColor(background),
+            SetForegroundColor(foreground),
+            SetAttribute(if selected {
+                Attribute::Bold
+            } else {
+                Attribute::Reset
+            }),
+            Print(pad_or_truncate(&label, width)),
+            SetAttribute(Attribute::Reset)
+        )?;
     }
     Ok(())
 }
@@ -591,24 +749,55 @@ fn draw_vertical_separator<W: Write>(
     Ok(())
 }
 
-fn draw_terminal<W: Write>(out: &mut W, app: &App, top: u16, rows: usize, width: u16) -> io::Result<()> {
-    if rows == 0 { return Ok(()); }
+fn draw_terminal<W: Write>(
+    out: &mut W,
+    app: &App,
+    top: u16,
+    rows: usize,
+    width: u16,
+) -> io::Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
     let separator_row = top.saturating_sub(1);
-    let cwd = app.terminal_cwd().map(|path| path.display().to_string()).unwrap_or_default();
+    let cwd = app
+        .terminal_cwd()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
     let title = format!(" TERMINAL · {} · {} ", app.terminal_shell_name(), cwd);
     let close_hint = " Ctrl-Backtick focus · Ctrl-Shift-Backtick close ";
-    queue!(out, MoveTo(0, separator_row), SetBackgroundColor(app.theme.background), SetForegroundColor(if app.terminal_focused { app.theme.insert_mode } else { app.theme.border }), SetAttribute(Attribute::Bold), Print(fit_bar(&title, close_hint, width as usize)), SetAttribute(Attribute::Reset))?;
+    queue!(
+        out,
+        MoveTo(0, separator_row),
+        SetBackgroundColor(app.theme.background),
+        SetForegroundColor(if app.terminal_exited() {
+            app.theme.error
+        } else if app.terminal_focused {
+            app.theme.insert_mode
+        } else {
+            app.theme.border
+        }),
+        SetAttribute(Attribute::Bold),
+        Print(fit_bar(&title, close_hint, width as usize)),
+        SetAttribute(Attribute::Reset)
+    )?;
 
-    let output_rows = rows.saturating_sub(1);
-    let lines = app.terminal_lines(output_rows);
-    let blank_rows = output_rows.saturating_sub(lines.len());
-    for row in 0..output_rows {
-        let text = if row < blank_rows { "" } else { lines[row - blank_rows].as_str() };
-        queue!(out, MoveTo(0, top + row as u16), SetBackgroundColor(app.theme.prompt_bar), SetForegroundColor(app.theme.prompt_text), Print(pad_or_truncate(text, width as usize)))?;
+    let lines = app.terminal_lines(rows);
+    let blank_rows = rows.saturating_sub(lines.len());
+    for row in 0..rows {
+        let text = if row < blank_rows {
+            ""
+        } else {
+            lines[row - blank_rows].as_str()
+        };
+        queue!(
+            out,
+            MoveTo(0, top + row as u16),
+            SetBackgroundColor(app.theme.prompt_bar),
+            SetForegroundColor(app.theme.prompt_text),
+            Print(pad_or_truncate(text, width as usize))
+        )?;
     }
-    let input_row = top + rows.saturating_sub(1) as u16;
-    let prompt = format!("> {}", app.terminal_input());
-    queue!(out, MoveTo(0, input_row), SetBackgroundColor(if app.terminal_focused { app.theme.current_line } else { app.theme.prompt_bar }), SetForegroundColor(if app.terminal_exited() { app.theme.error } else { app.theme.foreground }), Print(pad_or_truncate(&prompt, width as usize)))?;
     Ok(())
 }
 
@@ -686,7 +875,13 @@ fn draw_editor<W: Write>(
                 None => (" ", number_color),
             };
 
-            queue!(out, SetForegroundColor(git_color), Print(git_marker), SetForegroundColor(number_color), Print(number))?;
+            queue!(
+                out,
+                SetForegroundColor(git_color),
+                Print(git_marker),
+                SetForegroundColor(number_color),
+                Print(number)
+            )?;
         }
 
         let line = app.editor.line_text(line_index);
@@ -721,7 +916,10 @@ fn draw_editor<W: Write>(
                 if screen_column < text_width {
                     queue!(
                         out,
-                        MoveTo(editor_x + gutter_width as u16 + screen_column as u16, terminal_row),
+                        MoveTo(
+                            editor_x + gutter_width as u16 + screen_column as u16,
+                            terminal_row
+                        ),
                         SetBackgroundColor(line_background),
                         SetForegroundColor(app.theme.muted),
                         Print(pad_or_truncate(&label, text_width - screen_column))
@@ -850,11 +1048,16 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Search => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
-            Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery | Mode::ContextMenu | Mode::Dashboard => app.theme.command_mode,
+            Mode::GitDiff
+            | Mode::GitHistory
+            | Mode::ThemeGallery
+            | Mode::KeymapGallery
+            | Mode::ContextMenu
+            | Mode::Dashboard => app.theme.command_mode,
         }
     };
 
-    let language = Language::from_path(app.editor.path.as_deref());
+    let language_name = app.language_name();
     let left = format!(
         " {}  │  {} keys  │  Tab {}/{}  │  {} lines  │  {} ",
         app.active_panel_label(),
@@ -862,7 +1065,7 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         app.editor.active_index() + 1,
         app.editor.len(),
         app.editor.line_count(),
-        language.name()
+        language_name
     );
     let background = app.background_status();
     let background_label = background.as_ref().map(|(label, _)| label.as_str());
@@ -870,7 +1073,11 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         format!(
             " {}{} {}/{} items  ",
             background_label.unwrap_or(""),
-            if background_label.is_some() { "  │ " } else { "" },
+            if background_label.is_some() {
+                "  │ "
+            } else {
+                ""
+            },
             app.project
                 .selected
                 .saturating_add(1)
@@ -881,7 +1088,11 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         format!(
             " {}{}Ln {}, Col {}  ",
             background_label.unwrap_or(""),
-            if background_label.is_some() { "  │ " } else { "" },
+            if background_label.is_some() {
+                "  │ "
+            } else {
+                ""
+            },
             app.editor.cursor.line + 1,
             app.editor.cursor.column + 1
         )
@@ -899,14 +1110,23 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
 
     if let Some((label, state)) = background {
         let right_width = UnicodeWidthStr::width(right.as_str());
-        let x = (width as usize).saturating_sub(right_width).saturating_add(1) as u16;
+        let x = (width as usize)
+            .saturating_sub(right_width)
+            .saturating_add(1) as u16;
         let color = match state {
             BackgroundState::Working => app.theme.search_mode,
             BackgroundState::Ready => app.theme.success,
             BackgroundState::Warning => app.theme.gutter_current,
             BackgroundState::Error => app.theme.error,
         };
-        queue!(out, MoveTo(x, row), SetForegroundColor(color), SetAttribute(Attribute::Bold), Print(label), SetAttribute(Attribute::Reset))?;
+        queue!(
+            out,
+            MoveTo(x, row),
+            SetForegroundColor(color),
+            SetAttribute(Attribute::Bold),
+            Print(label),
+            SetAttribute(Attribute::Reset)
+        )?;
     }
 
     if app.mode == Mode::Command {
@@ -919,7 +1139,10 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
                     MoveTo((1 + before).min(width as usize) as u16, row),
                     SetBackgroundColor(app.theme.search_background),
                     SetForegroundColor(app.theme.search_foreground),
-                    Print(pad_or_truncate(selected, width.saturating_sub(1 + before as u16) as usize))
+                    Print(pad_or_truncate(
+                        selected,
+                        width.saturating_sub(1 + before as u16) as usize
+                    ))
                 )?;
             }
         }
@@ -933,12 +1156,47 @@ fn draw_git_diff<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> i
     let x = 3u16;
     let y = 2u16;
     for row in 0..panel_height {
-        queue!(out, MoveTo(x, y + row as u16), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.overlay_text), Print(" ".repeat(panel_width)))?;
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
     }
-    queue!(out, MoveTo(x, y), SetAttribute(Attribute::Bold), SetForegroundColor(app.theme.top_bar_text), Print(pad_or_truncate(" GIT DIFF  ·  Esc closes  ·  ↑↓ scroll", panel_width)), SetAttribute(Attribute::Reset))?;
-    for (row, line) in app.git_diff_lines.iter().skip(app.git_diff_scroll).take(panel_height.saturating_sub(2)).enumerate() {
-        let color = if line.starts_with('+') { app.theme.success } else if line.starts_with('-') { app.theme.error } else if line.starts_with("@@") { app.theme.heading } else { app.theme.overlay_text };
-        queue!(out, MoveTo(x, y + 1 + row as u16), SetForegroundColor(color), Print(pad_or_truncate(line, panel_width)))?;
+    queue!(
+        out,
+        MoveTo(x, y),
+        SetAttribute(Attribute::Bold),
+        SetForegroundColor(app.theme.top_bar_text),
+        Print(pad_or_truncate(
+            " GIT DIFF  ·  Esc closes  ·  ↑↓ scroll",
+            panel_width
+        )),
+        SetAttribute(Attribute::Reset)
+    )?;
+    for (row, line) in app
+        .git_diff_lines
+        .iter()
+        .skip(app.git_diff_scroll)
+        .take(panel_height.saturating_sub(2))
+        .enumerate()
+    {
+        let color = if line.starts_with('+') {
+            app.theme.success
+        } else if line.starts_with('-') {
+            app.theme.error
+        } else if line.starts_with("@@") {
+            app.theme.heading
+        } else {
+            app.theme.overlay_text
+        };
+        queue!(
+            out,
+            MoveTo(x, y + 1 + row as u16),
+            SetForegroundColor(color),
+            Print(pad_or_truncate(line, panel_width))
+        )?;
     }
     Ok(())
 }
@@ -946,14 +1204,54 @@ fn draw_git_diff<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> i
 fn draw_git_history<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
     let panel_width = width.saturating_sub(6) as usize;
     let panel_height = height.saturating_sub(4) as usize;
-    let x = 3u16; let y = 2u16;
-    for row in 0..panel_height { queue!(out, MoveTo(x, y + row as u16), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.overlay_text), Print(" ".repeat(panel_width)))?; }
-    queue!(out, MoveTo(x, y), SetAttribute(Attribute::Bold), SetForegroundColor(app.theme.top_bar_text), Print(pad_or_truncate(" GIT HISTORY  ·  Enter inspects commit  ·  Esc closes", panel_width)), SetAttribute(Attribute::Reset))?;
-    if app.git_history.is_empty() { queue!(out, MoveTo(x, y + 2), Print(" No commits for this file."))?; }
-    for (index, entry) in app.git_history.iter().take(panel_height.saturating_sub(2)).enumerate() {
+    let x = 3u16;
+    let y = 2u16;
+    for row in 0..panel_height {
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
+    }
+    queue!(
+        out,
+        MoveTo(x, y),
+        SetAttribute(Attribute::Bold),
+        SetForegroundColor(app.theme.top_bar_text),
+        Print(pad_or_truncate(
+            " GIT HISTORY  ·  Enter inspects commit  ·  Esc closes",
+            panel_width
+        )),
+        SetAttribute(Attribute::Reset)
+    )?;
+    if app.git_history.is_empty() {
+        queue!(out, MoveTo(x, y + 2), Print(" No commits for this file."))?;
+    }
+    for (index, entry) in app
+        .git_history
+        .iter()
+        .take(panel_height.saturating_sub(2))
+        .enumerate()
+    {
         let selected = index == app.git_history_selected;
         let label = format!(" {}  {}", entry.hash, entry.summary);
-        queue!(out, MoveTo(x, y + 1 + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print(pad_or_truncate(&label, panel_width)))?;
+        queue!(
+            out,
+            MoveTo(x, y + 1 + index as u16),
+            SetBackgroundColor(if selected {
+                app.theme.command_mode
+            } else {
+                app.theme.overlay
+            }),
+            SetForegroundColor(if selected {
+                app.theme.background
+            } else {
+                app.theme.overlay_text
+            }),
+            Print(pad_or_truncate(&label, panel_width))
+        )?;
     }
     Ok(())
 }
@@ -963,44 +1261,133 @@ fn draw_theme_gallery<W: Write>(out: &mut W, app: &App, width: u16, height: u16)
     let panel_height = ThemeKind::ALL.len() + 4;
     let x = width.saturating_sub(panel_width as u16) / 2;
     let y = height.saturating_sub(panel_height as u16) / 2;
-    for row in 0..panel_height { queue!(out, MoveTo(x, y + row as u16), SetBackgroundColor(app.theme.overlay), Print(" ".repeat(panel_width)))?; }
-    queue!(out, MoveTo(x + 2, y + 1), SetForegroundColor(app.theme.top_bar_text), SetAttribute(Attribute::Bold), Print("THEME GALLERY · live preview"), SetAttribute(Attribute::Reset))?;
+    for row in 0..panel_height {
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            Print(" ".repeat(panel_width))
+        )?;
+    }
+    queue!(
+        out,
+        MoveTo(x + 2, y + 1),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print("THEME GALLERY · live preview"),
+        SetAttribute(Attribute::Reset)
+    )?;
     for (index, kind) in ThemeKind::ALL.iter().enumerate() {
         let selected = index == app.theme_gallery_selected;
-        queue!(out, MoveTo(x + 2, y + 2 + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print(pad_or_truncate(&format!(" {}  {}", if selected { "▶" } else { " " }, kind.name()), panel_width.saturating_sub(4))))?;
+        queue!(
+            out,
+            MoveTo(x + 2, y + 2 + index as u16),
+            SetBackgroundColor(if selected {
+                app.theme.command_mode
+            } else {
+                app.theme.overlay
+            }),
+            SetForegroundColor(if selected {
+                app.theme.background
+            } else {
+                app.theme.overlay_text
+            }),
+            Print(pad_or_truncate(
+                &format!(" {}  {}", if selected { "▶" } else { " " }, kind.name()),
+                panel_width.saturating_sub(4)
+            ))
+        )?;
     }
-    queue!(out, MoveTo(x + 2, y + panel_height as u16 - 1), SetForegroundColor(app.theme.muted), Print("Hover preview · Click apply · ↑↓/Enter · Esc cancel"))?;
+    queue!(
+        out,
+        MoveTo(x + 2, y + panel_height as u16 - 1),
+        SetForegroundColor(app.theme.muted),
+        Print("Hover preview · Click apply · ↑↓/Enter · Esc cancel")
+    )?;
     Ok(())
 }
 
-fn draw_keymap_gallery<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
+fn draw_keymap_gallery<W: Write>(
+    out: &mut W,
+    app: &App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
     let panel_width = 62usize.min(width.saturating_sub(4) as usize);
     let panel_height = KeymapProfile::ALL.len() + 5;
     let x = width.saturating_sub(panel_width as u16) / 2;
     let y = height.saturating_sub(panel_height as u16) / 2;
     for row in 0..panel_height {
-        queue!(out, MoveTo(x, y + row as u16), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.overlay_text), Print(" ".repeat(panel_width)))?;
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
     }
-    queue!(out, MoveTo(x + 2, y + 1), SetForegroundColor(app.theme.top_bar_text), SetAttribute(Attribute::Bold), Print("KEYMAP PROFILES"), SetAttribute(Attribute::Reset))?;
+    queue!(
+        out,
+        MoveTo(x + 2, y + 1),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print("KEYMAP PROFILES"),
+        SetAttribute(Attribute::Reset)
+    )?;
     for (index, profile) in KeymapProfile::ALL.iter().enumerate() {
         let selected = index == app.keymap_gallery_selected;
         let active = *profile == app.keymap_profile();
-        let label = format!(" {} {:<13} {}{}", if selected { "▶" } else { " " }, profile.name(), profile.description(), if active { "  ✓" } else { "" });
-        queue!(out, MoveTo(x + 2, y + 2 + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print(pad_or_truncate(&label, panel_width.saturating_sub(4))))?;
+        let label = format!(
+            " {} {:<13} {}{}",
+            if selected { "▶" } else { " " },
+            profile.name(),
+            profile.description(),
+            if active { "  ✓" } else { "" }
+        );
+        queue!(
+            out,
+            MoveTo(x + 2, y + 2 + index as u16),
+            SetBackgroundColor(if selected {
+                app.theme.command_mode
+            } else {
+                app.theme.overlay
+            }),
+            SetForegroundColor(if selected {
+                app.theme.background
+            } else {
+                app.theme.overlay_text
+            }),
+            Print(pad_or_truncate(&label, panel_width.saturating_sub(4)))
+        )?;
     }
-    queue!(out, MoveTo(x + 2, y + panel_height as u16 - 1), SetForegroundColor(app.theme.muted), Print("Click/Enter apply · ↑↓ select · Esc cancel"))?;
+    queue!(
+        out,
+        MoveTo(x + 2, y + panel_height as u16 - 1),
+        SetForegroundColor(app.theme.muted),
+        Print("Click/Enter apply · ↑↓ select · Esc cancel")
+    )?;
     Ok(())
 }
 
-pub fn keymap_gallery_item_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<usize> {
-    if app.mode != Mode::KeymapGallery { return None; }
+pub fn keymap_gallery_item_at(
+    app: &App,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if app.mode != Mode::KeymapGallery {
+        return None;
+    }
     let panel_width = 62usize.min(width.saturating_sub(4) as usize);
     let panel_height = KeymapProfile::ALL.len() + 5;
     let x = width.saturating_sub(panel_width as u16) / 2;
     let y = height.saturating_sub(panel_height as u16) / 2;
     let first = y.saturating_add(2);
-    if column < x || column >= x.saturating_add(panel_width as u16)
-        || row < first || row >= first.saturating_add(KeymapProfile::ALL.len() as u16)
+    if column < x
+        || column >= x.saturating_add(panel_width as u16)
+        || row < first
+        || row >= first.saturating_add(KeymapProfile::ALL.len() as u16)
     {
         return None;
     }
@@ -1009,10 +1396,21 @@ pub fn keymap_gallery_item_at(app: &App, width: u16, height: u16, column: u16, r
 
 fn context_menu_geometry(app: &App, width: u16, height: u16) -> Option<(u16, u16, usize)> {
     let menu = app.context_menu.as_ref()?;
-    let content_width = menu.actions.iter().map(|action| {
-        let hint = action.hint();
-        UnicodeWidthStr::width(action.label()) + if hint.is_empty() { 0 } else { UnicodeWidthStr::width(hint) + 2 }
-    }).max().unwrap_or(12) + 4;
+    let content_width = menu
+        .actions
+        .iter()
+        .map(|action| {
+            let hint = action.hint();
+            UnicodeWidthStr::width(action.label())
+                + if hint.is_empty() {
+                    0
+                } else {
+                    UnicodeWidthStr::width(hint) + 2
+                }
+        })
+        .max()
+        .unwrap_or(12)
+        + 4;
     let menu_width = content_width.clamp(20, width.saturating_sub(2) as usize);
     let menu_height = menu.actions.len().saturating_add(2) as u16;
     let x = menu.x.min(width.saturating_sub(menu_width as u16 + 1));
@@ -1021,9 +1419,19 @@ fn context_menu_geometry(app: &App, width: u16, height: u16) -> Option<(u16, u16
 }
 
 fn draw_context_menu<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
-    let Some(menu) = app.context_menu.as_ref() else { return Ok(()); };
-    let Some((x, y, menu_width)) = context_menu_geometry(app, width, height) else { return Ok(()); };
-    queue!(out, MoveTo(x, y), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.border), Print(format!("┌{}┐", "─".repeat(menu_width.saturating_sub(2)))))?;
+    let Some(menu) = app.context_menu.as_ref() else {
+        return Ok(());
+    };
+    let Some((x, y, menu_width)) = context_menu_geometry(app, width, height) else {
+        return Ok(());
+    };
+    queue!(
+        out,
+        MoveTo(x, y),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.border),
+        Print(format!("┌{}┐", "─".repeat(menu_width.saturating_sub(2))))
+    )?;
     for (index, action) in menu.actions.iter().enumerate() {
         let selected = index == menu.selected;
         let hint = action.hint();
@@ -1033,28 +1441,154 @@ fn draw_context_menu<W: Write>(out: &mut W, app: &App, width: u16, height: u16) 
         } else {
             let left = format!("  {}", action.label());
             let used = UnicodeWidthStr::width(left.as_str()) + UnicodeWidthStr::width(hint);
-            format!("{}{}{} ", left, " ".repeat(inner.saturating_sub(used + 1)), hint)
+            format!(
+                "{}{}{} ",
+                left,
+                " ".repeat(inner.saturating_sub(used + 1)),
+                hint
+            )
         };
-        queue!(out, MoveTo(x, y + 1 + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print("│"), Print(pad_or_truncate(&label, inner)), Print("│"))?;
+        queue!(
+            out,
+            MoveTo(x, y + 1 + index as u16),
+            SetBackgroundColor(if selected {
+                app.theme.command_mode
+            } else {
+                app.theme.overlay
+            }),
+            SetForegroundColor(if selected {
+                app.theme.background
+            } else {
+                app.theme.overlay_text
+            }),
+            Print("│"),
+            Print(pad_or_truncate(&label, inner)),
+            Print("│")
+        )?;
     }
-    queue!(out, MoveTo(x, y + menu.actions.len() as u16 + 1), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.border), Print(format!("└{}┘", "─".repeat(menu_width.saturating_sub(2)))))?;
+    queue!(
+        out,
+        MoveTo(x, y + menu.actions.len() as u16 + 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.border),
+        Print(format!("└{}┘", "─".repeat(menu_width.saturating_sub(2))))
+    )?;
     Ok(())
 }
 
-pub fn context_menu_action_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<usize> {
+fn lsp_panel_geometry(
+    app: &App,
+    width: u16,
+    height: u16,
+) -> Option<(u16, u16, usize, usize, usize)> {
+    let panel = app.lsp_panel.as_ref()?;
+    let panel_width = (width as usize).saturating_sub(4).clamp(30, 90);
+    let visible = panel
+        .items
+        .len()
+        .min((height as usize).saturating_sub(8).clamp(1, 14));
+    let panel_height = visible + 2;
+    let x = (width.saturating_sub(panel_width as u16)) / 2;
+    let y = (height.saturating_sub(panel_height as u16)) / 2;
+    let start = panel
+        .selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(panel.items.len().saturating_sub(visible));
+    Some((x, y, panel_width, visible, start))
+}
+
+fn draw_lsp_panel<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
+    let Some(panel) = app.lsp_panel.as_ref() else {
+        return Ok(());
+    };
+    let Some((x, y, panel_width, visible, start)) = lsp_panel_geometry(app, width, height) else {
+        return Ok(());
+    };
+    let title = format!(
+        "┌ {} {}┐",
+        panel.title,
+        "─".repeat(panel_width.saturating_sub(panel.title.chars().count() + 4))
+    );
+    queue!(
+        out,
+        MoveTo(x, y),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.border),
+        Print(pad_or_truncate(&title, panel_width))
+    )?;
+    for row in 0..visible {
+        let index = start + row;
+        let item = &panel.items[index];
+        let selected = index == panel.selected;
+        let text = if item.detail.is_empty() {
+            item.label.clone()
+        } else {
+            format!("{}  ·  {}", item.label, item.detail)
+        };
+        let body = format!("│ {}", text);
+        queue!(
+            out,
+            MoveTo(x, y + row as u16 + 1),
+            SetBackgroundColor(if selected {
+                app.theme.command_mode
+            } else {
+                app.theme.overlay
+            }),
+            SetForegroundColor(if selected {
+                app.theme.background
+            } else {
+                app.theme.overlay_text
+            }),
+            Print(pad_or_truncate(&body, panel_width.saturating_sub(1))),
+            Print("│")
+        )?;
+    }
+    queue!(
+        out,
+        MoveTo(x, y + visible as u16 + 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.border),
+        Print(format!("└{}┘", "─".repeat(panel_width.saturating_sub(2))))
+    )?;
+    Ok(())
+}
+
+pub fn lsp_panel_item_at(
+    app: &App,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let (x, y, panel_width, visible, start) = lsp_panel_geometry(app, width, height)?;
+    if column <= x || column >= x + panel_width as u16 - 1 || row <= y || row > y + visible as u16 {
+        return None;
+    }
+    Some(start + (row - y - 1) as usize)
+}
+
+pub fn context_menu_action_at(
+    app: &App,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
     let menu = app.context_menu.as_ref()?;
     let (x, y, menu_width) = context_menu_geometry(app, width, height)?;
     if column <= x || column >= x.saturating_add(menu_width as u16).saturating_sub(1) {
         return None;
     }
     let first = y.saturating_add(1);
-    if row < first || row >= first.saturating_add(menu.actions.len() as u16) { return None; }
+    if row < first || row >= first.saturating_add(menu.actions.len() as u16) {
+        return None;
+    }
     Some((row - first) as usize)
 }
 
 fn dashboard_geometry(app: &App, width: u16, height: u16) -> (u16, u16, usize, usize) {
     let panel_width = 72usize.min(width.saturating_sub(4) as usize);
-    let recent_rows = app.recent_projects().len().max(1).min(10);
+    let recent_rows = app.recent_projects().len().clamp(1, 10);
     let panel_height = recent_rows + 11;
     let x = width.saturating_sub(panel_width as u16) / 2;
     let y = height.saturating_sub(panel_height as u16) / 2;
@@ -1065,42 +1599,150 @@ fn draw_dashboard<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> 
     let (x, y, panel_width, recent_rows) = dashboard_geometry(app, width, height);
     let panel_height = recent_rows + 11;
     for row in 0..panel_height {
-        queue!(out, MoveTo(x, y + row as u16), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.overlay_text), Print(" ".repeat(panel_width)))?;
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
     }
     let title = "CARET";
-    queue!(out, MoveTo(x + (panel_width.saturating_sub(title.len()) / 2) as u16, y + 1), SetForegroundColor(app.theme.top_bar_text), SetAttribute(Attribute::Bold), Print(title), SetAttribute(Attribute::Reset))?;
+    queue!(
+        out,
+        MoveTo(
+            x + (panel_width.saturating_sub(title.len()) / 2) as u16,
+            y + 1
+        ),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print(title),
+        SetAttribute(Attribute::Reset)
+    )?;
     let subtitle = "Fast, focused editing in any terminal";
-    queue!(out, MoveTo(x + (panel_width.saturating_sub(subtitle.len()) / 2) as u16, y + 2), SetForegroundColor(app.theme.muted), Print(subtitle))?;
-    queue!(out, MoveTo(x + 3, y + 4), SetForegroundColor(app.theme.heading), SetAttribute(Attribute::Bold), Print("RECENT PROJECTS"), SetAttribute(Attribute::Reset))?;
+    queue!(
+        out,
+        MoveTo(
+            x + (panel_width.saturating_sub(subtitle.len()) / 2) as u16,
+            y + 2
+        ),
+        SetForegroundColor(app.theme.muted),
+        Print(subtitle)
+    )?;
+    queue!(
+        out,
+        MoveTo(x + 3, y + 4),
+        SetForegroundColor(app.theme.heading),
+        SetAttribute(Attribute::Bold),
+        Print("RECENT PROJECTS"),
+        SetAttribute(Attribute::Reset)
+    )?;
 
     if app.recent_projects().is_empty() {
-        queue!(out, MoveTo(x + 3, y + 5), SetForegroundColor(app.theme.muted), Print("No recent projects yet — open the current folder to begin."))?;
+        queue!(
+            out,
+            MoveTo(x + 3, y + 5),
+            SetForegroundColor(app.theme.muted),
+            Print("No recent projects yet — open the current folder to begin.")
+        )?;
     } else {
         for (index, path) in app.recent_projects().iter().take(10).enumerate() {
             let selected = index == app.dashboard_selected;
             let hovered = app.dashboard_hover == Some(index);
             let active = selected || hovered;
             let exists = path.is_dir();
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("Project");
-            let label = format!(" {} {:<20}  {}{}", if active { "▶" } else { " " }, name, path.display(), if exists { "" } else { "  (missing)" });
-            queue!(out, MoveTo(x + 2, y + 5 + index as u16), SetBackgroundColor(if active { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if active { app.theme.background } else if exists { app.theme.overlay_text } else { app.theme.error }), Print(pad_or_truncate(&label, panel_width.saturating_sub(4))))?;
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Project");
+            let label = format!(
+                " {} {:<20}  {}{}",
+                if active { "▶" } else { " " },
+                name,
+                path.display(),
+                if exists { "" } else { "  (missing)" }
+            );
+            queue!(
+                out,
+                MoveTo(x + 2, y + 5 + index as u16),
+                SetBackgroundColor(if active {
+                    app.theme.command_mode
+                } else {
+                    app.theme.overlay
+                }),
+                SetForegroundColor(if active {
+                    app.theme.background
+                } else if exists {
+                    app.theme.overlay_text
+                } else {
+                    app.theme.error
+                }),
+                Print(pad_or_truncate(&label, panel_width.saturating_sub(4)))
+            )?;
         }
     }
 
     let actions_y = y + 6 + recent_rows as u16;
     let current_hit = app.recent_projects().len();
     let path_hit = current_hit + 1;
-    queue!(out, MoveTo(x + 3, actions_y), SetBackgroundColor(if app.dashboard_hover == Some(current_hit) { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if app.dashboard_hover == Some(current_hit) { app.theme.background } else { app.theme.top_bar_text }), SetAttribute(Attribute::Bold), Print(" [C] Open Current Folder "), SetAttribute(Attribute::Reset))?;
-    queue!(out, MoveTo(x + 3, actions_y + 1), SetBackgroundColor(if app.dashboard_hover == Some(path_hit) { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if app.dashboard_hover == Some(path_hit) { app.theme.background } else { app.theme.top_bar_text }), SetAttribute(Attribute::Bold), Print(" [E] Open Path… "), SetAttribute(Attribute::Reset))?;
-    queue!(out, MoveTo(x + 3, actions_y + 3), SetForegroundColor(app.theme.muted), Print("↑↓ select · Enter open · F1 help · Q quit"))?;
+    queue!(
+        out,
+        MoveTo(x + 3, actions_y),
+        SetBackgroundColor(if app.dashboard_hover == Some(current_hit) {
+            app.theme.command_mode
+        } else {
+            app.theme.overlay
+        }),
+        SetForegroundColor(if app.dashboard_hover == Some(current_hit) {
+            app.theme.background
+        } else {
+            app.theme.top_bar_text
+        }),
+        SetAttribute(Attribute::Bold),
+        Print(" [C] Open Current Folder "),
+        SetAttribute(Attribute::Reset)
+    )?;
+    queue!(
+        out,
+        MoveTo(x + 3, actions_y + 1),
+        SetBackgroundColor(if app.dashboard_hover == Some(path_hit) {
+            app.theme.command_mode
+        } else {
+            app.theme.overlay
+        }),
+        SetForegroundColor(if app.dashboard_hover == Some(path_hit) {
+            app.theme.background
+        } else {
+            app.theme.top_bar_text
+        }),
+        SetAttribute(Attribute::Bold),
+        Print(" [E] Open Path… "),
+        SetAttribute(Attribute::Reset)
+    )?;
+    queue!(
+        out,
+        MoveTo(x + 3, actions_y + 3),
+        SetForegroundColor(app.theme.muted),
+        Print("↑↓ select · Enter open · F1 help · Q quit")
+    )?;
     Ok(())
 }
 
 /// Recent rows use 0..N; N is Current Folder and N+1 is Open Path.
-pub fn dashboard_hit_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<usize> {
-    if app.mode != Mode::Dashboard { return None; }
+pub fn dashboard_hit_at(
+    app: &App,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if app.mode != Mode::Dashboard {
+        return None;
+    }
     let (x, y, panel_width, recent_rows) = dashboard_geometry(app, width, height);
-    if column < x || column >= x.saturating_add(panel_width as u16) { return None; }
+    if column < x || column >= x.saturating_add(panel_width as u16) {
+        return None;
+    }
     let recent_start = y + 5;
     if !app.recent_projects().is_empty()
         && row >= recent_start
@@ -1109,15 +1751,23 @@ pub fn dashboard_hit_at(app: &App, width: u16, height: u16, column: u16, row: u1
         return Some((row - recent_start) as usize);
     }
     let actions_y = y + 6 + recent_rows as u16;
-    if row == actions_y {
-        if column >= x + 3 && column < x + 27 { return Some(app.recent_projects().len()); }
+    if row == actions_y && column >= x + 3 && column < x + 27 {
+        return Some(app.recent_projects().len());
     }
-    if row == actions_y + 1 && column >= x + 3 && column < x + 22 { return Some(app.recent_projects().len() + 1); }
+    if row == actions_y + 1 && column >= x + 3 && column < x + 22 {
+        return Some(app.recent_projects().len() + 1);
+    }
     None
 }
 
 /// Returns the theme row under the mouse, if it is inside the gallery list.
-pub fn theme_gallery_item_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<usize> {
+pub fn theme_gallery_item_at(
+    app: &App,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
     if app.mode != Mode::ThemeGallery {
         return None;
     }
@@ -1135,21 +1785,53 @@ pub fn theme_gallery_item_at(app: &App, width: u16, height: u16, column: u16, ro
     Some((row - first) as usize)
 }
 
-fn draw_command_palette<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
-    if app.mode != Mode::Command { return Ok(()); }
+fn draw_command_palette<W: Write>(
+    out: &mut W,
+    app: &App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    if app.mode != Mode::Command {
+        return Ok(());
+    }
     let suggestions = app.command_suggestions();
     let rows = suggestions.len().min(8);
     let panel_width = 30usize.min(width.saturating_sub(2) as usize);
     let start_row = height.saturating_sub(2 + rows as u16);
     for (index, command) in suggestions.into_iter().take(rows).enumerate() {
         let selected = index == app.command_suggestion;
-        queue!(out, MoveTo(1, start_row + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print(pad_or_truncate(&format!("  :{command}"), panel_width)))?;
+        queue!(
+            out,
+            MoveTo(1, start_row + index as u16),
+            SetBackgroundColor(if selected {
+                app.theme.command_mode
+            } else {
+                app.theme.overlay
+            }),
+            SetForegroundColor(if selected {
+                app.theme.background
+            } else {
+                app.theme.overlay_text
+            }),
+            Print(pad_or_truncate(&format!("  :{command}"), panel_width))
+        )?;
     }
     Ok(())
 }
 
-pub fn command_suggestion_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<usize> {
-    if app.mode != Mode::Command || column == 0 || column as usize > 30usize.min(width.saturating_sub(2) as usize) { return None; }
+pub fn command_suggestion_at(
+    app: &App,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if app.mode != Mode::Command
+        || column == 0
+        || column as usize > 30usize.min(width.saturating_sub(2) as usize)
+    {
+        return None;
+    }
     let rows = app.command_suggestions().len().min(8);
     let start = height.saturating_sub(2 + rows as u16);
     if row >= start && row < start.saturating_add(rows as u16) {
@@ -1177,7 +1859,8 @@ fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             app.theme.prompt_text,
         ),
         Mode::QuitConfirm => (
-            format!(" Unsaved changes — [S] Save all & quit   [D] Discard & quit   [Esc] Cancel"),
+            " Unsaved changes — [S] Save all & quit   [D] Discard & quit   [Esc] Cancel"
+                .to_string(),
             app.theme.error,
             app.theme.background,
         ),
@@ -1188,7 +1871,11 @@ fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         ),
         _ => {
             let (icon, foreground) = notification_presentation(&app.message, app);
-            let prompt = if app.message.is_empty() { String::new() } else { format!(" {icon} {}", app.message) };
+            let prompt = if app.message.is_empty() {
+                String::new()
+            } else {
+                format!(" {icon} {}", app.message)
+            };
             (prompt, app.theme.prompt_bar, foreground)
         }
     };
@@ -1210,11 +1897,24 @@ fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
 
 fn notification_presentation(message: &str, app: &App) -> (&'static str, Color) {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("failed") || lower.contains("error") || lower.contains("cannot") || lower.contains("unknown command") {
+    if lower.contains("failed")
+        || lower.contains("error")
+        || lower.contains("cannot")
+        || lower.contains("unknown command")
+    {
         ("✕", app.theme.error)
-    } else if lower.contains("warning") || lower.contains("still loading") || lower.contains("missing") || lower.starts_with("no ") {
+    } else if lower.contains("warning")
+        || lower.contains("still loading")
+        || lower.contains("missing")
+        || lower.starts_with("no ")
+    {
         ("⚠", app.theme.gutter_current)
-    } else if lower.contains("saved") || lower.contains("ready") || lower.contains("created") || lower.contains("opened") || lower.contains("applied") {
+    } else if lower.contains("saved")
+        || lower.contains("ready")
+        || lower.contains("created")
+        || lower.contains("opened")
+        || lower.contains("applied")
+    {
         ("✓", app.theme.success)
     } else {
         ("•", app.theme.prompt_text)
@@ -1233,7 +1933,12 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Search => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
-            Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery | Mode::ContextMenu | Mode::Dashboard => app.theme.command_mode,
+            Mode::GitDiff
+            | Mode::GitHistory
+            | Mode::ThemeGallery
+            | Mode::KeymapGallery
+            | Mode::ContextMenu
+            | Mode::Dashboard => app.theme.command_mode,
         }
     };
 
@@ -1320,6 +2025,9 @@ pub fn hotkey_action_at(app: &App, width: u16, column: u16) -> Option<&'static s
 }
 
 fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
+    if app.lsp_panel.is_some() {
+        return &[("↑↓", "Select"), ("Enter", "Open/Apply"), ("Esc", "Close")];
+    }
     if app.terminal_focused {
         return &[
             ("Enter", "Run"),
@@ -1413,7 +2121,14 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
         (Mode::ThemeGallery, _) => &[("↑↓", "Preview"), ("Enter", "Apply"), ("Esc", "Cancel")],
         (Mode::KeymapGallery, _) => &[("↑↓", "Select"), ("Enter", "Apply"), ("Esc", "Cancel")],
         (Mode::ContextMenu, _) => &[("↑↓", "Select"), ("Enter", "Apply"), ("Esc", "Close")],
-        (Mode::Dashboard, _) => &[("↑↓", "Select"), ("Enter", "Open"), ("C", "Current"), ("E", "Path"), ("F1", "Help"), ("Q", "Quit")],
+        (Mode::Dashboard, _) => &[
+            ("↑↓", "Select"),
+            ("Enter", "Open"),
+            ("C", "Current"),
+            ("E", "Path"),
+            ("F1", "Help"),
+            ("Q", "Quit"),
+        ],
     }
 }
 
@@ -1461,7 +2176,10 @@ fn draw_help<W: Write>(
         ("0 / $", "Start / end of line"),
         ("gg / G", "Top / bottom of file"),
         ("PageUp / PageDown", "Move one screen"),
-        ("zc / zo / za / zM / zR", "Close, open, toggle, fold all, unfold all"),
+        (
+            "zc / zo / za / zM / zR",
+            "Close, open, toggle, fold all, unfold all",
+        ),
         ("Alt-Left / Alt-Right", "Go back / forward in history"),
         ("/", "Search for text"),
         ("n / N", "Next / previous search result"),
@@ -1476,7 +2194,10 @@ fn draw_help<W: Write>(
         ("Up / Down", "Select a file or folder"),
         ("Enter", "Open a file or expand a folder"),
         ("Right-click file/tab", "Open actions for that item"),
-        ("+ / ~ / - in gutter", "Added / modified / deleted Git lines"),
+        (
+            "+ / ~ / - in gutter",
+            "Added / modified / deleted Git lines",
+        ),
         ("Left / Right", "Collapse / expand a folder"),
         ("Backspace", "Move to the parent folder"),
         (
@@ -1492,14 +2213,14 @@ fn draw_help<W: Write>(
         (":w  /  :w file", "Save / Save as"),
         (":q  /  :q!", "Quit / Force quit"),
         (":e path", "Open a file or folder"),
-        (":new [file]", "Create a new tab"),
-        (":tab 2", "Select tab 2"),
-        (":bd  /  :bd!", "Close tab / Force close tab"),
-        (":tree", "Show or hide the explorer"),
         (":terminal / Ctrl-`", "Open or focus the integrated shell"),
-        (":set number / nonumber", "Show or hide line numbers"),
-        (":theme oxide / mono", "Change the color theme"),
-        ("Ctrl-Q", "Save, discard, or cancel quitting"),
+        ("Ctrl-Space", "Show LSP completions"),
+        ("F2", "Rename the symbol at the cursor"),
+        ("F12 / Shift-F12", "Definition / references"),
+        (":hover", "Show type and documentation"),
+        (":actions", "Show and apply code actions"),
+        (":diagnostics", "Inspect errors and warnings"),
+        (":plugins", "List loaded plugins and commands"),
     ];
     const CUSTOMIZE: [(&str, &str); 11] = [
         ("Click Themes / :themes", "Open the live theme gallery"),
@@ -1508,11 +2229,20 @@ fn draw_help<W: Write>(
         (":keymaps", "Open the keymap profile chooser"),
         (":keymap caret", "Insert-first Caret workflow"),
         (":keymap vim", "Modal Vim-style workflow"),
-        (":keymap conventional", "Always-type workflow with Ctrl shortcuts"),
+        (
+            ":keymap conventional",
+            "Always-type workflow with Ctrl shortcuts",
+        ),
         ("Ctrl-Shift-P", "Open the command palette from any profile"),
         (":config", "Show the saved configuration path"),
-        (":theme mono / NO_COLOR=1", "Use the high-contrast monochrome theme"),
-        (":set reducedmotion", "Disable animated background indicators"),
+        (
+            ":theme mono / NO_COLOR=1",
+            "Use the high-contrast monochrome theme",
+        ),
+        (
+            ":set reducedmotion",
+            "Disable animated background indicators",
+        ),
     ];
 
     let page = app.help_page.min(PAGES.len() - 1);
@@ -1563,7 +2293,7 @@ fn draw_help<W: Write>(
         SetAttribute(Attribute::Reset),
         MoveTo(start_x + box_width.saturating_sub(13) as u16, start_y + 1),
         SetForegroundColor(app.theme.muted),
-        Print(format!("Page {}/4", page + 1))
+        Print(format!("Page {}/{}", page + 1, PAGES.len()))
     )?;
 
     let mut tab_x = start_x + 3;
@@ -1649,8 +2379,19 @@ fn place_cursor<W: Write>(
     terminal_width: u16,
     terminal_height: u16,
 ) -> io::Result<()> {
-    if matches!(app.mode, Mode::Help | Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery | Mode::ContextMenu | Mode::Dashboard)
-        || (app.explorer_focused && !matches!(app.mode, Mode::Command | Mode::Search)) {
+    if matches!(
+        app.mode,
+        Mode::Help
+            | Mode::QuitConfirm
+            | Mode::ReloadConfirm
+            | Mode::GitDiff
+            | Mode::GitHistory
+            | Mode::ThemeGallery
+            | Mode::KeymapGallery
+            | Mode::ContextMenu
+            | Mode::Dashboard
+    ) || (app.explorer_focused && !matches!(app.mode, Mode::Command | Mode::Search))
+    {
         return queue!(out, Hide);
     }
 
@@ -1661,7 +2402,11 @@ fn place_cursor<W: Write>(
         } else {
             &app.search_input
         };
-        let typed = if app.mode == Mode::Command { &input[..app.command_cursor()] } else { input.as_str() };
+        let typed = if app.mode == Mode::Command {
+            &input[..app.command_cursor()]
+        } else {
+            input.as_str()
+        };
         let x = (prefix_width + UnicodeWidthStr::width(typed))
             .min(terminal_width.saturating_sub(1) as usize) as u16;
 
@@ -1764,7 +2509,10 @@ mod tests {
             let layout = screen_layout(&app, width, height);
             assert!(layout.content_height >= 3, "{width}x{height}");
             assert!(layout.editor_width >= 1, "{width}x{height}");
-            assert!(layout.gutter_width < layout.editor_width, "{width}x{height}");
+            assert!(
+                layout.gutter_width < layout.editor_width,
+                "{width}x{height}"
+            );
             assert!(layout.hotkey_row < height, "{width}x{height}");
         }
     }

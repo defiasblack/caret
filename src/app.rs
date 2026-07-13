@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -14,12 +13,13 @@ use crossterm::{
     },
     terminal,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::{
     config::{self, KeymapProfile, Settings},
     editor::Cursor,
     lsp::{self, LspClient},
+    plugin::{PluginContext, PluginRegistry, PluginResponse},
     project::ProjectTree,
     syntax::Language,
     tabs::{OpenDisposition, Tabs},
@@ -54,7 +54,10 @@ pub enum HoverTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SidebarView { Files, Outline }
+pub enum SidebarView {
+    Files,
+    Outline,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MacroPrefix {
@@ -108,16 +111,58 @@ pub struct SplitViews {
 }
 
 #[derive(Debug, Clone)]
-pub struct GitHistoryEntry { pub hash: String, pub summary: String }
+pub struct GitHistoryEntry {
+    pub hash: String,
+    pub summary: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitLineChange { Added, Modified, Deleted }
+pub enum GitLineChange {
+    Added,
+    Modified,
+    Deleted,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackgroundState { Working, Ready, Warning, Error }
+pub enum BackgroundState {
+    Working,
+    Ready,
+    Warning,
+    Error,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LspStatus { Off, Starting, Loading, Ready, Error }
+enum LspStatus {
+    Off,
+    Starting,
+    Loading,
+    Ready,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LspPanelKind {
+    Completion,
+    Hover,
+    Locations,
+    CodeActions,
+    Diagnostics,
+}
+
+#[derive(Debug, Clone)]
+pub struct LspPanelItem {
+    pub label: String,
+    pub detail: String,
+    payload: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct LspPanel {
+    pub title: String,
+    pub items: Vec<LspPanelItem>,
+    pub selected: usize,
+    kind: LspPanelKind,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextAction {
@@ -209,6 +254,8 @@ pub struct App {
     help_return_mode: Mode,
     pub hover_target: Option<HoverTarget>,
     settings: Settings,
+    plugins: PluginRegistry,
+    active_custom_theme: Option<String>,
     pending_key: Option<char>,
     macro_prefix: Option<MacroPrefix>,
     recording_macro: Option<char>,
@@ -228,11 +275,14 @@ pub struct App {
     lsp_status: LspStatus,
     lsp_started_at: Option<Instant>,
     diagnostic_count: usize,
+    diagnostics: Vec<Value>,
+    pub lsp_panel: Option<LspPanel>,
     background_tick: usize,
     last_background_animation: Instant,
     observed_message: String,
     message_changed_at: Instant,
     lsp_last_text: String,
+    lsp_open_path: Option<PathBuf>,
     pending_save_after_disk_change: bool,
     pub git_diff_lines: Vec<String>,
     pub git_diff_scroll: usize,
@@ -241,6 +291,8 @@ pub struct App {
     git_line_changes: HashMap<usize, GitLineChange>,
     pub theme_gallery_selected: usize,
     theme_gallery_original: ThemeKind,
+    theme_gallery_original_theme: Theme,
+    theme_gallery_original_custom: Option<String>,
     theme_gallery_return_mode: Mode,
     pub keymap_gallery_selected: usize,
     keymap_gallery_return_mode: Mode,
@@ -255,6 +307,7 @@ pub struct App {
 impl App {
     pub fn new(path: Option<&Path>) -> io::Result<Self> {
         let (settings, config_message) = config::load();
+        let plugins = PluginRegistry::load(&config::plugins_dir());
         let current_dir = std::env::current_dir()?;
 
         let (editor_path, project_root, explorer_focused): (Option<PathBuf>, PathBuf, bool) =
@@ -294,7 +347,23 @@ impl App {
         } else {
             Mode::Insert
         };
-        let initial_theme = if std::env::var_os("NO_COLOR").is_some() { ThemeKind::Mono } else { settings.theme };
+        let initial_theme = if std::env::var_os("NO_COLOR").is_some() {
+            ThemeKind::Mono
+        } else {
+            settings.theme
+        };
+        let custom_theme = if std::env::var_os("NO_COLOR").is_none() {
+            settings
+                .custom_theme
+                .as_ref()
+                .and_then(|name| plugins.theme(name).map(|theme| (name.clone(), theme)))
+        } else {
+            None
+        };
+        let initial_rendered_theme = custom_theme
+            .as_ref()
+            .map_or_else(|| Theme::for_kind(initial_theme), |(_, theme)| *theme);
+        let initial_custom_name = custom_theme.as_ref().map(|(name, _)| name.clone());
 
         let mut app = Self {
             editor,
@@ -314,7 +383,8 @@ impl App {
             last_search: String::new(),
             message: config_message.unwrap_or_else(|| {
                 if show_dashboard {
-                    return "Welcome to Caret · choose a recent project or open the current folder".to_string();
+                    return "Welcome to Caret · choose a recent project or open the current folder"
+                        .to_string();
                 }
                 if explorer_focused {
                     "FILES · Enter opens · Ctrl-E returns to editor".to_string()
@@ -323,7 +393,7 @@ impl App {
                 }
             }),
             theme_kind: initial_theme,
-            theme: Theme::for_kind(initial_theme),
+            theme: initial_rendered_theme,
             viewport_rows: 1,
             viewport_columns: 1,
             follow_cursor: true,
@@ -332,6 +402,8 @@ impl App {
             help_return_mode: mode,
             hover_target: None,
             settings,
+            plugins,
+            active_custom_theme: initial_custom_name.clone(),
             pending_key: None,
             macro_prefix: None,
             recording_macro: None,
@@ -351,11 +423,14 @@ impl App {
             lsp_status: LspStatus::Off,
             lsp_started_at: None,
             diagnostic_count: 0,
+            diagnostics: Vec::new(),
+            lsp_panel: None,
             background_tick: 0,
             last_background_animation: Instant::now(),
             observed_message: String::new(),
             message_changed_at: Instant::now(),
             lsp_last_text: String::new(),
+            lsp_open_path: None,
             pending_save_after_disk_change: false,
             git_diff_lines: Vec::new(),
             git_diff_scroll: 0,
@@ -364,6 +439,8 @@ impl App {
             git_line_changes: HashMap::new(),
             theme_gallery_selected: 0,
             theme_gallery_original: initial_theme,
+            theme_gallery_original_theme: initial_rendered_theme,
+            theme_gallery_original_custom: initial_custom_name,
             theme_gallery_return_mode: mode,
             keymap_gallery_selected: 0,
             keymap_gallery_return_mode: mode,
@@ -374,7 +451,9 @@ impl App {
             terminal: None,
             terminal_focused: false,
         };
-        if path.is_some() { app.remember_current_project(); }
+        if path.is_some() {
+            app.remember_current_project();
+        }
         app.refresh_git_line_changes();
         Ok(app)
     }
@@ -406,12 +485,38 @@ impl App {
                 true
             }
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                if self.lsp_panel.is_some() {
+                    if let Ok((width, height)) = terminal::size() {
+                        if let Some(index) = crate::ui::lsp_panel_item_at(
+                            self,
+                            width,
+                            height,
+                            mouse.column,
+                            mouse.row,
+                        ) {
+                            if let Some(panel) = self.lsp_panel.as_mut() {
+                                if panel.selected != index {
+                                    panel.selected = index;
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
                 if self.mode == Mode::Dashboard {
                     if let Ok((width, height)) = terminal::size() {
-                        let hit = crate::ui::dashboard_hit_at(self, width, height, mouse.column, mouse.row);
+                        let hit = crate::ui::dashboard_hit_at(
+                            self,
+                            width,
+                            height,
+                            mouse.column,
+                            mouse.row,
+                        );
                         if hit != self.dashboard_hover {
                             self.dashboard_hover = hit;
-                            if let Some(index) = hit.filter(|index| *index < self.settings.recent_projects.len()) {
+                            if let Some(index) =
+                                hit.filter(|index| *index < self.settings.recent_projects.len())
+                            {
                                 self.dashboard_selected = index;
                             }
                             return true;
@@ -420,7 +525,13 @@ impl App {
                 }
                 if self.mode == Mode::ContextMenu {
                     if let Ok((width, height)) = terminal::size() {
-                        if let Some(index) = crate::ui::context_menu_action_at(self, width, height, mouse.column, mouse.row) {
+                        if let Some(index) = crate::ui::context_menu_action_at(
+                            self,
+                            width,
+                            height,
+                            mouse.column,
+                            mouse.row,
+                        ) {
                             if let Some(menu) = self.context_menu.as_mut() {
                                 if menu.selected != index {
                                     menu.selected = index;
@@ -432,7 +543,13 @@ impl App {
                 }
                 if self.mode == Mode::ThemeGallery {
                     if let Ok((width, height)) = terminal::size() {
-                        if let Some(index) = crate::ui::theme_gallery_item_at(self, width, height, mouse.column, mouse.row) {
+                        if let Some(index) = crate::ui::theme_gallery_item_at(
+                            self,
+                            width,
+                            height,
+                            mouse.column,
+                            mouse.row,
+                        ) {
                             if index != self.theme_gallery_selected {
                                 self.theme_gallery_selected = index;
                                 self.preview_gallery_theme();
@@ -443,7 +560,13 @@ impl App {
                 }
                 if self.mode == Mode::KeymapGallery {
                     if let Ok((width, height)) = terminal::size() {
-                        if let Some(index) = crate::ui::keymap_gallery_item_at(self, width, height, mouse.column, mouse.row) {
+                        if let Some(index) = crate::ui::keymap_gallery_item_at(
+                            self,
+                            width,
+                            height,
+                            mouse.column,
+                            mouse.row,
+                        ) {
                             if index != self.keymap_gallery_selected {
                                 self.keymap_gallery_selected = index;
                                 return true;
@@ -461,11 +584,14 @@ impl App {
     pub fn poll_background(&mut self) -> bool {
         let message = self.message.clone();
         let mut changed = false;
-        if let Some(terminal) = self.terminal.as_mut() { changed |= terminal.poll(); }
+        if let Some(terminal) = self.terminal.as_mut() {
+            changed |= terminal.poll();
+        }
         self.poll_lsp();
         if self.mode != Mode::ReloadConfirm && self.editor.changed_on_disk() {
             self.mode = Mode::ReloadConfirm;
-            self.message = "File changed on disk — [R] Reload   [K] Keep buffer   [Esc] Later".to_string();
+            self.message =
+                "File changed on disk — [R] Reload   [K] Keep buffer   [Esc] Later".to_string();
         }
         if self.message != self.observed_message {
             self.observed_message = self.message.clone();
@@ -504,8 +630,23 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if self.lsp_panel.is_some() {
+                if let Some(index) =
+                    crate::ui::lsp_panel_item_at(self, width, height, mouse.column, mouse.row)
+                {
+                    if let Some(panel) = self.lsp_panel.as_mut() {
+                        panel.selected = index;
+                    }
+                    self.activate_lsp_panel_item();
+                } else {
+                    self.lsp_panel = None;
+                }
+                return;
+            }
             if self.mode == Mode::Dashboard {
-                if let Some(hit) = crate::ui::dashboard_hit_at(self, width, height, mouse.column, mouse.row) {
+                if let Some(hit) =
+                    crate::ui::dashboard_hit_at(self, width, height, mouse.column, mouse.row)
+                {
                     if hit < self.settings.recent_projects.len() {
                         self.dashboard_selected = hit;
                         self.open_selected_recent_project();
@@ -521,11 +662,17 @@ impl App {
                     }
                     return;
                 }
-                if mouse.row != 0 { return; }
+                if mouse.row != 0 {
+                    return;
+                }
             }
             if self.mode == Mode::ContextMenu {
-                if let Some(index) = crate::ui::context_menu_action_at(self, width, height, mouse.column, mouse.row) {
-                    if let Some(menu) = self.context_menu.as_mut() { menu.selected = index; }
+                if let Some(index) =
+                    crate::ui::context_menu_action_at(self, width, height, mouse.column, mouse.row)
+                {
+                    if let Some(menu) = self.context_menu.as_mut() {
+                        menu.selected = index;
+                    }
                     self.execute_context_action();
                 } else {
                     self.close_context_menu();
@@ -533,10 +680,14 @@ impl App {
                 return;
             }
             if self.mode == Mode::ThemeGallery {
-                if let Some(index) = crate::ui::theme_gallery_item_at(self, width, height, mouse.column, mouse.row) {
+                if let Some(index) =
+                    crate::ui::theme_gallery_item_at(self, width, height, mouse.column, mouse.row)
+                {
                     self.theme_gallery_selected = index;
                     self.preview_gallery_theme();
                     self.settings.theme = self.theme_kind;
+                    self.settings.custom_theme = None;
+                    self.active_custom_theme = None;
                     self.persist_settings();
                     self.mode = self.theme_gallery_return_mode;
                     self.message = format!("Theme: {}", self.theme_kind.name());
@@ -544,15 +695,19 @@ impl App {
                 return;
             }
             if self.mode == Mode::KeymapGallery {
-                if let Some(index) = crate::ui::keymap_gallery_item_at(self, width, height, mouse.column, mouse.row) {
+                if let Some(index) =
+                    crate::ui::keymap_gallery_item_at(self, width, height, mouse.column, mouse.row)
+                {
                     self.keymap_gallery_selected = index;
                     self.apply_selected_keymap();
                 }
                 return;
             }
-            if let Some(index) = crate::ui::command_suggestion_at(self, width, height, mouse.column, mouse.row) {
+            if let Some(index) =
+                crate::ui::command_suggestion_at(self, width, height, mouse.column, mouse.row)
+            {
                 if let Some(command) = self.command_suggestions().get(index) {
-                    self.command_input = (*command).to_string();
+                    self.command_input = command.clone();
                     self.command_suggestion = index;
                     self.message = "Command selected; press Enter to run".to_string();
                 }
@@ -567,12 +722,17 @@ impl App {
             && (mouse.row as usize) < layout.content_top as usize + layout.content_height;
         let over_terminal = layout.terminal_height > 0
             && mouse.row >= layout.terminal_top.saturating_sub(1)
-            && mouse.row < layout.terminal_top.saturating_add(layout.terminal_height as u16);
+            && mouse.row
+                < layout
+                    .terminal_top
+                    .saturating_add(layout.terminal_height as u16);
 
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if over_terminal {
-                    if let Some(terminal) = self.terminal.as_mut() { terminal.scroll_up(3); }
+                    if let Some(terminal) = self.terminal.as_mut() {
+                        terminal.scroll_up(3);
+                    }
                 } else if over_sidebar {
                     for _ in 0..3 {
                         self.project.move_up();
@@ -586,7 +746,9 @@ impl App {
             }
             MouseEventKind::ScrollDown => {
                 if over_terminal {
-                    if let Some(terminal) = self.terminal.as_mut() { terminal.scroll_down(3); }
+                    if let Some(terminal) = self.terminal.as_mut() {
+                        terminal.scroll_down(3);
+                    }
                 } else if over_sidebar {
                     for _ in 0..3 {
                         self.project.move_down();
@@ -601,7 +763,9 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.handle_left_click(mouse.column, mouse.row, width, height);
             }
-            MouseEventKind::Down(MouseButton::Right) => self.open_context_menu(mouse.column, mouse.row, width, height),
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.open_context_menu(mouse.column, mouse.row, width, height)
+            }
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.handle_editor_drag(mouse.column, mouse.row, width, height);
             }
@@ -642,13 +806,17 @@ impl App {
     }
 
     fn open_context_menu(&mut self, column: u16, row: u16, width: u16, height: u16) {
-        if !matches!(self.mode, Mode::Normal | Mode::Insert | Mode::ContextMenu) { return; }
+        if !matches!(self.mode, Mode::Normal | Mode::Insert | Mode::ContextMenu) {
+            return;
+        }
         let layout = crate::ui::screen_layout(self, width, height);
         let mut actions = Vec::new();
         let return_mode;
 
         if row == 1 {
-            let Some(index) = crate::ui::tab_index_at(self, width, column) else { return; };
+            let Some(index) = crate::ui::tab_index_at(self, width, column) else {
+                return;
+            };
             self.select_tab_with_history(index);
             self.explorer_focused = false;
             return_mode = self.preferred_editor_mode();
@@ -659,9 +827,13 @@ impl App {
             && (row as usize) < layout.content_top as usize + layout.content_height
         {
             let screen_row = (row - layout.content_top) as usize;
-            if screen_row == 0 { return; }
+            if screen_row == 0 {
+                return;
+            }
             let index = self.project.scroll + screen_row - 1;
-            let Some(entry) = self.project.entries.get(index) else { return; };
+            let Some(entry) = self.project.entries.get(index) else {
+                return;
+            };
             let is_dir = entry.is_dir;
             self.project.selected = index;
             self.explorer_focused = true;
@@ -670,7 +842,11 @@ impl App {
             if is_dir {
                 actions.extend([ContextAction::NewFile, ContextAction::NewFolder]);
             } else {
-                actions.extend([ContextAction::Duplicate, ContextAction::Stage, ContextAction::Unstage]);
+                actions.extend([
+                    ContextAction::Duplicate,
+                    ContextAction::Stage,
+                    ContextAction::Unstage,
+                ]);
             }
             actions.push(ContextAction::Rename);
         } else {
@@ -679,18 +855,32 @@ impl App {
                 || (row as usize) >= layout.content_top as usize + layout.content_height
                 || (column as usize) < layout.editor_x
                 || (column as usize) >= editor_end
-            { return; }
+            {
+                return;
+            }
             self.explorer_focused = false;
             return_mode = self.preferred_editor_mode();
             if self.editor.selected_text().is_some() {
                 actions.extend([ContextAction::Copy, ContextAction::Cut]);
             }
-            actions.extend([ContextAction::Paste, ContextAction::SelectAll, ContextAction::ToggleComment, ContextAction::Format]);
+            actions.extend([
+                ContextAction::Paste,
+                ContextAction::SelectAll,
+                ContextAction::ToggleComment,
+                ContextAction::Format,
+            ]);
         }
 
-        if actions.is_empty() { return; }
+        if actions.is_empty() {
+            return;
+        }
         self.context_menu_previous_mode = return_mode;
-        self.context_menu = Some(ContextMenu { x: column.saturating_add(1), y: row, selected: 0, actions });
+        self.context_menu = Some(ContextMenu {
+            x: column.saturating_add(1),
+            y: row,
+            selected: 0,
+            actions,
+        });
         self.mode = Mode::ContextMenu;
         self.message = "Context menu · ↑↓ select · Enter apply · Esc close".to_string();
     }
@@ -702,7 +892,12 @@ impl App {
     }
 
     fn execute_context_action(&mut self) {
-        let Some(action) = self.context_menu.as_ref().and_then(|menu| menu.actions.get(menu.selected)).copied() else {
+        let Some(action) = self
+            .context_menu
+            .as_ref()
+            .and_then(|menu| menu.actions.get(menu.selected))
+            .copied()
+        else {
             self.close_context_menu();
             return;
         };
@@ -712,17 +907,43 @@ impl App {
         match action {
             ContextAction::Open => self.activate_project_entry(),
             ContextAction::Rename => self.begin_rename_selected(),
-            ContextAction::Duplicate => self.begin_context_command("copy ", "Enter the duplicate file name"),
-            ContextAction::NewFile => self.begin_context_command("newfile ", "Enter the new file path"),
-            ContextAction::NewFolder => self.begin_context_command("newdir ", "Enter the new folder path"),
+            ContextAction::Duplicate => {
+                self.begin_context_command("copy ", "Enter the duplicate file name")
+            }
+            ContextAction::NewFile => {
+                self.begin_context_command("newfile ", "Enter the new file path")
+            }
+            ContextAction::NewFolder => {
+                self.begin_context_command("newdir ", "Enter the new folder path")
+            }
             ContextAction::Stage => self.git_selected(true),
             ContextAction::Unstage => self.git_selected(false),
             ContextAction::SaveTab => self.save(),
             ContextAction::CloseTab => self.close_active_tab(false),
-            ContextAction::Copy => { self.handle_global_shortcut(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)); }
-            ContextAction::Cut => { self.handle_global_shortcut(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)); }
-            ContextAction::Paste => { self.handle_global_shortcut(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)); }
-            ContextAction::SelectAll => { self.handle_global_shortcut(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)); }
+            ContextAction::Copy => {
+                self.handle_global_shortcut(KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                ));
+            }
+            ContextAction::Cut => {
+                self.handle_global_shortcut(KeyEvent::new(
+                    KeyCode::Char('x'),
+                    KeyModifiers::CONTROL,
+                ));
+            }
+            ContextAction::Paste => {
+                self.handle_global_shortcut(KeyEvent::new(
+                    KeyCode::Char('v'),
+                    KeyModifiers::CONTROL,
+                ));
+            }
+            ContextAction::SelectAll => {
+                self.handle_global_shortcut(KeyEvent::new(
+                    KeyCode::Char('a'),
+                    KeyModifiers::CONTROL,
+                ));
+            }
             ContextAction::ToggleComment => self.toggle_comments(),
             ContextAction::Format => self.request_formatting(),
         }
@@ -744,7 +965,10 @@ impl App {
 
         if layout.terminal_height > 0
             && row >= layout.terminal_top.saturating_sub(1)
-            && row < layout.terminal_top.saturating_add(layout.terminal_height as u16)
+            && row
+                < layout
+                    .terminal_top
+                    .saturating_add(layout.terminal_height as u16)
         {
             self.terminal_focused = true;
             self.explorer_focused = false;
@@ -778,10 +1002,7 @@ impl App {
             return;
         }
 
-        if row == 0
-            && column >= width.saturating_sub(30)
-            && column < width.saturating_sub(20)
-        {
+        if row == 0 && column >= width.saturating_sub(30) && column < width.saturating_sub(20) {
             self.explorer_focused = false;
             self.open_theme_gallery();
             return;
@@ -838,9 +1059,12 @@ impl App {
             if entry_index < self.project.entries.len() {
                 self.project.selected = entry_index;
                 let path = self.project.entries[entry_index].path.clone();
-                let double_click = self.last_project_click.as_ref().is_some_and(|(time, previous)| {
-                    previous == &path && time.elapsed() <= Duration::from_millis(500)
-                });
+                let double_click =
+                    self.last_project_click
+                        .as_ref()
+                        .is_some_and(|(time, previous)| {
+                            previous == &path && time.elapsed() <= Duration::from_millis(500)
+                        });
                 self.last_project_click = Some((Instant::now(), path));
                 if double_click {
                     self.begin_rename_selected();
@@ -865,7 +1089,7 @@ impl App {
             views.secondary_active = if views.vertical {
                 column > layout.editor_x + layout.editor_width.saturating_sub(1) / 2
             } else {
-                row >= layout.content_top + layout.content_height.saturating_sub(1) as u16 / 2 + 1
+                row > layout.content_top + layout.content_height.saturating_sub(1) as u16 / 2
             };
             self.split_views = Some(views);
             self.activate_focused_view();
@@ -1009,22 +1233,60 @@ impl App {
         match self.lsp_status {
             LspStatus::Off => None,
             LspStatus::Starting => {
-                let slow = self.lsp_started_at.is_some_and(|started| started.elapsed() > Duration::from_secs(30));
+                let slow = self
+                    .lsp_started_at
+                    .is_some_and(|started| started.elapsed() > Duration::from_secs(30));
                 Some((
-                    if slow { "LSP starting slowly".to_string() } else if self.reduced_motion() { "LSP starting".to_string() } else { format!("{} LSP starting", SPINNER[self.background_tick % SPINNER.len()]) },
-                    if slow { BackgroundState::Warning } else { BackgroundState::Working },
+                    if slow {
+                        "LSP starting slowly".to_string()
+                    } else if self.reduced_motion() {
+                        "LSP starting".to_string()
+                    } else {
+                        format!(
+                            "{} LSP starting",
+                            SPINNER[self.background_tick % SPINNER.len()]
+                        )
+                    },
+                    if slow {
+                        BackgroundState::Warning
+                    } else {
+                        BackgroundState::Working
+                    },
                 ))
             }
             LspStatus::Loading => {
-                let slow = self.lsp_started_at.is_some_and(|started| started.elapsed() > Duration::from_secs(30));
+                let slow = self
+                    .lsp_started_at
+                    .is_some_and(|started| started.elapsed() > Duration::from_secs(30));
                 Some((
-                    if slow { "LSP workspace still loading".to_string() } else if self.reduced_motion() { "LSP loading".to_string() } else { format!("{} LSP loading", SPINNER[self.background_tick % SPINNER.len()]) },
-                    if slow { BackgroundState::Warning } else { BackgroundState::Working },
+                    if slow {
+                        "LSP workspace still loading".to_string()
+                    } else if self.reduced_motion() {
+                        "LSP loading".to_string()
+                    } else {
+                        format!(
+                            "{} LSP loading",
+                            SPINNER[self.background_tick % SPINNER.len()]
+                        )
+                    },
+                    if slow {
+                        BackgroundState::Warning
+                    } else {
+                        BackgroundState::Working
+                    },
                 ))
             }
             LspStatus::Ready => Some((
-                if self.diagnostic_count == 0 { "LSP ready".to_string() } else { format!("LSP ready · {} issues", self.diagnostic_count) },
-                if self.diagnostic_count == 0 { BackgroundState::Ready } else { BackgroundState::Warning },
+                if self.diagnostic_count == 0 {
+                    "LSP ready".to_string()
+                } else {
+                    format!("LSP ready · {} issues", self.diagnostic_count)
+                },
+                if self.diagnostic_count == 0 {
+                    BackgroundState::Ready
+                } else {
+                    BackgroundState::Warning
+                },
             )),
             LspStatus::Error => Some(("LSP error".to_string(), BackgroundState::Error)),
         }
@@ -1035,13 +1297,21 @@ impl App {
     }
 
     fn open_help(&mut self) {
-        if self.mode != Mode::Help { self.help_return_mode = self.mode; }
+        if self.mode != Mode::Help {
+            self.help_return_mode = self.mode;
+        }
         self.mode = Mode::Help;
     }
 
     fn activate_focused_view(&mut self) {
-        let Some(views) = self.split_views else { return; };
-        let view = if views.secondary_active { views.secondary } else { views.primary };
+        let Some(views) = self.split_views else {
+            return;
+        };
+        let view = if views.secondary_active {
+            views.secondary
+        } else {
+            views.primary
+        };
         self.editor.select(view.tab_index);
         self.editor.cursor = view.cursor;
         self.editor.scroll_line = view.scroll_line;
@@ -1049,9 +1319,20 @@ impl App {
     }
 
     fn sync_focused_view(&mut self) {
-        let Some(mut views) = self.split_views else { return; };
-        let view = EditorView { tab_index: self.editor.active_index(), cursor: self.editor.cursor, scroll_line: self.editor.scroll_line, scroll_column: self.editor.scroll_column };
-        if views.secondary_active { views.secondary = view; } else { views.primary = view; }
+        let Some(mut views) = self.split_views else {
+            return;
+        };
+        let view = EditorView {
+            tab_index: self.editor.active_index(),
+            cursor: self.editor.cursor,
+            scroll_line: self.editor.scroll_line,
+            scroll_column: self.editor.scroll_column,
+        };
+        if views.secondary_active {
+            views.secondary = view;
+        } else {
+            views.primary = view;
+        }
         self.split_views = Some(views);
     }
 
@@ -1059,21 +1340,65 @@ impl App {
         if let Some(mut views) = self.split_views {
             views.vertical = vertical;
             self.split_views = Some(views);
-            self.message = if vertical { "Vertical split" } else { "Horizontal split" }.to_string();
+            self.message = if vertical {
+                "Vertical split"
+            } else {
+                "Horizontal split"
+            }
+            .to_string();
         } else {
-            let view = EditorView { tab_index: self.editor.active_index(), cursor: self.editor.cursor, scroll_line: self.editor.scroll_line, scroll_column: self.editor.scroll_column };
-            self.split_views = Some(SplitViews { primary: view, secondary: view, secondary_active: false, vertical });
-            self.message = if vertical { "Vertical split opened · Ctrl-\\ switches panes" } else { "Horizontal split opened · Ctrl-\\ switches panes" }.to_string();
+            let view = EditorView {
+                tab_index: self.editor.active_index(),
+                cursor: self.editor.cursor,
+                scroll_line: self.editor.scroll_line,
+                scroll_column: self.editor.scroll_column,
+            };
+            self.split_views = Some(SplitViews {
+                primary: view,
+                secondary: view,
+                secondary_active: false,
+                vertical,
+            });
+            self.message = if vertical {
+                "Vertical split opened · Ctrl-\\ switches panes"
+            } else {
+                "Horizontal split opened · Ctrl-\\ switches panes"
+            }
+            .to_string();
         }
     }
 
-    pub fn terminal_visible(&self) -> bool { self.terminal.is_some() }
-    pub fn terminal_shell_name(&self) -> &str { self.terminal.as_ref().map_or("Terminal", |terminal| terminal.shell_name.as_str()) }
-    pub fn terminal_cwd(&self) -> Option<&Path> { self.terminal.as_ref().map(|terminal| terminal.cwd.as_path()) }
-    pub fn terminal_lines(&self, rows: usize) -> Vec<String> { self.terminal.as_ref().map_or_else(Vec::new, |terminal| terminal.visible_lines(rows)) }
-    pub fn terminal_input(&self) -> &str { self.terminal.as_ref().map_or("", TerminalPane::input) }
-    pub fn terminal_cursor_column(&self) -> usize { self.terminal.as_ref().map_or(2, TerminalPane::cursor_column) }
-    pub fn terminal_exited(&self) -> bool { self.terminal.as_ref().is_some_and(TerminalPane::is_exited) }
+    pub fn terminal_visible(&self) -> bool {
+        self.terminal.is_some()
+    }
+    pub fn terminal_shell_name(&self) -> &str {
+        self.terminal
+            .as_ref()
+            .map_or("Terminal", |terminal| terminal.shell_name.as_str())
+    }
+    pub fn terminal_cwd(&self) -> Option<&Path> {
+        self.terminal
+            .as_ref()
+            .map(|terminal| terminal.cwd.as_path())
+    }
+    pub fn terminal_lines(&self, rows: usize) -> Vec<String> {
+        self.terminal
+            .as_ref()
+            .map_or_else(Vec::new, |terminal| terminal.visible_lines(rows))
+    }
+    pub fn resize_terminal(&mut self, rows: usize, columns: usize) {
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.resize(rows, columns);
+        }
+    }
+    pub fn terminal_cursor_position(&self) -> (usize, usize) {
+        self.terminal
+            .as_ref()
+            .map_or((0, 0), TerminalPane::cursor_position)
+    }
+    pub fn terminal_exited(&self) -> bool {
+        self.terminal.as_ref().is_some_and(TerminalPane::is_exited)
+    }
 
     fn open_terminal(&mut self) {
         if self.terminal.is_none() {
@@ -1085,7 +1410,9 @@ impl App {
                 }
             }
         }
-        if self.mode == Mode::Dashboard { self.mode = self.preferred_editor_mode(); }
+        if self.mode == Mode::Dashboard {
+            self.mode = self.preferred_editor_mode();
+        }
         self.explorer_focused = false;
         self.terminal_focused = true;
         self.message = "Terminal focused · Ctrl-` returns to editor".to_string();
@@ -1096,7 +1423,12 @@ impl App {
             self.open_terminal();
         } else {
             self.terminal_focused = !self.terminal_focused;
-            self.message = if self.terminal_focused { "Terminal focused · Ctrl-` returns to editor" } else { "Editor focused · Ctrl-` returns to terminal" }.to_string();
+            self.message = if self.terminal_focused {
+                "Terminal focused · Ctrl-` returns to editor"
+            } else {
+                "Editor focused · Ctrl-` returns to terminal"
+            }
+            .to_string();
         }
     }
 
@@ -1115,6 +1447,10 @@ impl App {
         }
         if self.mode == Mode::ReloadConfirm {
             self.handle_reload_confirmation(key);
+            return;
+        }
+        if self.lsp_panel.is_some() {
+            self.handle_lsp_panel_key(key);
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1138,8 +1474,22 @@ impl App {
             }
             return;
         }
+        if key.code == KeyCode::F(2)
+            && !self.explorer_focused
+            && matches!(self.mode, Mode::Normal | Mode::Insert)
+        {
+            self.command_input = "symbolrename ".to_string();
+            self.command_cursor = self.command_input.len();
+            self.command_selection = None;
+            self.command_anchor = None;
+            self.mode = Mode::Command;
+            self.message = "Rename symbol to…".to_string();
+            return;
+        }
         if self.mode == Mode::Dashboard {
-            if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            if key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
                 && matches!(key.code, KeyCode::Char('p' | 'P'))
                 && self.handle_global_shortcut(key)
             {
@@ -1172,10 +1522,23 @@ impl App {
         if self.mode == Mode::GitDiff {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.mode = self.preferred_editor_mode(),
-                KeyCode::Up | KeyCode::Char('k') => self.git_diff_scroll = self.git_diff_scroll.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => self.git_diff_scroll = (self.git_diff_scroll + 1).min(self.git_diff_lines.len().saturating_sub(1)),
-                KeyCode::PageUp => self.git_diff_scroll = self.git_diff_scroll.saturating_sub(self.viewport_rows.saturating_sub(2)),
-                KeyCode::PageDown => self.git_diff_scroll = (self.git_diff_scroll + self.viewport_rows.saturating_sub(2)).min(self.git_diff_lines.len().saturating_sub(1)),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.git_diff_scroll = self.git_diff_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.git_diff_scroll =
+                        (self.git_diff_scroll + 1).min(self.git_diff_lines.len().saturating_sub(1))
+                }
+                KeyCode::PageUp => {
+                    self.git_diff_scroll = self
+                        .git_diff_scroll
+                        .saturating_sub(self.viewport_rows.saturating_sub(2))
+                }
+                KeyCode::PageDown => {
+                    self.git_diff_scroll = (self.git_diff_scroll
+                        + self.viewport_rows.saturating_sub(2))
+                    .min(self.git_diff_lines.len().saturating_sub(1))
+                }
                 _ => {}
             }
             return;
@@ -1183,8 +1546,13 @@ impl App {
         if self.mode == Mode::GitHistory {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.mode = self.preferred_editor_mode(),
-                KeyCode::Up | KeyCode::Char('k') => self.git_history_selected = self.git_history_selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => self.git_history_selected = (self.git_history_selected + 1).min(self.git_history.len().saturating_sub(1)),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.git_history_selected = self.git_history_selected.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.git_history_selected = (self.git_history_selected + 1)
+                        .min(self.git_history.len().saturating_sub(1))
+                }
                 KeyCode::Enter => self.show_selected_history_diff(),
                 _ => {}
             }
@@ -1192,10 +1560,30 @@ impl App {
         }
         if self.mode == Mode::ThemeGallery {
             match key.code {
-                KeyCode::Esc => { self.theme_kind = self.theme_gallery_original; self.theme = Theme::for_kind(self.theme_kind); self.mode = self.theme_gallery_return_mode; self.message = "Theme preview cancelled".to_string(); }
-                KeyCode::Up | KeyCode::Char('k') => { self.theme_gallery_selected = self.theme_gallery_selected.saturating_sub(1); self.preview_gallery_theme(); }
-                KeyCode::Down | KeyCode::Char('j') => { self.theme_gallery_selected = (self.theme_gallery_selected + 1).min(ThemeKind::ALL.len() - 1); self.preview_gallery_theme(); }
-                KeyCode::Enter => { self.settings.theme = self.theme_kind; self.persist_settings(); self.mode = self.theme_gallery_return_mode; self.message = format!("Theme: {}", self.theme_kind.name()); }
+                KeyCode::Esc => {
+                    self.theme_kind = self.theme_gallery_original;
+                    self.theme = self.theme_gallery_original_theme;
+                    self.active_custom_theme = self.theme_gallery_original_custom.clone();
+                    self.mode = self.theme_gallery_return_mode;
+                    self.message = "Theme preview cancelled".to_string();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.theme_gallery_selected = self.theme_gallery_selected.saturating_sub(1);
+                    self.preview_gallery_theme();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.theme_gallery_selected =
+                        (self.theme_gallery_selected + 1).min(ThemeKind::ALL.len() - 1);
+                    self.preview_gallery_theme();
+                }
+                KeyCode::Enter => {
+                    self.settings.theme = self.theme_kind;
+                    self.settings.custom_theme = None;
+                    self.active_custom_theme = None;
+                    self.persist_settings();
+                    self.mode = self.theme_gallery_return_mode;
+                    self.message = format!("Theme: {}", self.theme_kind.name());
+                }
                 _ => {}
             }
             return;
@@ -1228,7 +1616,8 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if let Some(menu) = self.context_menu.as_mut() {
-                        menu.selected = (menu.selected + 1).min(menu.actions.len().saturating_sub(1));
+                        menu.selected =
+                            (menu.selected + 1).min(menu.actions.len().saturating_sub(1));
                     }
                 }
                 KeyCode::Enter => self.execute_context_action(),
@@ -1279,7 +1668,14 @@ impl App {
                 }
                 _ => {}
             },
-            Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery | Mode::ContextMenu | Mode::Dashboard => {}
+            Mode::QuitConfirm
+            | Mode::ReloadConfirm
+            | Mode::GitDiff
+            | Mode::GitHistory
+            | Mode::ThemeGallery
+            | Mode::KeymapGallery
+            | Mode::ContextMenu
+            | Mode::Dashboard => {}
         }
     }
 
@@ -1375,7 +1771,11 @@ impl App {
     fn handle_reload_confirmation(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('r') | KeyCode::Char('R') => match self.editor.reload_from_disk() {
-                Ok(()) => { self.pending_save_after_disk_change = false; self.mode = self.preferred_editor_mode(); self.message = "Reloaded changed file".to_string(); }
+                Ok(()) => {
+                    self.pending_save_after_disk_change = false;
+                    self.mode = self.preferred_editor_mode();
+                    self.message = "Reloaded changed file".to_string();
+                }
                 Err(error) => self.message = format!("Reload failed: {error}"),
             },
             KeyCode::Char('k') | KeyCode::Char('K') => {
@@ -1387,10 +1787,17 @@ impl App {
                 } else {
                     self.editor.keep_disk_change();
                     self.mode = self.preferred_editor_mode();
-                    self.message = "Kept current buffer; save will ask before overwriting disk changes".to_string();
+                    self.message =
+                        "Kept current buffer; save will ask before overwriting disk changes"
+                            .to_string();
                 }
             }
-            KeyCode::Esc => { self.pending_save_after_disk_change = false; self.editor.acknowledge_disk_change(); self.mode = self.preferred_editor_mode(); self.message = "Reload deferred".to_string(); }
+            KeyCode::Esc => {
+                self.pending_save_after_disk_change = false;
+                self.editor.acknowledge_disk_change();
+                self.mode = self.preferred_editor_mode();
+                self.message = "Reload deferred".to_string();
+            }
             _ => {}
         }
     }
@@ -1398,6 +1805,14 @@ impl App {
     fn handle_global_shortcut(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char(' ') | KeyCode::Null => {
+                    self.request_lsp_position("textDocument/completion");
+                    return true;
+                }
+                KeyCode::Char('.') => {
+                    self.request_lsp_position("textDocument/codeAction");
+                    return true;
+                }
                 KeyCode::Char('p' | 'P') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     self.command_input.clear();
                     self.command_cursor = 0;
@@ -1415,15 +1830,30 @@ impl App {
                     return true;
                 }
                 KeyCode::Char('z') => {
-                    self.message = if self.editor.undo() { "Undone" } else { "Nothing to undo" }.to_string();
+                    self.message = if self.editor.undo() {
+                        "Undone"
+                    } else {
+                        "Nothing to undo"
+                    }
+                    .to_string();
                     return true;
                 }
                 KeyCode::Char('y') => {
-                    self.message = if self.editor.redo() { "Redone" } else { "Nothing to redo" }.to_string();
+                    self.message = if self.editor.redo() {
+                        "Redone"
+                    } else {
+                        "Nothing to redo"
+                    }
+                    .to_string();
                     return true;
                 }
                 KeyCode::Char('\\') => {
-                    if let Some(mut views) = self.split_views { self.sync_focused_view(); views.secondary_active = !views.secondary_active; self.split_views = Some(views); self.activate_focused_view(); }
+                    if let Some(mut views) = self.split_views {
+                        self.sync_focused_view();
+                        views.secondary_active = !views.secondary_active;
+                        self.split_views = Some(views);
+                        self.activate_focused_view();
+                    }
                     return true;
                 }
                 KeyCode::Char('a') => {
@@ -1508,7 +1938,8 @@ impl App {
                     self.message = match self.sidebar_view {
                         SidebarView::Outline => "SYMBOLS · Enter jumps · Ctrl-E returns to editor",
                         SidebarView::Files => "FILES · Enter opens · Ctrl-E returns to editor",
-                    }.to_string();
+                    }
+                    .to_string();
                     return true;
                 }
                 KeyCode::Char('/') => {
@@ -1562,6 +1993,15 @@ impl App {
             }
         }
 
+        if key.code == KeyCode::F(12) {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.request_lsp_position("textDocument/references");
+            } else {
+                self.request_lsp_position("textDocument/definition");
+            }
+            return true;
+        }
+
         false
     }
 
@@ -1579,6 +2019,19 @@ impl App {
     }
 
     fn toggle_comments(&mut self) {
+        if let Some(language) = self.plugins.language_for_path(self.editor.path.as_deref()) {
+            let Some(prefix) = language.line_comment.as_deref() else {
+                self.message = format!("{} has no configured line-comment syntax", language.name);
+                return;
+            };
+            self.editor.checkpoint();
+            self.message = match self.editor.toggle_line_comments(prefix, None) {
+                Some(true) => "Commented line(s)".to_string(),
+                Some(false) => "Uncommented line(s)".to_string(),
+                None => "No nonblank lines to comment".to_string(),
+            };
+            return;
+        }
         let language = Language::from_path(self.editor.path.as_deref());
         let Some((prefix, suffix)) = language.comment_delimiters() else {
             self.message = format!("{} has no configured line-comment syntax", language.name());
@@ -1591,6 +2044,26 @@ impl App {
             Some(false) => "Uncommented line(s)".to_string(),
             None => "No nonblank lines to comment".to_string(),
         };
+    }
+
+    pub fn language_name(&self) -> String {
+        self.plugins
+            .language_for_path(self.editor.path.as_deref())
+            .map(|language| language.name.clone())
+            .unwrap_or_else(|| {
+                Language::from_path(self.editor.path.as_deref())
+                    .name()
+                    .to_string()
+            })
+    }
+
+    fn lsp_cursor_character(&self) -> usize {
+        self.editor
+            .line_text(self.editor.cursor.line)
+            .chars()
+            .take(self.editor.cursor.column)
+            .map(char::len_utf16)
+            .sum()
     }
 
     fn available_fold_ranges(&self) -> Vec<(usize, usize)> {
@@ -1618,12 +2091,19 @@ impl App {
         self.message = if symbols.is_empty() {
             "No symbols in this file".to_string()
         } else {
-            symbols.into_iter().take(8).map(|symbol| format!("{}:{}", symbol.name, symbol.start_line + 1)).collect::<Vec<_>>().join("  ·  ")
+            symbols
+                .into_iter()
+                .take(8)
+                .map(|symbol| format!("{}:{}", symbol.name, symbol.start_line + 1))
+                .collect::<Vec<_>>()
+                .join("  ·  ")
         };
     }
 
     fn selected_project_path(&self) -> Option<PathBuf> {
-        self.project.selected_entry().map(|entry| entry.path.clone())
+        self.project
+            .selected_entry()
+            .map(|entry| entry.path.clone())
     }
 
     fn project_target_path(&self, value: &str) -> Option<PathBuf> {
@@ -1632,37 +2112,78 @@ impl App {
     }
 
     fn create_project_file(&mut self, value: &str) {
-        let Some(path) = self.project_target_path(value) else { self.message = "Path must be inside the project".to_string(); return; };
-        if path.exists() { self.message = "File already exists".to_string(); return; }
-        match path.parent().map(fs::create_dir_all).transpose().and_then(|_| fs::File::create(&path).map(|_| ())) {
-            Ok(()) => { let _ = self.project.refresh(); self.message = format!("Created {}", path.display()); }
+        let Some(path) = self.project_target_path(value) else {
+            self.message = "Path must be inside the project".to_string();
+            return;
+        };
+        if path.exists() {
+            self.message = "File already exists".to_string();
+            return;
+        }
+        match path
+            .parent()
+            .map(fs::create_dir_all)
+            .transpose()
+            .and_then(|_| fs::File::create(&path).map(|_| ()))
+        {
+            Ok(()) => {
+                let _ = self.project.refresh();
+                self.message = format!("Created {}", path.display());
+            }
             Err(error) => self.message = format!("Create failed: {error}"),
         }
     }
 
     fn create_project_directory(&mut self, value: &str) {
-        let Some(path) = self.project_target_path(value) else { self.message = "Path must be inside the project".to_string(); return; };
+        let Some(path) = self.project_target_path(value) else {
+            self.message = "Path must be inside the project".to_string();
+            return;
+        };
         match fs::create_dir(&path) {
-            Ok(()) => { let _ = self.project.refresh(); self.message = format!("Created {}", path.display()); }
+            Ok(()) => {
+                let _ = self.project.refresh();
+                self.message = format!("Created {}", path.display());
+            }
             Err(error) => self.message = format!("Create failed: {error}"),
         }
     }
 
     fn rename_selected_project_entry(&mut self, value: &str) {
-        let Some(source) = self.selected_project_path() else { self.message = "Select a file or folder first".to_string(); return; };
-        let Some(destination) = source.parent().and_then(|parent| (!value.is_empty()).then(|| parent.join(value))) else { self.message = "Usage: :rename new-name".to_string(); return; };
+        let Some(source) = self.selected_project_path() else {
+            self.message = "Select a file or folder first".to_string();
+            return;
+        };
+        let Some(destination) = source
+            .parent()
+            .and_then(|parent| (!value.is_empty()).then(|| parent.join(value)))
+        else {
+            self.message = "Usage: :rename new-name".to_string();
+            return;
+        };
         match fs::rename(&source, &destination) {
-            Ok(()) => { let _ = self.project.refresh(); self.message = format!("Renamed to {}", destination.display()); }
+            Ok(()) => {
+                let _ = self.project.refresh();
+                self.message = format!("Renamed to {}", destination.display());
+            }
             Err(error) => self.message = format!("Rename failed: {error}"),
         }
     }
 
     fn begin_rename_selected(&mut self) {
-        let Some(path) = self.selected_project_path() else { self.message = "Select a file or folder first".to_string(); return; };
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let Some(path) = self.selected_project_path() else {
+            self.message = "Select a file or folder first".to_string();
+            return;
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
         let prefix = "rename ";
         self.command_input = format!("{prefix}{name}");
-        let stem_end = name.rfind('.').filter(|index| *index > 0).unwrap_or(name.len());
+        let stem_end = name
+            .rfind('.')
+            .filter(|index| *index > 0)
+            .unwrap_or(name.len());
         self.command_cursor = prefix.len() + stem_end;
         self.command_selection = None;
         self.command_anchor = None;
@@ -1674,47 +2195,117 @@ impl App {
 
     fn replace_command_selection(&mut self) {
         if let Some((start, end)) = self.command_selection.take() {
-            if start <= end && end <= self.command_input.len() { self.command_input.replace_range(start..end, ""); self.command_cursor = start; }
+            if start <= end && end <= self.command_input.len() {
+                self.command_input.replace_range(start..end, "");
+                self.command_cursor = start;
+            }
         }
         self.command_anchor = None;
     }
 
     fn duplicate_selected_project_file(&mut self, value: &str) {
-        let Some(source) = self.selected_project_path() else { self.message = "Select a file first".to_string(); return; };
-        if source.is_dir() { self.message = "Duplicate currently supports files only".to_string(); return; }
-        let destination = if value.is_empty() { source.with_file_name(format!("{} copy", source.file_stem().and_then(|name| name.to_str()).unwrap_or("file"))).with_extension(source.extension().unwrap_or_default()) } else { source.parent().unwrap_or(&self.project.root).join(value) };
+        let Some(source) = self.selected_project_path() else {
+            self.message = "Select a file first".to_string();
+            return;
+        };
+        if source.is_dir() {
+            self.message = "Duplicate currently supports files only".to_string();
+            return;
+        }
+        let destination = if value.is_empty() {
+            source
+                .with_file_name(format!(
+                    "{} copy",
+                    source
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("file")
+                ))
+                .with_extension(source.extension().unwrap_or_default())
+        } else {
+            source.parent().unwrap_or(&self.project.root).join(value)
+        };
         match fs::copy(&source, &destination) {
-            Ok(_) => { let _ = self.project.refresh(); self.message = format!("Duplicated to {}", destination.display()); }
+            Ok(_) => {
+                let _ = self.project.refresh();
+                self.message = format!("Duplicated to {}", destination.display());
+            }
             Err(error) => self.message = format!("Duplicate failed: {error}"),
         }
     }
 
     fn move_selected_project_entry(&mut self, value: &str) {
-        let Some(source) = self.selected_project_path() else { self.message = "Select a file or folder first".to_string(); return; };
-        let Some(destination) = self.project_target_path(value) else { self.message = "Path must be inside the project".to_string(); return; };
+        let Some(source) = self.selected_project_path() else {
+            self.message = "Select a file or folder first".to_string();
+            return;
+        };
+        let Some(destination) = self.project_target_path(value) else {
+            self.message = "Path must be inside the project".to_string();
+            return;
+        };
         match fs::rename(&source, &destination) {
-            Ok(()) => { let _ = self.project.refresh(); self.message = format!("Moved to {}", destination.display()); }
+            Ok(()) => {
+                let _ = self.project.refresh();
+                self.message = format!("Moved to {}", destination.display());
+            }
             Err(error) => self.message = format!("Move failed: {error}"),
         }
     }
 
     fn delete_selected_project_entry(&mut self, force: bool) {
-        if !force { self.message = "Deletion is permanent; use :delete!".to_string(); return; }
-        let Some(path) = self.selected_project_path() else { self.message = "Select a file or folder first".to_string(); return; };
-        let result = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
-        match result { Ok(()) => { let _ = self.project.refresh(); self.message = format!("Deleted {}", path.display()); }, Err(error) => self.message = format!("Delete failed: {error}"), }
+        if !force {
+            self.message = "Deletion is permanent; use :delete!".to_string();
+            return;
+        }
+        let Some(path) = self.selected_project_path() else {
+            self.message = "Select a file or folder first".to_string();
+            return;
+        };
+        let result = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => {
+                let _ = self.project.refresh();
+                self.message = format!("Deleted {}", path.display());
+            }
+            Err(error) => self.message = format!("Delete failed: {error}"),
+        }
     }
 
     fn git_selected(&mut self, stage: bool) {
-        let Some(path) = self.selected_project_path() else { self.message = "Select a file first".to_string(); return; };
+        let Some(path) = self.selected_project_path() else {
+            self.message = "Select a file first".to_string();
+            return;
+        };
         let relative = path.strip_prefix(&self.project.root).unwrap_or(&path);
         let relative = relative.to_string_lossy().to_string();
         let mut command = Command::new("git");
         command.arg("-C").arg(&self.project.root);
-        if stage { command.args(["add", "--", &relative]); } else { command.args(["restore", "--staged", "--", &relative]); }
+        if stage {
+            command.args(["add", "--", &relative]);
+        } else {
+            command.args(["restore", "--staged", "--", &relative]);
+        }
         match command.output() {
-            Ok(output) if output.status.success() => { self.project.refresh_git_status(); self.refresh_git_line_changes(); self.message = if stage { "Staged selected file" } else { "Unstaged selected file" }.to_string(); }
-            Ok(output) => self.message = format!("Git failed: {}", String::from_utf8_lossy(&output.stderr).trim()),
+            Ok(output) if output.status.success() => {
+                self.project.refresh_git_status();
+                self.refresh_git_line_changes();
+                self.message = if stage {
+                    "Staged selected file"
+                } else {
+                    "Unstaged selected file"
+                }
+                .to_string();
+            }
+            Ok(output) => {
+                self.message = format!(
+                    "Git failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+            }
             Err(error) => self.message = format!("Git failed: {error}"),
         }
     }
@@ -1725,12 +2316,17 @@ impl App {
 
     fn refresh_git_line_changes(&mut self) {
         self.git_line_changes.clear();
-        let Some(path) = self.editor.path.as_ref() else { return; };
-        let Ok(relative) = path.strip_prefix(&self.project.root) else { return; };
+        let Some(path) = self.editor.path.as_ref() else {
+            return;
+        };
+        let Ok(relative) = path.strip_prefix(&self.project.root) else {
+            return;
+        };
         let relative_text = relative.to_string_lossy().to_string();
 
         let tracked = Command::new("git")
-            .arg("-C").arg(&self.project.root)
+            .arg("-C")
+            .arg(&self.project.root)
             .args(["ls-files", "--error-unmatch", "--", &relative_text])
             .output()
             .is_ok_and(|output| output.status.success());
@@ -1744,11 +2340,16 @@ impl App {
         }
 
         let Ok(output) = Command::new("git")
-            .arg("-C").arg(&self.project.root)
+            .arg("-C")
+            .arg(&self.project.root)
             .args(["diff", "HEAD", "--unified=0", "--", &relative_text])
             .output()
-        else { return; };
-        if !output.status.success() { return; }
+        else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
         self.git_line_changes = parse_git_hunks(
             &String::from_utf8_lossy(&output.stdout),
             self.editor.line_count(),
@@ -1756,39 +2357,97 @@ impl App {
     }
 
     fn show_git_diff(&mut self) {
-        let path = self.selected_project_path().or_else(|| self.editor.path.clone());
-        let Some(path) = path else { self.message = "Select or open a file first".to_string(); return; };
-        let relative = path.strip_prefix(&self.project.root).unwrap_or(&path).to_string_lossy().to_string();
+        let path = self
+            .selected_project_path()
+            .or_else(|| self.editor.path.clone());
+        let Some(path) = path else {
+            self.message = "Select or open a file first".to_string();
+            return;
+        };
+        let relative = path
+            .strip_prefix(&self.project.root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
         let run = |staged| {
             let mut command = Command::new("git");
             command.arg("-C").arg(&self.project.root).arg("diff");
-            if staged { command.arg("--cached"); }
+            if staged {
+                command.arg("--cached");
+            }
             command.args(["--", &relative]).output()
         };
-        let output = run(false).ok().filter(|output| output.status.success()).or_else(|| run(true).ok());
-        let Some(output) = output else { self.message = "Git diff failed".to_string(); return; };
+        let output = run(false)
+            .ok()
+            .filter(|output| output.status.success())
+            .or_else(|| run(true).ok());
+        let Some(output) = output else {
+            self.message = "Git diff failed".to_string();
+            return;
+        };
         let text = String::from_utf8_lossy(&output.stdout);
-        self.git_diff_lines = if text.is_empty() { vec!["No unstaged or staged changes for this file.".to_string()] } else { text.lines().map(str::to_string).collect() };
+        self.git_diff_lines = if text.is_empty() {
+            vec!["No unstaged or staged changes for this file.".to_string()]
+        } else {
+            text.lines().map(str::to_string).collect()
+        };
         self.git_diff_scroll = 0;
         self.mode = Mode::GitDiff;
     }
 
     fn show_git_history(&mut self) {
-        let path = self.selected_project_path().or_else(|| self.editor.path.clone());
-        let Some(path) = path else { self.message = "Select or open a file first".to_string(); return; };
-        let relative = path.strip_prefix(&self.project.root).unwrap_or(&path).to_string_lossy().to_string();
-        let output = Command::new("git").arg("-C").arg(&self.project.root).args(["log", "--format=%h%x09%s", "-n", "30", "--", &relative]).output();
-        let Ok(output) = output else { self.message = "Git history failed".to_string(); return; };
-        self.git_history = String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| line.split_once('\t').map(|(hash, summary)| GitHistoryEntry { hash: hash.to_string(), summary: summary.to_string() })).collect();
+        let path = self
+            .selected_project_path()
+            .or_else(|| self.editor.path.clone());
+        let Some(path) = path else {
+            self.message = "Select or open a file first".to_string();
+            return;
+        };
+        let relative = path
+            .strip_prefix(&self.project.root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.project.root)
+            .args(["log", "--format=%h%x09%s", "-n", "30", "--", &relative])
+            .output();
+        let Ok(output) = output else {
+            self.message = "Git history failed".to_string();
+            return;
+        };
+        self.git_history = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                line.split_once('\t')
+                    .map(|(hash, summary)| GitHistoryEntry {
+                        hash: hash.to_string(),
+                        summary: summary.to_string(),
+                    })
+            })
+            .collect();
         self.git_history_selected = 0;
         self.mode = Mode::GitHistory;
     }
 
     fn show_selected_history_diff(&mut self) {
-        let Some(entry) = self.git_history.get(self.git_history_selected) else { return; };
-        let output = Command::new("git").arg("-C").arg(&self.project.root).args(["show", "--format=fuller", "--stat", &entry.hash]).output();
-        let Ok(output) = output else { self.message = "Git show failed".to_string(); return; };
-        self.git_diff_lines = String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect();
+        let Some(entry) = self.git_history.get(self.git_history_selected) else {
+            return;
+        };
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.project.root)
+            .args(["show", "--format=fuller", "--stat", &entry.hash])
+            .output();
+        let Ok(output) = output else {
+            self.message = "Git show failed".to_string();
+            return;
+        };
+        self.git_diff_lines = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
         self.git_diff_scroll = 0;
         self.mode = Mode::GitDiff;
     }
@@ -1983,6 +2642,7 @@ impl App {
             self.editor.active_title()
         );
         self.refresh_git_line_changes();
+        self.sync_lsp_active_file();
     }
 
     fn close_active_tab(&mut self, force: bool) {
@@ -2009,14 +2669,37 @@ impl App {
         if self.sidebar_view == SidebarView::Outline {
             let symbols = self.outline_symbols();
             match key.code {
-                KeyCode::Esc => { self.explorer_focused = false; self.mode = self.preferred_editor_mode(); }
-                KeyCode::Up | KeyCode::Char('k') => self.outline_selected = self.outline_selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => self.outline_selected = (self.outline_selected + 1).min(symbols.len().saturating_sub(1)),
-                KeyCode::PageUp => self.outline_selected = self.outline_selected.saturating_sub(self.viewport_rows.saturating_sub(2)),
-                KeyCode::PageDown => self.outline_selected = (self.outline_selected + self.viewport_rows.saturating_sub(2)).min(symbols.len().saturating_sub(1)),
+                KeyCode::Esc => {
+                    self.explorer_focused = false;
+                    self.mode = self.preferred_editor_mode();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.outline_selected = self.outline_selected.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.outline_selected =
+                        (self.outline_selected + 1).min(symbols.len().saturating_sub(1))
+                }
+                KeyCode::PageUp => {
+                    self.outline_selected = self
+                        .outline_selected
+                        .saturating_sub(self.viewport_rows.saturating_sub(2))
+                }
+                KeyCode::PageDown => {
+                    self.outline_selected = (self.outline_selected
+                        + self.viewport_rows.saturating_sub(2))
+                    .min(symbols.len().saturating_sub(1))
+                }
                 KeyCode::Home => self.outline_selected = 0,
                 KeyCode::End => self.outline_selected = symbols.len().saturating_sub(1),
-                KeyCode::Enter => if let Some(symbol) = symbols.get(self.outline_selected) { self.editor.goto_line(symbol.start_line); self.editor.move_line_start(); self.follow_cursor = true; self.message = format!("{} · line {}", symbol.name, symbol.start_line + 1); },
+                KeyCode::Enter => {
+                    if let Some(symbol) = symbols.get(self.outline_selected) {
+                        self.editor.goto_line(symbol.start_line);
+                        self.editor.move_line_start();
+                        self.follow_cursor = true;
+                        self.message = format!("{} · line {}", symbol.name, symbol.start_line + 1);
+                    }
+                }
                 _ => {}
             }
             return;
@@ -2091,7 +2774,11 @@ impl App {
                 Err(error) => self.message = format!("Refresh failed: {error}"),
             },
             KeyCode::F(2) => self.begin_rename_selected(),
-            KeyCode::Char('n') => { self.command_input = "newfile ".to_string(); self.command_suggestion = 0; self.mode = Mode::Command; }
+            KeyCode::Char('n') => {
+                self.command_input = "newfile ".to_string();
+                self.command_suggestion = 0;
+                self.mode = Mode::Command;
+            }
             KeyCode::Delete => self.delete_selected_project_entry(false),
             KeyCode::Char('s') => self.git_selected(true),
             KeyCode::Char('u') => self.git_selected(false),
@@ -2604,32 +3291,55 @@ impl App {
                 self.message = "Command cancelled".to_string();
             }
             KeyCode::Enter => {
-                let command = self.selected_command().unwrap_or_else(|| self.command_input.trim().to_string());
+                let command = self
+                    .selected_command()
+                    .unwrap_or_else(|| self.command_input.trim().to_string());
                 self.command_selection = None;
                 self.command_anchor = None;
                 self.mode = self.preferred_editor_mode();
                 self.execute_command(&command);
             }
             KeyCode::Backspace => {
-                if self.command_selection.is_some() { self.replace_command_selection(); } else if self.command_cursor > 0 {
+                if self.command_selection.is_some() {
+                    self.replace_command_selection();
+                } else if self.command_cursor > 0 {
                     let start = previous_char_boundary(&self.command_input, self.command_cursor);
-                    self.command_input.replace_range(start..self.command_cursor, "");
+                    self.command_input
+                        .replace_range(start..self.command_cursor, "");
                     self.command_cursor = start;
                 }
                 self.command_suggestion = 0;
             }
             KeyCode::Delete => {
-                if self.command_selection.is_some() { self.replace_command_selection(); } else if self.command_cursor < self.command_input.len() {
+                if self.command_selection.is_some() {
+                    self.replace_command_selection();
+                } else if self.command_cursor < self.command_input.len() {
                     let end = next_char_boundary(&self.command_input, self.command_cursor);
-                    self.command_input.replace_range(self.command_cursor..end, "");
+                    self.command_input
+                        .replace_range(self.command_cursor..end, "");
                 }
             }
-            KeyCode::Home => { self.command_cursor = 0; self.command_anchor = None; self.command_selection = None; }
-            KeyCode::End => { self.command_cursor = self.command_input.len(); self.command_anchor = None; self.command_selection = None; }
-            KeyCode::Left => self.move_command_cursor(false, key.modifiers.contains(KeyModifiers::SHIFT)),
-            KeyCode::Right => self.move_command_cursor(true, key.modifiers.contains(KeyModifiers::SHIFT)),
+            KeyCode::Home => {
+                self.command_cursor = 0;
+                self.command_anchor = None;
+                self.command_selection = None;
+            }
+            KeyCode::End => {
+                self.command_cursor = self.command_input.len();
+                self.command_anchor = None;
+                self.command_selection = None;
+            }
+            KeyCode::Left => {
+                self.move_command_cursor(false, key.modifiers.contains(KeyModifiers::SHIFT))
+            }
+            KeyCode::Right => {
+                self.move_command_cursor(true, key.modifiers.contains(KeyModifiers::SHIFT))
+            }
             KeyCode::Up => self.command_suggestion = self.command_suggestion.saturating_sub(1),
-            KeyCode::Down => self.command_suggestion = (self.command_suggestion + 1).min(self.command_suggestions().len().saturating_sub(1)),
+            KeyCode::Down => {
+                self.command_suggestion = (self.command_suggestion + 1)
+                    .min(self.command_suggestions().len().saturating_sub(1))
+            }
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -2651,26 +3361,127 @@ impl App {
             self.command_anchor = None;
             return;
         }
-        if extend && self.command_anchor.is_none() { self.command_anchor = Some(self.command_cursor); }
-        self.command_cursor = if forward { next_char_boundary(&self.command_input, self.command_cursor) } else { previous_char_boundary(&self.command_input, self.command_cursor) };
-        self.command_selection = self.command_anchor.and_then(|anchor| (anchor != self.command_cursor).then_some((anchor.min(self.command_cursor), anchor.max(self.command_cursor))));
-        if !extend { self.command_anchor = None; }
+        if extend && self.command_anchor.is_none() {
+            self.command_anchor = Some(self.command_cursor);
+        }
+        self.command_cursor = if forward {
+            next_char_boundary(&self.command_input, self.command_cursor)
+        } else {
+            previous_char_boundary(&self.command_input, self.command_cursor)
+        };
+        self.command_selection = self.command_anchor.and_then(|anchor| {
+            (anchor != self.command_cursor).then_some((
+                anchor.min(self.command_cursor),
+                anchor.max(self.command_cursor),
+            ))
+        });
+        if !extend {
+            self.command_anchor = None;
+        }
     }
 
-    pub fn command_suggestions(&self) -> Vec<&'static str> {
-        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "newfile", "newdir", "rename", "copy", "move", "delete", "delete!", "refresh", "gitrefresh", "stage", "unstage", "diff", "history", "symbols", "outline", "split", "vsplit", "only", "unsplit", "terminal", "terminalfocus", "terminalclose", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set reducedmotion", "set noreducedmotion", "set number", "set nonumber", "set", "theme", "themes", "keymap", "keymaps", "help"];
+    pub fn command_suggestions(&self) -> Vec<String> {
+        const COMMANDS: &[&str] = &[
+            "w",
+            "wa",
+            "q",
+            "q!",
+            "wq",
+            "e",
+            "new",
+            "tabnew",
+            "tabnext",
+            "tabprev",
+            "tree",
+            "newfile",
+            "newdir",
+            "rename",
+            "copy",
+            "move",
+            "delete",
+            "delete!",
+            "refresh",
+            "gitrefresh",
+            "stage",
+            "unstage",
+            "diff",
+            "history",
+            "symbols",
+            "outline",
+            "split",
+            "vsplit",
+            "only",
+            "unsplit",
+            "terminal",
+            "terminalfocus",
+            "terminalclose",
+            "plugins",
+            "plugin",
+            "pluginreload",
+            "plugindir",
+            "fold",
+            "foldopen",
+            "foldall",
+            "unfoldall",
+            "format",
+            "lsp",
+            "lspstop",
+            "complete",
+            "hover",
+            "definition",
+            "references",
+            "actions",
+            "diagnostics",
+            "symbolrename",
+            "set formatonsave",
+            "set noformatonsave",
+            "set reducedmotion",
+            "set noreducedmotion",
+            "set number",
+            "set nonumber",
+            "set",
+            "theme",
+            "themes",
+            "keymap",
+            "keymaps",
+            "help",
+        ];
         let query = self.command_input.trim().to_ascii_lowercase();
-        COMMANDS.iter().copied().filter(|command| command.contains(&query)).collect()
+        let mut commands = COMMANDS
+            .iter()
+            .map(|command| (*command).to_string())
+            .collect::<Vec<_>>();
+        commands.extend(
+            self.plugins
+                .command_names()
+                .into_iter()
+                .map(|name| format!("plugin {name}")),
+        );
+        commands
+            .into_iter()
+            .filter(|command| command.to_ascii_lowercase().contains(&query))
+            .collect()
     }
 
-    pub fn command_cursor(&self) -> usize { self.command_cursor.min(self.command_input.len()) }
+    pub fn command_cursor(&self) -> usize {
+        self.command_cursor.min(self.command_input.len())
+    }
 
-    pub fn command_selection(&self) -> Option<(usize, usize)> { self.command_selection }
+    pub fn command_selection(&self) -> Option<(usize, usize)> {
+        self.command_selection
+    }
 
     fn selected_command(&self) -> Option<String> {
         let suggestions = self.command_suggestions();
-        if self.command_input.trim().is_empty() || suggestions.iter().any(|value| *value == self.command_input.trim()) { None }
-        else { suggestions.get(self.command_suggestion).map(|value| (*value).to_string()) }
+        if self.command_input.trim().is_empty()
+            || suggestions
+                .iter()
+                .any(|value| value == self.command_input.trim())
+        {
+            None
+        } else {
+            suggestions.get(self.command_suggestion).cloned()
+        }
     }
 
     fn execute_command(&mut self, command: &str) {
@@ -2816,23 +3627,42 @@ impl App {
                 };
             }
             "newfile" | "touch" => {
-                if argument.is_empty() { self.message = "Usage: :newfile path".to_string(); } else { self.create_project_file(&argument); }
+                if argument.is_empty() {
+                    self.message = "Usage: :newfile path".to_string();
+                } else {
+                    self.create_project_file(&argument);
+                }
             }
             "newdir" | "mkdir" => {
-                if argument.is_empty() { self.message = "Usage: :newdir path".to_string(); } else { self.create_project_directory(&argument); }
+                if argument.is_empty() {
+                    self.message = "Usage: :newdir path".to_string();
+                } else {
+                    self.create_project_directory(&argument);
+                }
             }
             "rename" => self.rename_selected_project_entry(&argument),
             "copy" => self.duplicate_selected_project_file(&argument),
             "move" => {
-                if argument.is_empty() { self.message = "Usage: :move path".to_string(); } else { self.move_selected_project_entry(&argument); }
+                if argument.is_empty() {
+                    self.message = "Usage: :move path".to_string();
+                } else {
+                    self.move_selected_project_entry(&argument);
+                }
             }
             "delete" | "rm" => self.delete_selected_project_entry(false),
             "delete!" | "rm!" => self.delete_selected_project_entry(true),
             "refresh" | "reloadtree" => match self.project.refresh() {
-                Ok(()) => { self.project.refresh_git_status(); self.message = "File tree refreshed".to_string() },
+                Ok(()) => {
+                    self.project.refresh_git_status();
+                    self.message = "File tree refreshed".to_string()
+                }
                 Err(error) => self.message = format!("Refresh failed: {error}"),
             },
-            "gitrefresh" => { self.project.refresh_git_status(); self.refresh_git_line_changes(); self.message = "Git status and gutter refreshed".to_string(); },
+            "gitrefresh" => {
+                self.project.refresh_git_status();
+                self.refresh_git_line_changes();
+                self.message = "Git status and gutter refreshed".to_string();
+            }
             "stage" => self.git_selected(true),
             "unstage" => self.git_selected(false),
             "diff" => self.show_git_diff(),
@@ -2880,9 +3710,16 @@ impl App {
             "symbols" | "outline" => self.show_symbols(),
             "split" => self.open_split(false),
             "vsplit" => self.open_split(true),
-            "only" | "unsplit" => { self.split_views = None; self.message = "Split closed".to_string(); }
+            "only" | "unsplit" => {
+                self.split_views = None;
+                self.message = "Split closed".to_string();
+            }
             "terminal" | "term" => {
-                if self.terminal.is_none() { self.open_terminal(); } else { self.toggle_terminal_focus(); }
+                if self.terminal.is_none() {
+                    self.open_terminal();
+                } else {
+                    self.toggle_terminal_focus();
+                }
             }
             "terminalfocus" | "termfocus" => self.open_terminal(),
             "terminalclose" | "termclose" => self.close_terminal(),
@@ -2934,6 +3771,34 @@ impl App {
             "themes" | "themegallery" => self.open_theme_gallery(),
             "keymap" => self.execute_keymap(&argument),
             "keymaps" | "keymapgallery" => self.open_keymap_gallery(),
+            "plugins" => {
+                let errors = self.plugins.errors().len();
+                self.message = if errors == 0 {
+                    self.plugins.summary()
+                } else {
+                    format!(
+                        "{} · {errors} plugin error(s); see :plugindir",
+                        self.plugins.summary()
+                    )
+                };
+            }
+            "plugindir" => self.message = config::plugins_dir().display().to_string(),
+            "pluginreload" => {
+                self.plugins = PluginRegistry::load(&config::plugins_dir());
+                self.message = format!(
+                    "Reloaded {} plugin(s) · {} error(s)",
+                    self.plugins.count(),
+                    self.plugins.errors().len()
+                );
+            }
+            "plugin" => {
+                let mut values = argument.split_whitespace();
+                let Some(name) = values.next() else {
+                    self.message = "Usage: :plugin command [args]".to_string();
+                    return;
+                };
+                self.run_plugin_command(name, values.map(str::to_string).collect(), "command");
+            }
             "config" => self.message = config::config_path().display().to_string(),
             "lsp" => self.start_lsp(),
             "lspstop" => {
@@ -2948,6 +3813,15 @@ impl App {
             "definition" | "def" => self.request_lsp_position("textDocument/definition"),
             "references" | "refs" => self.request_lsp_position("textDocument/references"),
             "actions" => self.request_lsp_position("textDocument/codeAction"),
+            "diagnostics" => self.open_diagnostics_panel(),
+            "symbolrename" | "lsprename" => {
+                if argument.is_empty() {
+                    self.message =
+                        "Usage: :symbolrename newName (or press F2 in the editor)".to_string();
+                } else {
+                    self.request_lsp_rename(&argument);
+                }
+            }
             "format" => self.request_formatting(),
             "help" | "h" => self.open_help(),
             _ => self.message = format!("Unknown command: {command}"),
@@ -2967,10 +3841,16 @@ impl App {
         }
     }
 
-    pub fn recent_projects(&self) -> &[PathBuf] { &self.settings.recent_projects }
+    pub fn recent_projects(&self) -> &[PathBuf] {
+        &self.settings.recent_projects
+    }
 
     fn remember_current_project(&mut self) {
-        let project = self.project.root.canonicalize().unwrap_or_else(|_| self.project.root.clone());
+        let project = self
+            .project
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.project.root.clone());
         self.settings.recent_projects.retain(|existing| {
             existing.canonicalize().unwrap_or_else(|_| existing.clone()) != project
         });
@@ -2984,11 +3864,15 @@ impl App {
             self.open_current_folder_from_dashboard();
             return;
         }
-        let index = self.dashboard_selected.min(self.settings.recent_projects.len() - 1);
+        let index = self
+            .dashboard_selected
+            .min(self.settings.recent_projects.len() - 1);
         let path = self.settings.recent_projects[index].clone();
         if !path.is_dir() {
             self.settings.recent_projects.remove(index);
-            self.dashboard_selected = self.dashboard_selected.min(self.settings.recent_projects.len().saturating_sub(1));
+            self.dashboard_selected = self
+                .dashboard_selected
+                .min(self.settings.recent_projects.len().saturating_sub(1));
             self.persist_settings();
             self.message = format!("Removed missing project: {}", path.display());
             return;
@@ -3089,14 +3973,21 @@ impl App {
                     _ => self.message = "Tree width must be between 22 and 80".to_string(),
                 }
             }
-            _ => self.message = "Try :set number, :set formatonsave, :set reducedmotion, or :set tabstop=4".to_string(),
+            _ => {
+                self.message =
+                    "Try :set number, :set formatonsave, :set reducedmotion, or :set tabstop=4"
+                        .to_string()
+            }
         }
     }
 
     fn start_lsp(&mut self) {
         self.lsp = None;
+        self.lsp_panel = None;
         self.lsp_status = LspStatus::Off;
         self.diagnostic_count = 0;
+        self.diagnostics.clear();
+        self.lsp_open_path = None;
         let Some(path) = self.editor.path.clone() else {
             self.message = "Save the buffer before starting LSP".to_string();
             return;
@@ -3127,11 +4018,273 @@ impl App {
         }
     }
 
-    fn request_hover(&mut self) {
-        let Some(lsp) = &mut self.lsp else {
-            self.message = "Start LSP first with :lsp".to_string();
+    fn handle_lsp_panel_key(&mut self, key: KeyEvent) {
+        let Some(panel) = self.lsp_panel.as_mut() else {
             return;
         };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.lsp_panel = None;
+                self.message = "LSP results closed".to_string();
+            }
+            KeyCode::Up | KeyCode::Char('k') => panel.selected = panel.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                panel.selected = (panel.selected + 1).min(panel.items.len().saturating_sub(1))
+            }
+            KeyCode::PageUp => panel.selected = panel.selected.saturating_sub(8),
+            KeyCode::PageDown => {
+                panel.selected = (panel.selected + 8).min(panel.items.len().saturating_sub(1))
+            }
+            KeyCode::Home => panel.selected = 0,
+            KeyCode::End => panel.selected = panel.items.len().saturating_sub(1),
+            KeyCode::Enter => self.activate_lsp_panel_item(),
+            _ => {}
+        }
+    }
+
+    fn activate_lsp_panel_item(&mut self) {
+        let Some(panel) = self.lsp_panel.take() else {
+            return;
+        };
+        let Some(item) = panel.items.get(panel.selected).cloned() else {
+            return;
+        };
+        match panel.kind {
+            LspPanelKind::Completion => self.apply_lsp_completion(&item.payload),
+            LspPanelKind::Locations | LspPanelKind::Diagnostics => {
+                self.open_lsp_location(&item.payload)
+            }
+            LspPanelKind::CodeActions => self.apply_lsp_code_action(&item.payload),
+            LspPanelKind::Hover => self.message = "Hover closed".to_string(),
+        }
+    }
+
+    fn open_diagnostics_panel(&mut self) {
+        if self.diagnostics.is_empty() {
+            self.message = "No LSP diagnostics for this file".to_string();
+            return;
+        }
+        let items = self
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let severity = match diagnostic["diagnostic"]["severity"].as_u64() {
+                    Some(1) => "Error",
+                    Some(2) => "Warning",
+                    Some(3) => "Info",
+                    Some(4) => "Hint",
+                    _ => "Diagnostic",
+                };
+                let line = diagnostic["diagnostic"]["range"]["start"]["line"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    + 1;
+                LspPanelItem {
+                    label: format!("{severity} · line {line}"),
+                    detail: diagnostic["diagnostic"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .replace('\n', " "),
+                    payload: diagnostic.clone(),
+                }
+            })
+            .collect();
+        self.lsp_panel = Some(LspPanel {
+            title: format!("Diagnostics ({})", self.diagnostics.len()),
+            items,
+            selected: 0,
+            kind: LspPanelKind::Diagnostics,
+        });
+        self.message = "↑↓ select · Enter jumps · Esc closes".to_string();
+    }
+
+    fn request_lsp_rename(&mut self, new_name: &str) {
+        if !self.lsp_initialized {
+            self.message = "Start LSP first with :lsp and wait until it is ready".to_string();
+            return;
+        }
+        let Some(path) = self.editor.path.as_ref() else {
+            self.message = "Save the buffer before renaming a symbol".to_string();
+            return;
+        };
+        let character = self.lsp_cursor_character();
+        let params = json!({
+            "textDocument": { "uri": lsp::file_uri(path) },
+            "position": { "line": self.editor.cursor.line, "character": character },
+            "newName": new_name
+        });
+        match self
+            .lsp
+            .as_mut()
+            .ok_or_else(|| "Start LSP first with :lsp".to_string())
+            .and_then(|client| {
+                client
+                    .request("textDocument/rename", params)
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(id) => {
+                self.lsp_requests
+                    .insert(id, "textDocument/rename".to_string());
+                self.message = format!("Renaming symbol to {new_name}…");
+            }
+            Err(error) => self.message = error,
+        }
+    }
+
+    fn apply_lsp_completion(&mut self, item: &Value) {
+        let replacement = item["textEdit"]["newText"]
+            .as_str()
+            .or_else(|| item["insertText"].as_str())
+            .or_else(|| item["label"].as_str())
+            .unwrap_or_default();
+        let replacement = if item["insertTextFormat"].as_u64() == Some(2) {
+            strip_lsp_snippet(replacement)
+        } else {
+            replacement.to_string()
+        };
+        let range = item["textEdit"]
+            .get("range")
+            .or_else(|| item["textEdit"].get("replace"));
+        if let Some(range) = range {
+            let edit = json!({ "range": range, "newText": replacement });
+            if let Some(text) =
+                apply_lsp_text_edits(&self.editor.text(), std::slice::from_ref(&edit))
+            {
+                self.editor.replace_text(&text);
+            }
+        } else {
+            self.editor.checkpoint();
+            self.editor.delete_selection();
+            self.editor.insert_text(&replacement);
+        }
+        self.message = format!(
+            "Completed: {}",
+            item["label"].as_str().unwrap_or(&replacement)
+        );
+    }
+
+    fn open_lsp_location(&mut self, payload: &Value) {
+        let (uri, range) = if payload.get("diagnostic").is_some() {
+            (payload["uri"].as_str(), &payload["diagnostic"]["range"])
+        } else {
+            let range = if payload["range"].is_object() {
+                &payload["range"]
+            } else {
+                &payload["targetSelectionRange"]
+            };
+            (
+                payload["uri"]
+                    .as_str()
+                    .or_else(|| payload["targetUri"].as_str()),
+                range,
+            )
+        };
+        let (Some(uri), Some(path)) = (uri, uri.and_then(lsp::path_from_uri)) else {
+            self.message = "LSP result has no usable file location".to_string();
+            return;
+        };
+        let line = range["start"]["line"].as_u64().unwrap_or(0) as usize;
+        let column = range["start"]["character"].as_u64().unwrap_or(0) as usize;
+        let before = self.current_location();
+        match self.editor.open_or_switch(&path) {
+            Ok(_) => {
+                self.commit_navigation(before);
+                self.editor.goto_line(line);
+                self.editor.cursor.column = lsp_cursor_column(&self.editor.text(), line, column)
+                    .unwrap_or(0)
+                    .min(self.editor.line_len_chars(line));
+                self.explorer_focused = false;
+                self.mode = self.preferred_editor_mode();
+                self.after_tab_switch();
+                self.message = format!("{} · line {}", path.display(), line + 1);
+            }
+            Err(error) => self.message = format!("Cannot open {uri}: {error}"),
+        }
+    }
+
+    fn apply_lsp_code_action(&mut self, action: &Value) {
+        let mut applied = 0;
+        if action["edit"].is_object() {
+            match self.apply_workspace_edit(&action["edit"]) {
+                Ok(count) => applied = count,
+                Err(error) => {
+                    self.message = error;
+                    return;
+                }
+            }
+        }
+        let command = action
+            .get("command")
+            .filter(|command| command.is_object())
+            .unwrap_or(action);
+        if command["command"].is_string() {
+            let params = json!({ "command": command["command"], "arguments": command["arguments"].as_array().cloned().unwrap_or_default() });
+            match self
+                .lsp
+                .as_mut()
+                .and_then(|client| client.request("workspace/executeCommand", params).ok())
+            {
+                Some(id) => {
+                    self.lsp_requests
+                        .insert(id, "workspace/executeCommand".to_string());
+                    self.message = format!(
+                        "Running code action: {}",
+                        action["title"].as_str().unwrap_or("command")
+                    );
+                }
+                None => self.message = "Could not execute the LSP code action".to_string(),
+            }
+        } else {
+            self.message = format!("Applied code action to {applied} file(s)");
+        }
+    }
+
+    fn apply_workspace_edit(&mut self, edit: &Value) -> Result<usize, String> {
+        let mut documents = Vec::<(String, Vec<Value>)>::new();
+        if let Some(changes) = edit["changes"].as_object() {
+            for (uri, edits) in changes {
+                documents.push((uri.clone(), edits.as_array().cloned().unwrap_or_default()));
+            }
+        }
+        if let Some(changes) = edit["documentChanges"].as_array() {
+            for change in changes {
+                if let (Some(uri), Some(edits)) = (
+                    change["textDocument"]["uri"].as_str(),
+                    change["edits"].as_array(),
+                ) {
+                    documents.push((uri.to_string(), edits.clone()));
+                }
+            }
+        }
+        let mut applied = 0;
+        for (uri, edits) in documents {
+            let path =
+                lsp::path_from_uri(&uri).ok_or_else(|| format!("Unsupported LSP URI: {uri}"))?;
+            if let Some(editor) = self.editor.editor_for_path_mut(&path) {
+                let text = apply_lsp_text_edits(&editor.text(), &edits)
+                    .ok_or_else(|| format!("Invalid text edits for {}", path.display()))?;
+                editor.replace_text(&text);
+            } else {
+                let text = fs::read_to_string(&path)
+                    .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+                let text = apply_lsp_text_edits(&text, &edits)
+                    .ok_or_else(|| format!("Invalid text edits for {}", path.display()))?;
+                fs::write(&path, text)
+                    .map_err(|error| format!("Could not update {}: {error}", path.display()))?;
+            }
+            applied += 1;
+        }
+        let _ = self.project.refresh();
+        self.project.refresh_git_status();
+        self.refresh_git_line_changes();
+        Ok(applied)
+    }
+
+    fn request_hover(&mut self) {
+        if self.lsp.is_none() {
+            self.message = "Start LSP first with :lsp".to_string();
+            return;
+        }
         if !self.lsp_initialized {
             self.message = "LSP is still initializing".to_string();
             return;
@@ -3144,10 +4297,15 @@ impl App {
             self.message = "Save the buffer before requesting hover".to_string();
             return;
         };
-        match lsp.request("textDocument/hover", json!({
-            "textDocument": { "uri": lsp::file_uri(path) },
-            "position": { "line": self.editor.cursor.line, "character": self.editor.cursor.column }
-        })) {
+        let character = self.lsp_cursor_character();
+        let lsp = self.lsp.as_mut().expect("LSP availability checked");
+        match lsp.request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": lsp::file_uri(path) },
+                "position": { "line": self.editor.cursor.line, "character": character }
+            }),
+        ) {
             Ok(id) => {
                 self.lsp_requests.insert(id, "hover".to_string());
                 self.message = "Hover requested".to_string();
@@ -3157,6 +4315,9 @@ impl App {
     }
 
     fn sync_lsp_document(&mut self) {
+        if self.editor.path != self.lsp_open_path {
+            self.sync_lsp_active_file();
+        }
         let Some(lsp) = &self.lsp else { return };
         if !self.lsp_initialized {
             return;
@@ -3179,7 +4340,37 @@ impl App {
         self.lsp_last_text = self.editor.text();
     }
 
+    fn sync_lsp_active_file(&mut self) {
+        if !self.lsp_initialized {
+            return;
+        }
+        let next = self.editor.path.clone();
+        if next == self.lsp_open_path {
+            return;
+        }
+        let Some(lsp) = &self.lsp else { return };
+        if let Some(previous) = self.lsp_open_path.take() {
+            let _ = lsp.notify(
+                "textDocument/didClose",
+                json!({ "textDocument": { "uri": lsp::file_uri(&previous) } }),
+            );
+        }
+        if let Some(path) = next {
+            let text = self.editor.text();
+            let language_id = lsp_language_id(Language::from_path(Some(&path)));
+            self.lsp_version = 1;
+            if lsp.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lsp::file_uri(&path), "languageId": language_id, "version": 1, "text": text } })).is_ok() {
+                self.lsp_last_text = self.editor.text();
+                self.lsp_open_path = Some(path);
+            }
+        }
+    }
+
     fn request_lsp_position(&mut self, method: &str) {
+        if !self.lsp_initialized {
+            self.message = "Start LSP first with :lsp and wait until it is ready".to_string();
+            return;
+        }
         if !self.lsp_workspace_ready {
             self.message = "LSP is still loading the workspace".to_string();
             return;
@@ -3188,18 +4379,19 @@ impl App {
             self.message = "Save the buffer before using LSP".to_string();
             return;
         };
+        let character = self.lsp_cursor_character();
         let mut params = json!({
             "textDocument": { "uri": lsp::file_uri(path) },
-            "position": { "line": self.editor.cursor.line, "character": self.editor.cursor.column }
+            "position": { "line": self.editor.cursor.line, "character": character }
         });
         if method == "textDocument/references" {
             params["context"] = json!({ "includeDeclaration": true });
         } else if method == "textDocument/codeAction" {
             params["range"] = json!({
-                "start": { "line": self.editor.cursor.line, "character": self.editor.cursor.column },
-                "end": { "line": self.editor.cursor.line, "character": self.editor.cursor.column }
+                "start": { "line": self.editor.cursor.line, "character": character },
+                "end": { "line": self.editor.cursor.line, "character": character }
             });
-            params["context"] = json!({ "diagnostics": [] });
+            params["context"] = json!({ "diagnostics": self.diagnostics.iter().map(|value| value["diagnostic"].clone()).collect::<Vec<_>>() });
         }
         match self
             .lsp
@@ -3219,6 +4411,10 @@ impl App {
     }
 
     fn request_formatting(&mut self) {
+        if !self.lsp_initialized {
+            self.message = "Start LSP first with :lsp and wait until it is ready".to_string();
+            return;
+        }
         let Some(path) = self.editor.path.as_ref() else {
             self.message = "Save the buffer before formatting".to_string();
             return;
@@ -3274,6 +4470,17 @@ impl App {
             message.get("id"),
             message.get("method").and_then(|method| method.as_str()),
         ) {
+            if method == "workspace/applyEdit" {
+                let id = id.clone();
+                let result = match self.apply_workspace_edit(&message["params"]["edit"]) {
+                    Ok(_) => json!({ "applied": true }),
+                    Err(error) => json!({ "applied": false, "failureReason": error }),
+                };
+                if let Some(lsp) = &self.lsp {
+                    let _ = lsp.respond(&id, result);
+                }
+                return;
+            }
             let result = match method {
                 "workspace/configuration" => {
                     let count = message["params"]["items"].as_array().map_or(0, Vec::len);
@@ -3325,8 +4532,13 @@ impl App {
                 self.lsp_initialized = true;
                 self.lsp_status = LspStatus::Ready;
                 self.lsp_last_text = self.editor.text();
+                self.lsp_open_path = Some(path.clone());
                 self.message = "LSP ready".to_string();
             }
+            return;
+        }
+        if request.is_some() && message.get("error").is_some() {
+            self.message = format!("LSP request failed: {}", message["error"]);
             return;
         }
         if request.as_deref() == Some("textDocument/definition") {
@@ -3334,31 +4546,132 @@ impl App {
                 .as_array()
                 .and_then(|locations| locations.first())
                 .unwrap_or(&message["result"]);
-            let uri = location["uri"]
-                .as_str()
-                .or_else(|| location["targetUri"].as_str());
-            let range = if location["range"].is_object() {
-                &location["range"]
+            if location.is_object() {
+                self.open_lsp_location(location);
             } else {
-                &location["targetSelectionRange"]
-            };
-            if let (Some(uri), Some(line), Some(character)) = (
-                uri,
-                range["start"]["line"].as_u64(),
-                range["start"]["character"].as_u64(),
-            ) {
-                let path = PathBuf::from(uri.trim_start_matches("file:///").replace("%20", " "));
-                match self.editor.open_or_switch(&path) {
-                    Ok(_) => {
-                        self.editor.goto_line(line as usize);
-                        self.editor.cursor.column = character as usize;
-                        self.message = format!("Definition: {}", path.display());
-                    }
-                    Err(error) => self.message = format!("Cannot open definition: {error}"),
-                }
-                return;
+                self.message = "No definition found at cursor".to_string();
             }
-            self.message = "No definition found at cursor".to_string();
+            return;
+        }
+        if request.as_deref() == Some("textDocument/completion") {
+            let values = message["result"]
+                .as_array()
+                .or_else(|| message["result"]["items"].as_array())
+                .cloned()
+                .unwrap_or_default();
+            let items = values
+                .into_iter()
+                .map(|item| LspPanelItem {
+                    label: item["label"].as_str().unwrap_or("completion").to_string(),
+                    detail: item["detail"]
+                        .as_str()
+                        .or_else(|| item["documentation"]["value"].as_str())
+                        .unwrap_or_default()
+                        .replace('\n', " "),
+                    payload: item,
+                })
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                self.message = "No completions at cursor".to_string();
+            } else {
+                self.lsp_panel = Some(LspPanel {
+                    title: format!("Completions ({})", items.len()),
+                    items,
+                    selected: 0,
+                    kind: LspPanelKind::Completion,
+                });
+                self.message = "↑↓ select · Enter inserts · Esc closes".to_string();
+            }
+            return;
+        }
+        if request.as_deref() == Some("hover") {
+            let text = lsp_hover_text(&message["result"]);
+            let items = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| LspPanelItem {
+                    label: line.to_string(),
+                    detail: String::new(),
+                    payload: Value::Null,
+                })
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                self.message = "No hover information at cursor".to_string();
+            } else {
+                self.lsp_panel = Some(LspPanel {
+                    title: "Hover".to_string(),
+                    items,
+                    selected: 0,
+                    kind: LspPanelKind::Hover,
+                });
+                self.message = "Esc closes hover".to_string();
+            }
+            return;
+        }
+        if request.as_deref() == Some("textDocument/references") {
+            let values = message["result"].as_array().cloned().unwrap_or_default();
+            let items = values
+                .into_iter()
+                .map(|location| {
+                    let uri = location["uri"].as_str().unwrap_or_default();
+                    let path = lsp::path_from_uri(uri).unwrap_or_default();
+                    let line = location["range"]["start"]["line"].as_u64().unwrap_or(0) + 1;
+                    LspPanelItem {
+                        label: format!(
+                            "{}:{line}",
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(uri)
+                        ),
+                        detail: path.display().to_string(),
+                        payload: location,
+                    }
+                })
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                self.message = "No references found".to_string();
+            } else {
+                self.lsp_panel = Some(LspPanel {
+                    title: format!("References ({})", items.len()),
+                    items,
+                    selected: 0,
+                    kind: LspPanelKind::Locations,
+                });
+                self.message = "↑↓ select · Enter jumps · Esc closes".to_string();
+            }
+            return;
+        }
+        if request.as_deref() == Some("textDocument/codeAction") {
+            let values = message["result"].as_array().cloned().unwrap_or_default();
+            let items = values
+                .into_iter()
+                .map(|action| LspPanelItem {
+                    label: action["title"]
+                        .as_str()
+                        .unwrap_or("Code action")
+                        .to_string(),
+                    detail: action["kind"].as_str().unwrap_or_default().to_string(),
+                    payload: action,
+                })
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                self.message = "No code actions at cursor".to_string();
+            } else {
+                self.lsp_panel = Some(LspPanel {
+                    title: format!("Code actions ({})", items.len()),
+                    items,
+                    selected: 0,
+                    kind: LspPanelKind::CodeActions,
+                });
+                self.message = "↑↓ select · Enter applies · Esc closes".to_string();
+            }
+            return;
+        }
+        if request.as_deref() == Some("textDocument/rename") {
+            match self.apply_workspace_edit(&message["result"]) {
+                Ok(count) => self.message = format!("Renamed symbol in {count} file(s)"),
+                Err(error) => self.message = error,
+            }
             return;
         }
         if request.as_deref() == Some("textDocument/formatting") {
@@ -3375,11 +4688,21 @@ impl App {
         if message.get("method").and_then(|value| value.as_str())
             == Some("textDocument/publishDiagnostics")
         {
-            let count = message["params"]["diagnostics"]
-                .as_array()
-                .map_or(0, Vec::len);
-            self.diagnostic_count = count;
-            self.message = format!("LSP diagnostics: {count}");
+            let uri = message["params"]["uri"].as_str().unwrap_or_default();
+            self.diagnostics
+                .retain(|value| value["uri"].as_str() != Some(uri));
+            self.diagnostics.extend(
+                message["params"]["diagnostics"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|diagnostic| json!({ "uri": uri, "diagnostic": diagnostic })),
+            );
+            self.diagnostic_count = self.diagnostics.len();
+            self.message = format!(
+                "LSP diagnostics: {} · :diagnostics to inspect",
+                self.diagnostic_count
+            );
         } else if let Some(result) = message.get("result") {
             let text = result["contents"]
                 .as_str()
@@ -3397,55 +4720,191 @@ impl App {
     }
 
     fn apply_formatting_edits(&mut self, result: &serde_json::Value) -> bool {
-        let Some(edits) = result.as_array() else { return false; };
+        let Some(edits) = result.as_array() else {
+            return false;
+        };
         let mut text = self.editor.text();
         let mut changes = Vec::new();
         for edit in edits {
-            let Some(replacement) = edit["newText"].as_str() else { continue; };
+            let Some(replacement) = edit["newText"].as_str() else {
+                continue;
+            };
             let range = &edit["range"];
-            let Some(start_line) = range["start"]["line"].as_u64() else { continue; };
-            let Some(start_character) = range["start"]["character"].as_u64() else { continue; };
-            let Some(end_line) = range["end"]["line"].as_u64() else { continue; };
-            let Some(end_character) = range["end"]["character"].as_u64() else { continue; };
-            let Some(start) = lsp_text_offset(&text, start_line as usize, start_character as usize) else { continue; };
-            let Some(end) = lsp_text_offset(&text, end_line as usize, end_character as usize) else { continue; };
+            let Some(start_line) = range["start"]["line"].as_u64() else {
+                continue;
+            };
+            let Some(start_character) = range["start"]["character"].as_u64() else {
+                continue;
+            };
+            let Some(end_line) = range["end"]["line"].as_u64() else {
+                continue;
+            };
+            let Some(end_character) = range["end"]["character"].as_u64() else {
+                continue;
+            };
+            let Some(start) = lsp_text_offset(&text, start_line as usize, start_character as usize)
+            else {
+                continue;
+            };
+            let Some(end) = lsp_text_offset(&text, end_line as usize, end_character as usize)
+            else {
+                continue;
+            };
             changes.push((start, end, replacement.to_string()));
         }
         changes.sort_by_key(|(start, _, _)| *start);
-        if changes.is_empty() { return false; }
-        for (start, end, replacement) in changes.into_iter().rev() {
-            if start <= end && end <= text.len() { text.replace_range(start..end, &replacement); }
+        if changes.is_empty() {
+            return false;
         }
-        if text == self.editor.text() { return false; }
+        for (start, end, replacement) in changes.into_iter().rev() {
+            if start <= end && end <= text.len() {
+                text.replace_range(start..end, &replacement);
+            }
+        }
+        if text == self.editor.text() {
+            return false;
+        }
         self.editor.replace_text(&text);
         true
     }
 
+    fn plugin_context(&self, arguments: Vec<String>, event: &str) -> PluginContext {
+        PluginContext {
+            project: self.project.root.display().to_string(),
+            file: self
+                .editor
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            language: self.language_name(),
+            text: self.editor.text(),
+            selection: self.editor.selected_text(),
+            cursor_line: self.editor.cursor.line,
+            cursor_column: self.editor.cursor.column,
+            arguments,
+            event: event.to_string(),
+        }
+    }
+
+    fn run_plugin_command(&mut self, name: &str, arguments: Vec<String>, event: &str) {
+        let context = self.plugin_context(arguments, event);
+        match self.plugins.run(name, &context) {
+            Ok(response) => self.apply_plugin_response(response),
+            Err(error) => self.message = error,
+        }
+    }
+
+    fn apply_plugin_response(&mut self, response: PluginResponse) {
+        if let Some(text) = response.replace_document {
+            self.editor.replace_text(&text);
+        } else if let Some(text) = response.replace_selection {
+            if self.editor.selection_range().is_some() {
+                self.editor.checkpoint();
+                self.editor.delete_selection();
+                self.editor.insert_text(&text);
+            } else {
+                self.message =
+                    "Plugin requested replace_selection, but nothing is selected".to_string();
+            }
+        } else if let Some(text) = response.insert_text {
+            self.editor.checkpoint();
+            self.editor.delete_selection();
+            self.editor.insert_text(&text);
+        }
+
+        if let Some(path) = response.open {
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                self.project.root.join(path)
+            };
+            match self.editor.open_or_switch(&path) {
+                Ok(_) => {
+                    self.explorer_focused = false;
+                    self.mode = self.preferred_editor_mode();
+                    self.after_tab_switch();
+                }
+                Err(error) => {
+                    self.message = format!("Plugin could not open {}: {error}", path.display())
+                }
+            }
+        }
+        if let Some(message) = response.message {
+            self.message = message;
+        }
+    }
+
+    fn run_save_hooks(&mut self) -> Result<usize, String> {
+        let commands = self.plugins.on_save_commands();
+        for command in &commands {
+            let context = self.plugin_context(Vec::new(), "on_save");
+            let response = self.plugins.run(command, &context)?;
+            self.apply_plugin_response(response);
+        }
+        if self.editor.dirty {
+            self.editor
+                .save()
+                .map_err(|error| format!("Plugin save hook failed to save changes: {error}"))?;
+        }
+        Ok(commands.len())
+    }
+
     fn execute_theme(&mut self, argument: &str) {
+        if let Some(theme) = self.plugins.theme(argument) {
+            self.theme = theme;
+            self.active_custom_theme = Some(argument.to_string());
+            self.settings.custom_theme = Some(argument.to_string());
+            self.persist_settings();
+            self.message = format!("Theme: {argument} (plugin)");
+            return;
+        }
         let kind = match argument {
             "oxide" | "" => ThemeKind::Oxide,
             "mono" | "monochrome" => ThemeKind::Mono,
             "nord" => ThemeKind::Nord,
             "dracula" => ThemeKind::Dracula,
             "solarized" | "solarized-dark" => ThemeKind::Solarized,
-            "gallery" => { self.open_theme_gallery(); return; }
+            "gallery" => {
+                self.open_theme_gallery();
+                return;
+            }
             _ => {
-                self.message = "Themes: oxide, nord, dracula, solarized, mono, gallery".to_string();
+                let custom = self.plugins.theme_names();
+                self.message = if custom.is_empty() {
+                    "Themes: oxide, nord, dracula, solarized, mono, gallery".to_string()
+                } else {
+                    format!(
+                        "Themes: oxide, nord, dracula, solarized, mono, gallery · plugins: {}",
+                        custom.join(", ")
+                    )
+                };
                 return;
             }
         };
 
         self.theme_kind = kind;
         self.theme = Theme::for_kind(kind);
+        self.active_custom_theme = None;
         self.settings.theme = kind;
+        self.settings.custom_theme = None;
         self.persist_settings();
         self.message = format!("Theme: {argument}");
     }
 
     fn open_theme_gallery(&mut self) {
-        self.theme_gallery_return_mode = if self.mode == Mode::Command { self.preferred_editor_mode() } else { self.mode };
+        self.theme_gallery_return_mode = if self.mode == Mode::Command {
+            self.preferred_editor_mode()
+        } else {
+            self.mode
+        };
         self.theme_gallery_original = self.theme_kind;
-        self.theme_gallery_selected = ThemeKind::ALL.iter().position(|kind| *kind == self.theme_kind).unwrap_or(0);
+        self.theme_gallery_original_theme = self.theme;
+        self.theme_gallery_original_custom = self.active_custom_theme.clone();
+        self.theme_gallery_selected = ThemeKind::ALL
+            .iter()
+            .position(|kind| *kind == self.theme_kind)
+            .unwrap_or(0);
         self.mode = Mode::ThemeGallery;
         self.preview_gallery_theme();
     }
@@ -3455,7 +4914,9 @@ impl App {
         self.theme = Theme::for_kind(self.theme_kind);
     }
 
-    pub fn keymap_profile(&self) -> KeymapProfile { self.settings.keymap }
+    pub fn keymap_profile(&self) -> KeymapProfile {
+        self.settings.keymap
+    }
 
     fn preferred_editor_mode(&self) -> Mode {
         match self.settings.keymap {
@@ -3465,7 +4926,11 @@ impl App {
     }
 
     fn open_keymap_gallery(&mut self) {
-        self.keymap_gallery_return_mode = if self.mode == Mode::Command { self.preferred_editor_mode() } else { self.mode };
+        self.keymap_gallery_return_mode = if self.mode == Mode::Command {
+            self.preferred_editor_mode()
+        } else {
+            self.mode
+        };
         self.keymap_gallery_selected = KeymapProfile::ALL
             .iter()
             .position(|profile| *profile == self.settings.keymap)
@@ -3545,10 +5010,21 @@ impl App {
     fn save_as(&mut self, path: PathBuf) {
         match self.editor.save_as(&path) {
             Ok(()) => {
+                let hooks = match self.run_save_hooks() {
+                    Ok(count) => count,
+                    Err(error) => {
+                        self.message = error;
+                        return;
+                    }
+                };
                 let _ = self.project.refresh();
                 self.project.refresh_git_status();
                 self.refresh_git_line_changes();
-                self.message = format!("Saved {}", path.display());
+                self.message = if hooks == 0 {
+                    format!("Saved {}", path.display())
+                } else {
+                    format!("Saved {} · ran {hooks} plugin hook(s)", path.display())
+                };
                 self.request_formatting_after_save();
             }
             Err(error) => self.message = format!("Save failed: {error}"),
@@ -3564,6 +5040,13 @@ impl App {
         }
         match self.editor.save() {
             Ok(()) => {
+                let hooks = match self.run_save_hooks() {
+                    Ok(count) => count,
+                    Err(error) => {
+                        self.message = error;
+                        return false;
+                    }
+                };
                 let _ = self.project.refresh();
                 self.project.refresh_git_status();
                 self.refresh_git_line_changes();
@@ -3573,7 +5056,11 @@ impl App {
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "[No Name]".to_string());
-                self.message = format!("Saved {name}");
+                self.message = if hooks == 0 {
+                    format!("Saved {name}")
+                } else {
+                    format!("Saved {name} · ran {hooks} plugin hook(s)")
+                };
                 self.request_formatting_after_save();
                 true
             }
@@ -3599,12 +5086,20 @@ impl App {
 
 fn parse_git_hunks(diff: &str, line_count: usize) -> HashMap<usize, GitLineChange> {
     let mut changes = HashMap::new();
-    if line_count == 0 { return changes; }
+    if line_count == 0 {
+        return changes;
+    }
     for line in diff.lines().filter(|line| line.starts_with("@@ ")) {
-        let Some(header) = line.split(" @@").next() else { continue; };
+        let Some(header) = line.split(" @@").next() else {
+            continue;
+        };
         let mut ranges = header.split_whitespace().skip(1);
-        let Some(old) = ranges.next().and_then(|range| parse_diff_range(range, '-')) else { continue; };
-        let Some(new) = ranges.next().and_then(|range| parse_diff_range(range, '+')) else { continue; };
+        let Some(old) = ranges.next().and_then(|range| parse_diff_range(range, '-')) else {
+            continue;
+        };
+        let Some(new) = ranges.next().and_then(|range| parse_diff_range(range, '+')) else {
+            continue;
+        };
         let new_index = new.0.saturating_sub(1);
         if old.1 == 0 {
             for index in new_index..new_index.saturating_add(new.1).min(line_count) {
@@ -3620,11 +5115,15 @@ fn parse_git_hunks(diff: &str, line_count: usize) -> HashMap<usize, GitLineChang
         for index in new_index..new_index.saturating_add(common).min(line_count) {
             changes.insert(index, GitLineChange::Modified);
         }
-        for index in new_index.saturating_add(common)..new_index.saturating_add(new.1).min(line_count) {
+        for index in
+            new_index.saturating_add(common)..new_index.saturating_add(new.1).min(line_count)
+        {
             changes.insert(index, GitLineChange::Added);
         }
         if old.1 > new.1 {
-            let marker = new_index.saturating_add(new.1.saturating_sub(1)).min(line_count - 1);
+            let marker = new_index
+                .saturating_add(new.1.saturating_sub(1))
+                .min(line_count - 1);
             changes.insert(marker, GitLineChange::Deleted);
         }
     }
@@ -3664,19 +5163,132 @@ fn lsp_workspace_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn lsp_text_offset(text: &str, line: usize, character: usize) -> Option<usize> {
-    let line_start = if line == 0 { 0 } else { text.match_indices('\n').nth(line - 1).map(|(index, _)| index + 1)? };
-    let line_end = text[line_start..].find('\n').map_or(text.len(), |offset| line_start + offset);
+    let line_start = if line == 0 {
+        0
+    } else {
+        text.match_indices('\n')
+            .nth(line - 1)
+            .map(|(index, _)| index + 1)?
+    };
+    let line_end = text[line_start..]
+        .find('\n')
+        .map_or(text.len(), |offset| line_start + offset);
     let prefix = &text[line_start..line_end];
-    let byte_offset = prefix.char_indices().nth(character).map_or(prefix.len(), |(offset, _)| offset);
+    let mut utf16_column = 0;
+    let mut byte_offset = prefix.len();
+    for (offset, value) in prefix.char_indices() {
+        if utf16_column >= character {
+            byte_offset = offset;
+            break;
+        }
+        utf16_column += value.len_utf16();
+        if utf16_column > character {
+            return None;
+        }
+    }
     Some(line_start + byte_offset)
 }
 
+fn apply_lsp_text_edits(text: &str, edits: &[Value]) -> Option<String> {
+    let mut changes = Vec::new();
+    for edit in edits {
+        let replacement = edit["newText"].as_str()?;
+        let range = &edit["range"];
+        let start = lsp_text_offset(
+            text,
+            range["start"]["line"].as_u64()? as usize,
+            range["start"]["character"].as_u64()? as usize,
+        )?;
+        let end = lsp_text_offset(
+            text,
+            range["end"]["line"].as_u64()? as usize,
+            range["end"]["character"].as_u64()? as usize,
+        )?;
+        if start > end || end > text.len() {
+            return None;
+        }
+        changes.push((start, end, replacement.to_string()));
+    }
+    changes.sort_by_key(|(start, _, _)| *start);
+    let mut result = text.to_string();
+    for (start, end, replacement) in changes.into_iter().rev() {
+        result.replace_range(start..end, &replacement);
+    }
+    Some(result)
+}
+
+fn lsp_cursor_column(text: &str, line: usize, character: usize) -> Option<usize> {
+    let offset = lsp_text_offset(text, line, character)?;
+    let line_start = if line == 0 {
+        0
+    } else {
+        text.match_indices('\n')
+            .nth(line - 1)
+            .map(|(index, _)| index + 1)?
+    };
+    Some(text[line_start..offset].chars().count())
+}
+
+fn strip_lsp_snippet(snippet: &str) -> String {
+    let mut output = String::new();
+    let mut chars = snippet.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '$' {
+            output.push(character);
+            continue;
+        }
+        if chars.peek() == Some(&'{') {
+            chars.next();
+            let mut body = String::new();
+            for value in chars.by_ref() {
+                if value == '}' {
+                    break;
+                }
+                body.push(value);
+            }
+            let value = body.split_once(':').map_or("", |(_, default)| default);
+            output.push_str(value);
+        } else {
+            while chars.peek().is_some_and(|value| value.is_ascii_digit()) {
+                chars.next();
+            }
+        }
+    }
+    output
+}
+
+fn lsp_hover_text(result: &Value) -> String {
+    let contents = &result["contents"];
+    if let Some(text) = contents.as_str() {
+        return text.to_string();
+    }
+    if let Some(text) = contents["value"].as_str() {
+        return text.to_string();
+    }
+    contents
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.as_str().or_else(|| part["value"].as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
 fn previous_char_boundary(text: &str, index: usize) -> usize {
-    text[..index.min(text.len())].char_indices().last().map_or(0, |(offset, _)| offset)
+    text[..index.min(text.len())]
+        .char_indices()
+        .last()
+        .map_or(0, |(offset, _)| offset)
 }
 
 fn next_char_boundary(text: &str, index: usize) -> usize {
-    text[index.min(text.len())..].chars().next().map_or(text.len(), |character| index + character.len_utf8())
+    text[index.min(text.len())..]
+        .chars()
+        .next()
+        .map_or(text.len(), |character| index + character.len_utf8())
 }
 
 fn lsp_language_id(language: crate::syntax::Language) -> &'static str {
@@ -3788,7 +5400,8 @@ mod tests {
 
     #[test]
     fn parses_added_modified_and_deleted_git_hunks_for_the_gutter() {
-        let diff = "@@ -2,1 +2,1 @@\n-old\n+new\n@@ -4,0 +5,2 @@\n+a\n+b\n@@ -8,2 +9,0 @@\n-old\n-old\n";
+        let diff =
+            "@@ -2,1 +2,1 @@\n-old\n+new\n@@ -4,0 +5,2 @@\n+a\n+b\n@@ -8,2 +9,0 @@\n-old\n-old\n";
         let changes = parse_git_hunks(diff, 12);
 
         assert_eq!(changes.get(&1), Some(&GitLineChange::Modified));
@@ -3819,5 +5432,45 @@ mod tests {
 
         assert_eq!(state, BackgroundState::Warning);
         assert!(label.contains("still loading"));
+    }
+
+    #[test]
+    fn lsp_offsets_use_utf16_columns() {
+        let text = "a😀b\nnext";
+        assert_eq!(lsp_text_offset(text, 0, 0), Some(0));
+        assert_eq!(lsp_text_offset(text, 0, 1), Some(1));
+        assert_eq!(lsp_text_offset(text, 0, 2), None);
+        assert_eq!(lsp_text_offset(text, 0, 3), Some(5));
+        assert_eq!(lsp_cursor_column(text, 0, 3), Some(2));
+        assert_eq!(lsp_text_offset(text, 1, 2), Some(9));
+    }
+
+    #[test]
+    fn applies_lsp_edits_from_the_end_and_expands_snippets() {
+        let edits = vec![
+            json!({ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }, "newText": "A" }),
+            json!({ "range": { "start": { "line": 0, "character": 2 }, "end": { "line": 0, "character": 3 } }, "newText": "C" }),
+        ];
+        assert_eq!(apply_lsp_text_edits("abc", &edits).as_deref(), Some("AbC"));
+        assert_eq!(strip_lsp_snippet("write(${1:value})$0"), "write(value)");
+    }
+
+    #[test]
+    fn completion_panel_inserts_selected_item() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::Insert;
+        app.lsp_panel = Some(LspPanel {
+            title: "Completions".to_string(),
+            selected: 0,
+            kind: LspPanelKind::Completion,
+            items: vec![LspPanelItem {
+                label: "Console".to_string(),
+                detail: String::new(),
+                payload: json!({ "label": "Console", "insertText": "Console" }),
+            }],
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.editor.text(), "Console");
+        assert!(app.lsp_panel.is_none());
     }
 }

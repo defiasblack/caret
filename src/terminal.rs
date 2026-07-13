@@ -1,27 +1,23 @@
 use std::{
-    collections::VecDeque,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
-const MAX_OUTPUT_LINES: usize = 5_000;
+const SCROLLBACK_LINES: usize = 5_000;
+const INITIAL_ROWS: u16 = 24;
+const INITIAL_COLUMNS: u16 = 80;
 
 pub struct TerminalPane {
-    child: Child,
-    input_stream: ChildStdin,
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    input: Box<dyn Write + Send>,
     output: Receiver<Vec<u8>>,
-    lines: VecDeque<String>,
-    partial_line: String,
-    input: String,
-    cursor: usize,
-    history: Vec<String>,
-    history_index: Option<usize>,
-    scroll: usize,
+    parser: vt100::Parser,
     exited: bool,
     pub cwd: PathBuf,
     pub shell_name: String,
@@ -30,223 +26,235 @@ pub struct TerminalPane {
 impl TerminalPane {
     pub fn start(cwd: &Path) -> io::Result<Self> {
         let (program, args, shell_name) = shell_command();
-        let mut child = Command::new(&program)
-            .args(args)
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let input_stream = child.stdin.take().ok_or_else(|| io::Error::other("shell stdin unavailable"))?;
-        let stdout = child.stdout.take().ok_or_else(|| io::Error::other("shell stdout unavailable"))?;
-        let stderr = child.stderr.take().ok_or_else(|| io::Error::other("shell stderr unavailable"))?;
+        let pair = native_pty_system()
+            .openpty(pty_size(INITIAL_ROWS, INITIAL_COLUMNS))
+            .map_err(io_other)?;
+        let mut command = CommandBuilder::new(&program);
+        command.args(args);
+        command.cwd(cwd);
+        command.env("TERM", "xterm-256color");
+        let child = pair.slave.spawn_command(command).map_err(io_other)?;
+        let reader = pair.master.try_clone_reader().map_err(io_other)?;
+        let input = pair.master.take_writer().map_err(io_other)?;
+        drop(pair.slave);
+
         let (sender, output) = mpsc::channel();
-        spawn_reader(stdout, sender.clone());
-        spawn_reader(stderr, sender);
-        let mut lines = VecDeque::new();
-        lines.push_back(format!("Caret Terminal · {shell_name} · {}", cwd.display()));
-        lines.push_back("Ctrl-` returns to editor · Ctrl-L clears · Up/Down history".to_string());
-        Ok(Self {
+        spawn_reader(reader, sender);
+        let mut terminal = Self {
+            master: pair.master,
             child,
-            input_stream,
+            input,
             output,
-            lines,
-            partial_line: String::new(),
-            input: String::new(),
-            cursor: 0,
-            history: Vec::new(),
-            history_index: None,
-            scroll: 0,
+            parser: vt100::Parser::new(INITIAL_ROWS, INITIAL_COLUMNS, SCROLLBACK_LINES),
             exited: false,
             cwd: cwd.to_path_buf(),
             shell_name,
-        })
+        };
+        // Windows shells query the terminal cursor before accepting input.
+        // Complete that short handshake so immediate keystrokes cannot arrive first.
+        for _ in 0..400 {
+            if terminal.poll() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Ok(terminal)
     }
 
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         while let Ok(bytes) = self.output.try_recv() {
-            self.push_output(&String::from_utf8_lossy(&bytes));
+            let cursor_position_requested = bytes.windows(4).any(|window| window == b"\x1b[6n");
+            self.parser.process(&bytes);
+            if cursor_position_requested {
+                let (row, column) = self.parser.screen().cursor_position();
+                let response = format!("\x1b[{};{}R", row + 1, column + 1);
+                if let Err(error) = self
+                    .input
+                    .write_all(response.as_bytes())
+                    .and_then(|()| self.input.flush())
+                {
+                    self.parser
+                        .process(format!("\r\n[PTY response failed: {error}]\r\n").as_bytes());
+                }
+            }
             changed = true;
         }
         if !self.exited && self.child.try_wait().ok().flatten().is_some() {
             self.exited = true;
-            self.push_line("[shell exited — use :terminal to restart]".to_string());
+            self.parser
+                .process(b"\r\n[shell exited -- use :terminal to restart]\r\n");
             changed = true;
         }
         changed
     }
 
+    pub fn resize(&mut self, rows: usize, columns: usize) {
+        let rows = rows.clamp(1, u16::MAX as usize) as u16;
+        let columns = columns.clamp(1, u16::MAX as usize) as u16;
+        if self.parser.screen().size() == (rows, columns) {
+            return;
+        }
+        let _ = self.master.resize(pty_size(rows, columns));
+        self.parser.screen_mut().set_size(rows, columns);
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> io::Result<()> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('l' | 'L') => {
-                    self.lines.clear();
-                    self.partial_line.clear();
-                    self.scroll = 0;
-                }
-                KeyCode::Char('c' | 'C') => {
-                    self.input.clear();
-                    self.cursor = 0;
-                    self.history_index = None;
-                    self.push_line("^C".to_string());
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-        match key.code {
-            KeyCode::Enter => self.submit()?,
-            KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    let previous = previous_boundary(&self.input, self.cursor);
-                    self.input.replace_range(previous..self.cursor, "");
-                    self.cursor = previous;
-                }
-            }
-            KeyCode::Delete => {
-                if self.cursor < self.input.len() {
-                    let next = next_boundary(&self.input, self.cursor);
-                    self.input.replace_range(self.cursor..next, "");
-                }
-            }
-            KeyCode::Left => self.cursor = previous_boundary(&self.input, self.cursor),
-            KeyCode::Right => self.cursor = next_boundary(&self.input, self.cursor),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.len(),
-            KeyCode::Up => self.history_move(false),
-            KeyCode::Down => self.history_move(true),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(5),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(5),
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::ALT) => {
-                self.input.insert(self.cursor, character);
-                self.cursor += character.len_utf8();
-            }
-            _ => {}
+        let bytes = key_bytes(key);
+        if !bytes.is_empty() {
+            self.input.write_all(&bytes)?;
+            self.input.flush()?;
+            self.parser.screen_mut().set_scrollback(0);
         }
         Ok(())
-    }
-
-    fn submit(&mut self) -> io::Result<()> {
-        let command = self.input.trim().to_string();
-        self.push_line(format!("> {command}"));
-        if !command.is_empty() {
-            if self.history.last() != Some(&command) { self.history.push(command.clone()); }
-            self.history.truncate(500);
-            self.input_stream.write_all(command.as_bytes())?;
-            self.input_stream.write_all(b"\n")?;
-            self.input_stream.flush()?;
-        }
-        self.input.clear();
-        self.cursor = 0;
-        self.history_index = None;
-        self.scroll = 0;
-        Ok(())
-    }
-
-    fn history_move(&mut self, forward: bool) {
-        if self.history.is_empty() { return; }
-        let index = match (self.history_index, forward) {
-            (None, false) => self.history.len() - 1,
-            (Some(index), false) => index.saturating_sub(1),
-            (Some(index), true) if index + 1 < self.history.len() => index + 1,
-            (_, true) => {
-                self.history_index = None;
-                self.input.clear();
-                self.cursor = 0;
-                return;
-            }
-        };
-        self.history_index = Some(index);
-        self.input = self.history[index].clone();
-        self.cursor = self.input.len();
-    }
-
-    fn push_output(&mut self, text: &str) {
-        let clean = strip_ansi(text).replace("\r\n", "\n").replace('\r', "\n");
-        for segment in clean.split_inclusive('\n') {
-            if let Some(line) = segment.strip_suffix('\n') {
-                self.partial_line.push_str(line);
-                let complete = std::mem::take(&mut self.partial_line);
-                self.push_line(complete);
-            } else {
-                self.partial_line.push_str(segment);
-            }
-        }
-        self.scroll = 0;
-    }
-
-    fn push_line(&mut self, line: String) {
-        self.lines.push_back(line);
-        while self.lines.len() > MAX_OUTPUT_LINES { self.lines.pop_front(); }
     }
 
     pub fn visible_lines(&self, rows: usize) -> Vec<String> {
-        let mut all = self.lines.iter().cloned().collect::<Vec<_>>();
-        if !self.partial_line.is_empty() { all.push(self.partial_line.clone()); }
-        let end = all.len().saturating_sub(self.scroll.min(all.len()));
-        let start = end.saturating_sub(rows);
-        all[start..end].to_vec()
+        let (_, columns) = self.parser.screen().size();
+        self.parser.screen().rows(0, columns).take(rows).collect()
     }
 
-    pub fn input(&self) -> &str { &self.input }
-    pub fn cursor_column(&self) -> usize { self.input[..self.cursor.min(self.input.len())].chars().count() + 2 }
-    pub fn is_exited(&self) -> bool { self.exited }
-    pub fn scroll_up(&mut self, rows: usize) { self.scroll = self.scroll.saturating_add(rows).min(self.lines.len()); }
-    pub fn scroll_down(&mut self, rows: usize) { self.scroll = self.scroll.saturating_sub(rows); }
+    pub fn cursor_position(&self) -> (usize, usize) {
+        let (row, column) = self.parser.screen().cursor_position();
+        (row as usize, column as usize)
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.exited
+    }
+
+    pub fn scroll_up(&mut self, rows: usize) {
+        let current = self.parser.screen().scrollback();
+        self.parser
+            .screen_mut()
+            .set_scrollback(current.saturating_add(rows));
+    }
+
+    pub fn scroll_down(&mut self, rows: usize) {
+        let current = self.parser.screen().scrollback();
+        self.parser
+            .screen_mut()
+            .set_scrollback(current.saturating_sub(rows));
+    }
 }
 
 impl Drop for TerminalPane {
-    fn drop(&mut self) { let _ = self.child.kill(); }
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
 }
 
-fn spawn_reader(mut reader: impl Read + Send + 'static, sender: mpsc::Sender<Vec<u8>>) {
+fn spawn_reader(mut reader: Box<dyn Read + Send>, sender: mpsc::Sender<Vec<u8>>) {
     thread::spawn(move || {
-        let mut buffer = [0u8; 4096];
-        while let Ok(count) = reader.read(&mut buffer) {
-            if count == 0 { break; }
-            if sender.send(buffer[..count].to_vec()).is_err() { break; }
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) if sender.send(buffer[..count].to_vec()).is_err() => break,
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = sender.send(format!("\r\n[PTY read failed: {error}]\r\n").into_bytes());
+                    break;
+                }
+            }
         }
     });
 }
 
+fn key_bytes(key: KeyEvent) -> Vec<u8> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(character) = key.code {
+            let lower = character.to_ascii_lowercase();
+            if lower.is_ascii_lowercase() {
+                return vec![(lower as u8) - b'a' + 1];
+            }
+            return match character {
+                '@' | ' ' => vec![0],
+                '[' => vec![27],
+                '\\' => vec![28],
+                ']' => vec![29],
+                '^' => vec![30],
+                '_' => vec![31],
+                _ => Vec::new(),
+            };
+        }
+    }
+
+    let mut bytes = Vec::new();
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        bytes.push(0x1b);
+    }
+    match key.code {
+        KeyCode::Char(character) => {
+            let mut encoded = [0; 4];
+            bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+        }
+        KeyCode::Enter => bytes.push(b'\r'),
+        KeyCode::Tab => bytes.push(b'\t'),
+        KeyCode::BackTab => bytes.extend_from_slice(b"\x1b[Z"),
+        KeyCode::Backspace => bytes.push(0x7f),
+        KeyCode::Esc => bytes.push(0x1b),
+        KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
+        KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
+        KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
+        KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
+        KeyCode::Home => bytes.extend_from_slice(b"\x1b[H"),
+        KeyCode::End => bytes.extend_from_slice(b"\x1b[F"),
+        KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
+        KeyCode::PageDown => bytes.extend_from_slice(b"\x1b[6~"),
+        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
+        KeyCode::Insert => bytes.extend_from_slice(b"\x1b[2~"),
+        KeyCode::F(number @ 1..=4) => {
+            bytes.extend_from_slice(format!("\x1bO{}", (b'P' + number - 1) as char).as_bytes())
+        }
+        KeyCode::F(number @ 5..=12) => {
+            const CODES: [&str; 8] = ["15", "17", "18", "19", "20", "21", "23", "24"];
+            bytes.extend_from_slice(format!("\x1b[{}~", CODES[(number - 5) as usize]).as_bytes());
+        }
+        _ => {}
+    }
+    bytes
+}
+
+fn pty_size(rows: u16, cols: u16) -> PtySize {
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+fn io_other(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
 #[cfg(windows)]
 fn shell_command() -> (String, Vec<String>, String) {
-    let program = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-    (program, vec!["/Q".to_string()], "Command Prompt".to_string())
+    if let Ok(program) = std::env::var("CARET_SHELL") {
+        let name = Path::new(&program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("shell")
+            .to_string();
+        return (program, Vec::new(), name);
+    }
+    (
+        "powershell.exe".to_string(),
+        vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
+        "PowerShell".to_string(),
+    )
 }
 
 #[cfg(not(windows))]
 fn shell_command() -> (String, Vec<String>, String) {
     let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let name = Path::new(&program).file_name().and_then(|name| name.to_str()).unwrap_or("shell").to_string();
+    let name = Path::new(&program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("shell")
+        .to_string();
     (program, Vec::new(), name)
-}
-
-fn strip_ansi(text: &str) -> String {
-    let mut output = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for next in chars.by_ref() {
-                    if ('@'..='~').contains(&next) { break; }
-                }
-            }
-            continue;
-        }
-        if character != '\u{8}' { output.push(character); }
-    }
-    output
-}
-
-fn previous_boundary(text: &str, index: usize) -> usize {
-    text[..index.min(text.len())].char_indices().last().map_or(0, |(offset, _)| offset)
-}
-
-fn next_boundary(text: &str, index: usize) -> usize {
-    text[index.min(text.len())..].chars().next().map_or(text.len(), |character| index + character.len_utf8())
 }
 
 #[cfg(test)]
@@ -255,28 +263,54 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn removes_common_ansi_control_sequences() {
-        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+    fn maps_terminal_control_and_navigation_keys() {
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            vec![3]
+        );
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
+            b"\x1bx"
+        );
     }
 
     #[test]
-    fn persistent_shell_executes_and_streams_output() {
+    fn pty_shell_executes_and_streams_output() {
         let cwd = std::env::current_dir().expect("current directory");
         let mut terminal = TerminalPane::start(&cwd).expect("start shell");
         for character in "echo CARET_TERMINAL_TEST".chars() {
-            terminal.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)).expect("type command");
+            terminal
+                .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .expect("type command");
         }
-        terminal.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).expect("submit command");
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("submit command");
 
         let mut found = false;
-        for _ in 0..40 {
+        for _ in 0..80 {
             terminal.poll();
-            if terminal.visible_lines(100).iter().any(|line| line.trim().ends_with("CARET_TERMINAL_TEST") && !line.contains("echo ")) {
+            if terminal
+                .parser
+                .screen()
+                .contents()
+                .lines()
+                .any(|line| line.trim() == "CARET_TERMINAL_TEST")
+            {
                 found = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        assert!(found, "shell output was not streamed back to the pane: {:?}", terminal.visible_lines(100));
+        assert!(
+            found,
+            "PTY output was not parsed (exited={}): {:?}",
+            terminal.exited,
+            terminal.visible_lines(100)
+        );
     }
 }

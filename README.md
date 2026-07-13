@@ -219,11 +219,29 @@ read.
 | `:set tabstop=4` | Change tab width |
 | `:theme oxide` / `:theme mono` | Change theme |
 
+## Coding intelligence
+
+Run `:lsp` in a saved C# or Rust file, then use the keyboard or matching
+commands:
+
+| Key / command | Action |
+|---|---|
+| `Ctrl-Space` / `:complete` | Filter and insert completions |
+| `:hover` | Show type and documentation |
+| `F12` / `:definition` | Go to definition |
+| `Shift-F12` / `:references` | Browse references |
+| `F2` / `:symbolrename name` | Rename a symbol across its workspace |
+| `Ctrl-.` / `:actions` | Browse and apply code actions |
+| `:diagnostics` | Browse errors and warnings |
+| `:format` | Format the document |
+
+Result panels support arrows, Page Up/Down, mouse hover/click, Enter, and Esc.
+
 ## Integrated terminal
 
 Press `Ctrl-Backtick` or run `:terminal` to open a persistent shell below the
-editor. The shell inherits the project folder and works through standard input
-and output, so it remains usable in SSH sessions without a desktop GUI.
+editor. The PTY shell inherits the project folder and remains usable in SSH
+sessions without a desktop GUI.
 
 | Key | Action |
 |---|---|
@@ -235,5 +253,13 @@ and output, so it remains usable in SSH sessions without a desktop GUI.
 | `Ctrl-C` | Clear the current terminal input |
 
 The pane is intended for shell commands, builds, tests, Git, and scripts.
-Full-screen terminal programs that require a PTY should be run in a separate
-terminal or tmux pane.
+The pane uses a real PTY/ConPTY, so interactive shells, terminal colors, and
+full-screen terminal programs work inside Caret. Set `CARET_SHELL` to override
+the default shell.
+
+## Plugins
+
+Run `:plugindir` to find the plugin directory, add a TOML manifest, and run
+`:pluginreload`. Plugins can contribute commands, language comment rules,
+themes, and save hooks. See [Caret plugins](docs/PLUGINS.md) and the
+[sample plugin](examples/plugins/sample.toml).

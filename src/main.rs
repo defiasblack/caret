@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod editor;
 mod lsp;
+mod plugin;
 mod project;
 mod syntax;
 mod tabs;
@@ -45,12 +46,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(
-            stdout(),
-            Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(stdout(), Show, DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -124,7 +120,10 @@ fn run<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
 fn main() {
     std::panic::set_hook(Box::new(|info| {
         let path = std::env::temp_dir().join("caret-panic.log");
-        let location = info.location().map(|location| format!("{}:{}", location.file(), location.line())).unwrap_or_else(|| "unknown location".to_string());
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_else(|| "unknown location".to_string());
         let _ = std::fs::write(path, format!("Caret panic at {location}\n{info}\n"));
     }));
     let path = parse_args();

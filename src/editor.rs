@@ -112,7 +112,9 @@ impl Editor {
             dirty: false,
             show_line_numbers: true,
             tab_width: 4,
-            disk_modified: fs::metadata(path).and_then(|metadata| metadata.modified()).ok(),
+            disk_modified: fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok(),
             external_change_pending: false,
             folded_ranges: BTreeMap::new(),
             undo: Vec::new(),
@@ -120,24 +122,6 @@ impl Editor {
             undo_group_active: false,
             preferred_column: None,
         })
-    }
-
-    pub fn open(&mut self, path: &Path) -> io::Result<()> {
-        let replacement = Self::new(Some(path))?;
-        let show_line_numbers = self.show_line_numbers;
-        let tab_width = self.tab_width;
-        *self = replacement;
-        self.show_line_numbers = show_line_numbers;
-        self.tab_width = tab_width;
-        Ok(())
-    }
-
-    pub fn new_buffer(&mut self) {
-        let show_line_numbers = self.show_line_numbers;
-        let tab_width = self.tab_width;
-        *self = Self::blank();
-        self.show_line_numbers = show_line_numbers;
-        self.tab_width = tab_width;
     }
 
     pub fn save(&mut self) -> io::Result<()> {
@@ -167,19 +151,29 @@ impl Editor {
 
         self.path = Some(path.to_path_buf());
         self.dirty = false;
-        self.disk_modified = fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
+        self.disk_modified = fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
         self.external_change_pending = false;
         Ok(())
     }
 
     pub fn changed_on_disk(&self) -> bool {
-        let Some(path) = &self.path else { return false; };
-        let modified = fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
+        let Some(path) = &self.path else {
+            return false;
+        };
+        let modified = fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
         modified.is_some() && modified != self.disk_modified
     }
 
     pub fn acknowledge_disk_change(&mut self) {
-        self.disk_modified = self.path.as_ref().and_then(|path| fs::metadata(path).and_then(|metadata| metadata.modified()).ok());
+        self.disk_modified = self.path.as_ref().and_then(|path| {
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        });
     }
 
     pub fn keep_disk_change(&mut self) {
@@ -187,12 +181,18 @@ impl Editor {
         self.external_change_pending = true;
     }
 
-    pub fn has_pending_external_change(&self) -> bool { self.external_change_pending }
+    pub fn has_pending_external_change(&self) -> bool {
+        self.external_change_pending
+    }
 
-    pub fn clear_pending_external_change(&mut self) { self.external_change_pending = false; }
+    pub fn clear_pending_external_change(&mut self) {
+        self.external_change_pending = false;
+    }
 
     pub fn reload_from_disk(&mut self) -> io::Result<()> {
-        let Some(path) = self.path.clone() else { return Ok(()); };
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
         let replacement = Self::from_file(&path)?;
         let show_line_numbers = self.show_line_numbers;
         let tab_width = self.tab_width;
@@ -1071,16 +1071,8 @@ impl Editor {
             self.buffer.len_chars()
         };
 
-        if insertion == self.buffer.len_chars()
-            && insertion > 0
-            && self.buffer.char(insertion - 1) != '\n'
-        {
-            self.buffer.insert_char(insertion, '\n');
-            self.cursor.line += 1;
-        } else {
-            self.buffer.insert_char(insertion, '\n');
-            self.cursor.line += 1;
-        }
+        self.buffer.insert_char(insertion, '\n');
+        self.cursor.line += 1;
 
         self.cursor.column = 0;
         self.dirty = true;

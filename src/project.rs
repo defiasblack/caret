@@ -1,7 +1,6 @@
 use std::{
     collections::HashSet,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -19,7 +18,12 @@ pub struct ProjectEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitStatus { Modified, Added, Deleted, Untracked }
+pub enum GitStatus {
+    Modified,
+    Added,
+    Deleted,
+    Untracked,
+}
 
 #[derive(Debug)]
 pub struct ProjectTree {
@@ -66,12 +70,6 @@ impl ProjectTree {
         self.entries.get(self.selected)
     }
 
-    pub fn selected_relative_path(&self) -> Option<PathBuf> {
-        self.selected_entry()
-            .and_then(|entry| entry.path.strip_prefix(&self.root).ok())
-            .map(Path::to_path_buf)
-    }
-
     pub fn refresh(&mut self) -> io::Result<()> {
         let selected_path = self.selected_entry().map(|entry| entry.path.clone());
         let mut entries = Vec::new();
@@ -101,19 +99,40 @@ impl ProjectTree {
     }
 
     pub fn refresh_git_status(&mut self) {
-        let Ok(output) = Command::new("git").args(["-C"]).arg(&self.root).args(["status", "--porcelain"]).output() else { return; };
-        if !output.status.success() { return; }
-        for entry in &mut self.entries { entry.git_status = None; }
+        let Ok(output) = Command::new("git")
+            .args(["-C"])
+            .arg(&self.root)
+            .args(["status", "--porcelain"])
+            .output()
+        else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        for entry in &mut self.entries {
+            entry.git_status = None;
+        }
         for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if line.len() < 4 { continue; }
+            if line.len() < 4 {
+                continue;
+            }
             let code = &line[..2];
             let path = self.root.join(&line[3..]);
-            let status = if code == "??" { Some(GitStatus::Untracked) }
-                else if code.contains('D') { Some(GitStatus::Deleted) }
-                else if code.contains('A') { Some(GitStatus::Added) }
-                else if code.contains('M') { Some(GitStatus::Modified) }
-                else { None };
-            if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) { entry.git_status = status; }
+            let status = if code == "??" {
+                Some(GitStatus::Untracked)
+            } else if code.contains('D') {
+                Some(GitStatus::Deleted)
+            } else if code.contains('A') {
+                Some(GitStatus::Added)
+            } else if code.contains('M') {
+                Some(GitStatus::Modified)
+            } else {
+                None
+            };
+            if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
+                entry.git_status = status;
+            }
         }
     }
 
@@ -419,13 +438,7 @@ fn collect_entries(
         });
 
         if is_expanded {
-            collect_entries(
-                &child.path,
-                depth + 1,
-                expanded,
-                show_hidden,
-                output,
-            )?;
+            collect_entries(&child.path, depth + 1, expanded, show_hidden, output)?;
         }
     }
 

@@ -1,24 +1,6 @@
 # Caret Roadmap
 
-This list tracks Caret features that remain after the completed productivity
-milestone.
-
-## Editing
-
-
-## Coding intelligence
-
-- Language Server Protocol integration: completion, hover, definitions,
-  references, rename, formatting, code actions, and diagnostics
-
-## Project workflow
-
-
-## Customization and ecosystem
-
-- Plugin API for commands, languages, themes, and editor behavior
-
-## Polish
+The productivity roadmap is complete. Remaining known issues are tracked below.
 
 
 ## Known bugs

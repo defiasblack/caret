@@ -279,32 +279,52 @@ pub fn fold_ranges(source: &str, language: Language) -> Vec<(usize, usize)> {
 }
 
 pub fn symbols(source: &str, language: Language) -> Vec<Symbol> {
-    let Some(tree_language) = tree_sitter_language(language) else { return Vec::new(); };
+    let Some(tree_language) = tree_sitter_language(language) else {
+        return Vec::new();
+    };
     let mut parser = Parser::new();
-    if parser.set_language(&tree_language).is_err() { return Vec::new(); }
-    let Some(tree) = parser.parse(source, None) else { return Vec::new(); };
+    if parser.set_language(&tree_language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
     let mut output = Vec::new();
     collect_symbols(tree.root_node(), source, 0, &mut output);
     output
 }
 
 pub fn breadcrumbs(source: &str, language: Language, line: usize) -> Vec<Symbol> {
-    symbols(source, language).into_iter().filter(|symbol|
-        symbol.start_line <= line && line <= symbol.end_line).collect()
+    symbols(source, language)
+        .into_iter()
+        .filter(|symbol| symbol.start_line <= line && line <= symbol.end_line)
+        .collect()
 }
 
 fn collect_symbols(node: Node<'_>, source: &str, depth: usize, output: &mut Vec<Symbol>) {
     if let Some(kind) = symbol_kind(node.kind()) {
-        let name = node.child_by_field_name("name")
+        let name = node
+            .child_by_field_name("name")
             .or_else(|| first_identifier(node))
             .and_then(|name| name.utf8_text(source.as_bytes()).ok())
             .unwrap_or(node.kind())
             .to_string();
-        output.push(Symbol { name, kind, start_line: node.start_position().row, end_line: node.end_position().row, depth });
+        output.push(Symbol {
+            name,
+            kind,
+            start_line: node.start_position().row,
+            end_line: node.end_position().row,
+            depth,
+        });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_symbols(child, source, depth + usize::from(symbol_kind(node.kind()).is_some()), output);
+        collect_symbols(
+            child,
+            source,
+            depth + usize::from(symbol_kind(node.kind()).is_some()),
+            output,
+        );
     }
 }
 
@@ -319,9 +339,14 @@ fn first_identifier(node: Node<'_>) -> Option<Node<'_>> {
 fn symbol_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "namespace_declaration" | "file_scoped_namespace_declaration" | "module" => Some("module"),
-        "class_declaration" | "struct_declaration" | "interface_declaration" | "enum_declaration"
+        "class_declaration"
+        | "struct_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
         | "record_declaration" => Some("type"),
-        "function_declaration" | "function_definition" | "method_declaration"
+        "function_declaration"
+        | "function_definition"
+        | "method_declaration"
         | "constructor_declaration" => Some("function"),
         _ => None,
     }
@@ -776,6 +801,11 @@ mod tests {
         assert!(symbols.iter().any(|symbol| symbol.name == "Demo"));
         assert!(symbols.iter().any(|symbol| symbol.name == "Program"));
         assert!(symbols.iter().any(|symbol| symbol.name == "Run"));
-        assert_eq!(breadcrumbs(source, Language::CSharp, 0).last().map(|symbol| symbol.name.as_str()), Some("Run"));
+        assert_eq!(
+            breadcrumbs(source, Language::CSharp, 0)
+                .last()
+                .map(|symbol| symbol.name.as_str()),
+            Some("Run")
+        );
     }
 }
