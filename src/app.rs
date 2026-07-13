@@ -154,10 +154,12 @@ impl App {
             command_input: String::new(),
             search_input: String::new(),
             last_search: String::new(),
-            message: config_message.unwrap_or_else(|| if explorer_focused {
-                "FILES · Enter opens · Ctrl-E returns to editor".to_string()
-            } else {
-                "-- INSERT -- · Ctrl-E opens files · Ctrl-S saves".to_string()
+            message: config_message.unwrap_or_else(|| {
+                if explorer_focused {
+                    "FILES · Enter opens · Ctrl-E returns to editor".to_string()
+                } else {
+                    "-- INSERT -- · Ctrl-E opens files · Ctrl-S saves".to_string()
+                }
             }),
             theme_kind: settings.theme,
             theme: Theme::for_kind(settings.theme),
@@ -203,7 +205,8 @@ impl App {
                         | MouseEventKind::Down(MouseButton::Left)
                         | MouseEventKind::Down(MouseButton::Right)
                         | MouseEventKind::Drag(MouseButton::Left)
-                ) => {
+                ) =>
+            {
                 self.handle_mouse(mouse);
                 true
             }
@@ -238,8 +241,7 @@ impl App {
         let over_sidebar = layout.sidebar_width > 0
             && (mouse.column as usize) < layout.sidebar_width
             && mouse.row >= layout.content_top
-            && (mouse.row as usize)
-                < layout.content_top as usize + layout.content_height;
+            && (mouse.row as usize) < layout.content_top as usize + layout.content_height;
 
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -371,9 +373,9 @@ impl App {
             return;
         }
 
-        // Editor area: clicking the gutter moves to column zero. Clicking text
-        // translates the visual screen column (including tabs and wide Unicode)
-        // into the nearest character position.
+        // Editor area: the fold column is clickable; other gutter clicks move
+        // to column zero. Text clicks translate the visual screen column
+        // (including tabs and wide Unicode) into the nearest character.
         let editor_end = layout.editor_x + layout.editor_width;
         let column = column as usize;
 
@@ -388,9 +390,25 @@ impl App {
         self.pending_key = None;
 
         let screen_row = (row - layout.content_top) as usize;
-        let line = (self.editor.scroll_line + screen_row)
-            .min(self.editor.line_count().saturating_sub(1));
+        let line = self
+            .editor
+            .visible_line_at(self.editor.scroll_line, screen_row)
+            .unwrap_or_else(|| self.editor.line_count().saturating_sub(1));
         let local_x = column.saturating_sub(layout.editor_x);
+        let clicked_fold_control = layout.gutter_width >= 2
+            && local_x >= layout.gutter_width.saturating_sub(2)
+            && local_x < layout.gutter_width;
+
+        if clicked_fold_control {
+            self.editor.clear_selection();
+            self.editor.finish_undo_group();
+            self.editor.set_cursor_from_display_position(line, 0);
+            self.mode = Mode::Normal;
+            self.toggle_fold();
+            self.search_origin = self.editor.cursor;
+            return;
+        }
+
         let display_column = if local_x < layout.gutter_width {
             0
         } else {
@@ -436,15 +454,18 @@ impl App {
         self.editor.finish_undo_group();
         self.editor.begin_selection();
         let screen_row = (row - layout.content_top) as usize;
-        let line = (self.editor.scroll_line + screen_row)
-            .min(self.editor.line_count().saturating_sub(1));
+        let line = self
+            .editor
+            .visible_line_at(self.editor.scroll_line, screen_row)
+            .unwrap_or_else(|| self.editor.line_count().saturating_sub(1));
         let local_x = column - layout.editor_x;
         let display_column = if local_x < layout.gutter_width {
             0
         } else {
             self.editor.scroll_column + local_x - layout.gutter_width
         };
-        self.editor.set_cursor_from_display_position(line, display_column);
+        self.editor
+            .set_cursor_from_display_position(line, display_column);
     }
 
     fn toggle_file_tree(&mut self) {
@@ -525,23 +546,21 @@ impl App {
             Mode::Insert => self.handle_insert(key),
             Mode::Search => self.handle_search(key),
             Mode::Command => self.handle_command_input(key),
-            Mode::Help => {
-                match key.code {
-                    KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
-                        self.mode = Mode::Normal;
-                    }
-                    KeyCode::Left | KeyCode::Up | KeyCode::PageUp => {
-                        self.help_page = self.help_page.saturating_sub(1);
-                    }
-                    KeyCode::Right | KeyCode::Down | KeyCode::PageDown => {
-                        self.help_page = (self.help_page + 1).min(3);
-                    }
-                    KeyCode::Char(page @ '1'..='4') => {
-                        self.help_page = page.to_digit(10).unwrap_or(1) as usize - 1;
-                    }
-                    _ => {}
+            Mode::Help => match key.code {
+                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
+                    self.mode = Mode::Normal;
                 }
-            }
+                KeyCode::Left | KeyCode::Up | KeyCode::PageUp => {
+                    self.help_page = self.help_page.saturating_sub(1);
+                }
+                KeyCode::Right | KeyCode::Down | KeyCode::PageDown => {
+                    self.help_page = (self.help_page + 1).min(3);
+                }
+                KeyCode::Char(page @ '1'..='4') => {
+                    self.help_page = page.to_digit(10).unwrap_or(1) as usize - 1;
+                }
+                _ => {}
+            },
             Mode::QuitConfirm => {}
         }
     }
@@ -573,7 +592,8 @@ impl App {
             MacroPrefix::Record => {
                 self.recording_macro = Some(register);
                 self.macros.insert(register, Vec::new());
-                self.message = format!("Recording macro @{register}; press q in Normal mode to stop");
+                self.message =
+                    format!("Recording macro @{register}; press q in Normal mode to stop");
             }
             MacroPrefix::Replay => {
                 if let Some(recording) = self.recording_macro.filter(|_| !self.replaying_macro) {
@@ -788,6 +808,51 @@ impl App {
         };
     }
 
+    fn available_fold_ranges(&self) -> Vec<(usize, usize)> {
+        let language = Language::from_path(self.editor.path.as_deref());
+        crate::syntax::fold_ranges(&self.editor.text(), language)
+    }
+
+    fn close_fold(&mut self) {
+        let ranges = self.available_fold_ranges();
+        self.message = if self.editor.close_fold(&ranges) {
+            "Fold closed"
+        } else {
+            "No fold at cursor"
+        }
+        .to_string();
+    }
+
+    fn open_fold(&mut self) {
+        self.message = if self.editor.open_fold() {
+            "Fold opened"
+        } else {
+            "No closed fold at cursor"
+        }
+        .to_string();
+    }
+
+    fn toggle_fold(&mut self) {
+        let ranges = self.available_fold_ranges();
+        self.message = match self.editor.toggle_fold(&ranges) {
+            Some(true) => "Fold closed",
+            Some(false) => "Fold opened",
+            None => "No fold at cursor",
+        }
+        .to_string();
+    }
+
+    fn close_all_folds(&mut self) {
+        let ranges = self.available_fold_ranges();
+        let count = self.editor.close_all_folds(&ranges);
+        self.message = format!("Closed {count} fold(s)");
+    }
+
+    fn open_all_folds(&mut self) {
+        let count = self.editor.open_all_folds();
+        self.message = format!("Opened {count} fold(s)");
+    }
+
     fn new_tab(&mut self, path: Option<PathBuf>) {
         let before = self.current_location();
         match path {
@@ -983,17 +1048,13 @@ impl App {
                     self.message = format!("Folder error: {error}");
                 }
             }
-            KeyCode::Left | KeyCode::Char('h')
-                if key.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
+            KeyCode::Left | KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 match self.project.collapse_selected_recursive() {
                     Ok(count) => self.message = format!("Collapsed {count} folder(s)"),
                     Err(error) => self.message = format!("Folder error: {error}"),
                 }
             }
-            KeyCode::Right | KeyCode::Char('l')
-                if key.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
+            KeyCode::Right | KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 match self.project.expand_selected_one_level() {
                     Ok(count) => self.message = format!("Expanded {count} folder(s)"),
                     Err(error) => self.message = format!("Folder error: {error}"),
@@ -1041,18 +1102,20 @@ impl App {
             Ok(Some(path)) => {
                 let before = self.current_location();
                 match self.editor.open_or_switch(&path) {
-                Ok(disposition) => {
-                    self.commit_navigation(before);
-                    self.explorer_focused = false;
-                    self.mode = Mode::Insert;
-                    self.pending_key = None;
-                    self.search_origin = self.editor.cursor;
-                    self.message = match disposition {
-                        OpenDisposition::Opened => format!("Opened {} in a new tab", path.display()),
-                        OpenDisposition::Switched => format!("Switched to {}", path.display()),
-                    };
-                }
-                Err(error) => self.message = format!("Open failed: {error}"),
+                    Ok(disposition) => {
+                        self.commit_navigation(before);
+                        self.explorer_focused = false;
+                        self.mode = Mode::Insert;
+                        self.pending_key = None;
+                        self.search_origin = self.editor.cursor;
+                        self.message = match disposition {
+                            OpenDisposition::Opened => {
+                                format!("Opened {} in a new tab", path.display())
+                            }
+                            OpenDisposition::Switched => format!("Switched to {}", path.display()),
+                        };
+                    }
+                    Err(error) => self.message = format!("Open failed: {error}"),
                 }
             }
             Ok(None) => {}
@@ -1157,6 +1220,26 @@ impl App {
                     self.editor.move_file_start();
                     return;
                 }
+                ('z', KeyCode::Char('c')) => {
+                    self.close_fold();
+                    return;
+                }
+                ('z', KeyCode::Char('o')) => {
+                    self.open_fold();
+                    return;
+                }
+                ('z', KeyCode::Char('a')) => {
+                    self.toggle_fold();
+                    return;
+                }
+                ('z', KeyCode::Char('M')) => {
+                    self.close_all_folds();
+                    return;
+                }
+                ('z', KeyCode::Char('R')) => {
+                    self.open_all_folds();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1205,6 +1288,7 @@ impl App {
             KeyCode::Char('b') => self.editor.move_word_backward(),
             KeyCode::Char('G') => self.editor.move_file_end(),
             KeyCode::Char('g') => self.pending_key = Some('g'),
+            KeyCode::Char('z') => self.pending_key = Some('z'),
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.indent_selection(true)
             }
@@ -1259,8 +1343,9 @@ impl App {
                     self.message = "No matching bracket".to_string();
                 }
             }
-            KeyCode::Char(':')
-            | KeyCode::Char(';') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Char(':') | KeyCode::Char(';')
+                if key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
                 self.command_input.clear();
                 self.mode = Mode::Command;
             }
@@ -1270,7 +1355,8 @@ impl App {
 
     fn enter_insert(&mut self, after: bool) {
         self.editor.checkpoint();
-        if after && self.editor.cursor.column < self.editor.line_len_chars(self.editor.cursor.line) {
+        if after && self.editor.cursor.column < self.editor.line_len_chars(self.editor.cursor.line)
+        {
             self.editor.move_right();
         }
         self.mode = Mode::Insert;
@@ -1383,7 +1469,9 @@ impl App {
                 }
             }
             KeyCode::Char(character)
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.editor.insert_char(character);
             }
@@ -1451,7 +1539,9 @@ impl App {
                 self.preview_search();
             }
             KeyCode::Char(character)
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.search_input.push(character);
                 self.preview_search();
@@ -1495,7 +1585,9 @@ impl App {
                 self.command_input.pop();
             }
             KeyCode::Char(character)
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.command_input.push(character);
             }
@@ -1689,6 +1781,11 @@ impl App {
             "indent" => self.indent_selection(false),
             "outdent" => self.indent_selection(true),
             "comment" | "togglecomment" => self.toggle_comments(),
+            "fold" | "foldclose" => self.close_fold(),
+            "foldopen" => self.open_fold(),
+            "foldtoggle" => self.toggle_fold(),
+            "foldall" => self.close_all_folds(),
+            "unfoldall" => self.open_all_folds(),
             "expandall" | "treeexpand" => match self.project.expand_all() {
                 Ok(count) => self.message = format!("Expanded {count} folder(s)"),
                 Err(error) => self.message = format!("Expand all failed: {error}"),
@@ -1823,10 +1920,7 @@ impl App {
                     _ => self.message = "Tree width must be between 22 and 80".to_string(),
                 }
             }
-            _ => {
-                self.message =
-                    "Try :set number, :set tabstop=4, or :set treewidth=40".to_string()
-            }
+            _ => self.message = "Try :set number, :set tabstop=4, or :set treewidth=40".to_string(),
         }
     }
 
@@ -1883,17 +1977,24 @@ impl App {
 
     fn sync_lsp_document(&mut self) {
         let Some(lsp) = &self.lsp else { return };
-        if !self.lsp_initialized { return };
-        let Some(path) = self.editor.path.as_ref() else { return };
+        if !self.lsp_initialized {
+            return;
+        };
+        let Some(path) = self.editor.path.as_ref() else {
+            return;
+        };
         let text = self.editor.text();
         if text == self.lsp_last_text {
             return;
         }
         self.lsp_version += 1;
-        let _ = lsp.notify("textDocument/didChange", json!({
-            "textDocument": { "uri": lsp::file_uri(path), "version": self.lsp_version },
-            "contentChanges": [{ "text": text }]
-        }));
+        let _ = lsp.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": lsp::file_uri(path), "version": self.lsp_version },
+                "contentChanges": [{ "text": text }]
+            }),
+        );
         self.lsp_last_text = self.editor.text();
     }
 
@@ -1902,7 +2003,10 @@ impl App {
             self.message = "LSP is still loading the workspace".to_string();
             return;
         }
-        let Some(path) = self.editor.path.as_ref() else { self.message = "Save the buffer before using LSP".to_string(); return };
+        let Some(path) = self.editor.path.as_ref() else {
+            self.message = "Save the buffer before using LSP".to_string();
+            return;
+        };
         let mut params = json!({
             "textDocument": { "uri": lsp::file_uri(path) },
             "position": { "line": self.editor.cursor.line, "character": self.editor.cursor.column }
@@ -1916,7 +2020,15 @@ impl App {
             });
             params["context"] = json!({ "diagnostics": [] });
         }
-        match self.lsp.as_mut().ok_or_else(|| "Start LSP first with :lsp".to_string()).and_then(|client| client.request(method, params).map_err(|error| error.to_string())) {
+        match self
+            .lsp
+            .as_mut()
+            .ok_or_else(|| "Start LSP first with :lsp".to_string())
+            .and_then(|client| {
+                client
+                    .request(method, params)
+                    .map_err(|error| error.to_string())
+            }) {
             Ok(id) => {
                 self.lsp_requests.insert(id, method.to_string());
                 self.message = format!("LSP request: {method}");
@@ -1926,11 +2038,23 @@ impl App {
     }
 
     fn request_formatting(&mut self) {
-        let Some(path) = self.editor.path.as_ref() else { self.message = "Save the buffer before formatting".to_string(); return };
+        let Some(path) = self.editor.path.as_ref() else {
+            self.message = "Save the buffer before formatting".to_string();
+            return;
+        };
         let params = json!({ "textDocument": { "uri": lsp::file_uri(path) }, "options": { "tabSize": self.editor.tab_width, "insertSpaces": true } });
-        match self.lsp.as_mut().ok_or_else(|| "Start LSP first with :lsp".to_string()).and_then(|client| client.request("textDocument/formatting", params).map_err(|error| error.to_string())) {
+        match self
+            .lsp
+            .as_mut()
+            .ok_or_else(|| "Start LSP first with :lsp".to_string())
+            .and_then(|client| {
+                client
+                    .request("textDocument/formatting", params)
+                    .map_err(|error| error.to_string())
+            }) {
             Ok(id) => {
-                self.lsp_requests.insert(id, "textDocument/formatting".to_string());
+                self.lsp_requests
+                    .insert(id, "textDocument/formatting".to_string());
                 self.message = "LSP formatting requested".to_string();
             }
             Err(error) => self.message = error,
@@ -1965,13 +2089,20 @@ impl App {
                     json!(vec![json!({}); count])
                 }
                 "workspace/workspaceFolders" => {
-                    let root = self.editor.path.as_deref().and_then(lsp_workspace_root).unwrap_or_else(|| self.project.root.clone());
+                    let root = self
+                        .editor
+                        .path
+                        .as_deref()
+                        .and_then(lsp_workspace_root)
+                        .unwrap_or_else(|| self.project.root.clone());
                     json!([{
                         "uri": lsp::file_uri(&root),
                         "name": root.file_name().and_then(|name| name.to_str()).unwrap_or("workspace")
                     }])
                 }
-                "client/registerCapability" | "client/unregisterCapability" | "window/workDoneProgress/create" => json!(null),
+                "client/registerCapability"
+                | "client/unregisterCapability"
+                | "window/workDoneProgress/create" => json!(null),
                 _ => json!(null),
             };
             if let Some(lsp) = &self.lsp {
@@ -1979,14 +2110,19 @@ impl App {
             }
             return;
         }
-        let request = message.get("id").and_then(|id| id.as_u64()).and_then(|id| self.lsp_requests.remove(&id));
+        let request = message
+            .get("id")
+            .and_then(|id| id.as_u64())
+            .and_then(|id| self.lsp_requests.remove(&id));
         if message.get("id").and_then(|id| id.as_u64()) == Some(1) {
             let Some(lsp) = &self.lsp else { return };
             if lsp.notify("initialized", json!({})).is_err() {
                 self.message = "LSP initialization failed".to_string();
                 return;
             }
-            let Some(path) = self.editor.path.as_ref() else { return };
+            let Some(path) = self.editor.path.as_ref() else {
+                return;
+            };
             let language_id = lsp_language_id(crate::syntax::Language::from_path(Some(path)));
             if lsp.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lsp::file_uri(path), "languageId": language_id, "version": 1, "text": self.editor.text() } })).is_ok() {
                 self.lsp_initialized = true;
@@ -2000,9 +2136,18 @@ impl App {
             return;
         }
         if request.as_deref() == Some("textDocument/definition") {
-            let location = message["result"].as_array().and_then(|locations| locations.first()).unwrap_or(&message["result"]);
-            let uri = location["uri"].as_str().or_else(|| location["targetUri"].as_str());
-            let range = if location["range"].is_object() { &location["range"] } else { &location["targetSelectionRange"] };
+            let location = message["result"]
+                .as_array()
+                .and_then(|locations| locations.first())
+                .unwrap_or(&message["result"]);
+            let uri = location["uri"]
+                .as_str()
+                .or_else(|| location["targetUri"].as_str());
+            let range = if location["range"].is_object() {
+                &location["range"]
+            } else {
+                &location["targetSelectionRange"]
+            };
             if let (Some(uri), Some(line), Some(character)) = (
                 uri,
                 range["start"]["line"].as_u64(),
@@ -2022,8 +2167,12 @@ impl App {
             self.message = "No definition found at cursor".to_string();
             return;
         }
-        if message.get("method").and_then(|value| value.as_str()) == Some("textDocument/publishDiagnostics") {
-            let count = message["params"]["diagnostics"].as_array().map_or(0, Vec::len);
+        if message.get("method").and_then(|value| value.as_str())
+            == Some("textDocument/publishDiagnostics")
+        {
+            let count = message["params"]["diagnostics"]
+                .as_array()
+                .map_or(0, Vec::len);
             self.message = format!("LSP diagnostics: {count}");
         } else if let Some(result) = message.get("result") {
             let text = result["contents"]
@@ -2031,7 +2180,13 @@ impl App {
                 .map(str::to_string)
                 .or_else(|| result["contents"]["value"].as_str().map(str::to_string))
                 .unwrap_or_else(|| result.to_string());
-            self.message = format!("LSP: {}", text.replace('\n', " ").chars().take(120).collect::<String>());
+            self.message = format!(
+                "LSP: {}",
+                text.replace('\n', " ")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            );
         }
     }
 
@@ -2126,11 +2281,7 @@ impl App {
         let dirty = self.editor.dirty_titles();
         self.explorer_focused = false;
         self.mode = Mode::QuitConfirm;
-        self.message = format!(
-            "{} unsaved tab(s): {}",
-            dirty.len(),
-            dirty.join(", ")
-        );
+        self.message = format!("{} unsaved tab(s): {}", dirty.len(), dirty.join(", "));
     }
 }
 
@@ -2141,10 +2292,13 @@ fn lsp_workspace_root(path: &Path) -> Option<PathBuf> {
             .ok()?
             .filter_map(Result::ok)
             .any(|entry| {
-                entry.path()
+                entry
+                    .path()
                     .extension()
                     .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "sln" | "csproj"))
+                    .is_some_and(|extension| {
+                        matches!(extension.to_ascii_lowercase().as_str(), "sln" | "csproj")
+                    })
             });
         if has_workspace_file {
             return Some(directory);
@@ -2185,7 +2339,14 @@ mod tests {
         let mut app = App::new(None).expect("create app");
         app.mode = Mode::Normal;
 
-        for key in [key('q'), key('a'), key('i'), key('x'), KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), key('q')] {
+        for key in [
+            key('q'),
+            key('a'),
+            key('i'),
+            key('x'),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            key('q'),
+        ] {
             app.handle_key(key);
         }
         assert_eq!(app.editor.line_text(0), "x");

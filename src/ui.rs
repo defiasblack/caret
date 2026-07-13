@@ -4,8 +4,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     queue,
     style::{
-        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor,
-        SetForegroundColor,
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
     },
     terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate},
 };
@@ -99,20 +98,8 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     draw_tab_bar(out, app, 1, width)?;
 
     if sidebar_width > 0 {
-        draw_project_tree(
-            out,
-            app,
-            content_top,
-            content_height,
-            sidebar_width,
-        )?;
-        draw_vertical_separator(
-            out,
-            app,
-            sidebar_width as u16,
-            content_top,
-            content_height,
-        )?;
+        draw_project_tree(out, app, content_top, content_height, sidebar_width)?;
+        draw_vertical_separator(out, app, sidebar_width as u16, content_top, content_height)?;
     }
 
     draw_editor(
@@ -210,12 +197,7 @@ fn draw_top_bar<W: Write>(out: &mut W, app: &App, width: u16) -> io::Result<()> 
     Ok(())
 }
 
-fn draw_tab_bar<W: Write>(
-    out: &mut W,
-    app: &App,
-    row: u16,
-    width: u16,
-) -> io::Result<()> {
+fn draw_tab_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
     let available = width as usize;
     queue!(
         out,
@@ -311,7 +293,11 @@ fn draw_tab_bar<W: Write>(
 }
 
 fn tab_label(app: &App, index: usize) -> String {
-    let dirty = if app.editor.tab_dirty(index) { " ●" } else { "" };
+    let dirty = if app.editor.tab_dirty(index) {
+        " ●"
+    } else {
+        ""
+    };
     let title = compact_text(&app.editor.tab_title(index), 24);
     format!(" {} {}{} ", index + 1, title, dirty)
 }
@@ -450,7 +436,11 @@ fn draw_project_tree<W: Write>(
         };
 
         let icon = if entry.is_dir {
-            if entry.expanded { "▾" } else { "▸" }
+            if entry.expanded {
+                "▾"
+            } else {
+                "▸"
+            }
         } else if active_file {
             "●"
         } else {
@@ -460,10 +450,7 @@ fn draw_project_tree<W: Write>(
         let branch = "├─";
         let suffix = if entry.is_dir { "/" } else { "" };
         let kind = if entry.is_dir { "DIR" } else { "   " };
-        let label = format!(
-            " {indent}{branch}{icon} {kind} {}{suffix}",
-            entry.name
-        );
+        let label = format!(" {indent}{branch}{icon} {kind} {}{suffix}", entry.name);
 
         queue!(
             out,
@@ -513,10 +500,13 @@ fn draw_editor<W: Write>(
 ) -> io::Result<()> {
     let language = Language::from_path(app.editor.path.as_deref());
     let search_query = app.active_search_query();
+    let fold_ranges = syntax::fold_ranges(&app.editor.text(), language);
 
     for screen_row in 0..rows {
         let terminal_row = top + screen_row as u16;
-        let line_index = app.editor.scroll_line + screen_row;
+        let line_index = app
+            .editor
+            .visible_line_at(app.editor.scroll_line, screen_row);
 
         queue!(
             out,
@@ -526,7 +516,7 @@ fn draw_editor<W: Write>(
             Print(" ".repeat(editor_width as usize))
         )?;
 
-        if line_index >= app.editor.line_count() {
+        let Some(line_index) = line_index else {
             if gutter_width > 0 {
                 queue!(
                     out,
@@ -536,7 +526,7 @@ fn draw_editor<W: Write>(
                 )?;
             }
             continue;
-        }
+        };
 
         let is_current = line_index == app.editor.cursor.line;
         let line_background = if is_current {
@@ -553,7 +543,14 @@ fn draw_editor<W: Write>(
 
         if gutter_width > 0 {
             let number_width = gutter_width.saturating_sub(2);
-            let number = format!("{:>width$}  ", line_index + 1, width = number_width);
+            let marker = if app.editor.folded_end(line_index).is_some() {
+                "▶"
+            } else if fold_ranges.iter().any(|(start, _)| *start == line_index) {
+                "▼"
+            } else {
+                " "
+            };
+            let number = format!("{:>width$}{marker} ", line_index + 1, width = number_width);
             let number_color = if is_current {
                 app.theme.gutter_current
             } else {
@@ -586,6 +583,23 @@ fn draw_editor<W: Write>(
             line_start,
             &selections,
         )?;
+
+        if let Some(end) = app.editor.folded_end(line_index) {
+            let label = format!("  ⋯ {} lines folded", end - line_index);
+            let text_column = display_width(&line, app.editor.tab_width);
+            if text_column >= app.editor.scroll_column {
+                let screen_column = text_column - app.editor.scroll_column;
+                if screen_column < text_width {
+                    queue!(
+                        out,
+                        MoveTo(editor_x + gutter_width as u16 + screen_column as u16, terminal_row),
+                        SetBackgroundColor(line_background),
+                        SetForegroundColor(app.theme.muted),
+                        Print(pad_or_truncate(&label, text_width - screen_column))
+                    )?;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -637,9 +651,9 @@ fn render_line_text<W: Write>(
         }
 
         let highlighted = search_hits.get(character_index).copied().unwrap_or(false);
-        let selected = selections.iter().any(|(start, end)| {
-            (*start..*end).contains(&(line_start + character_index))
-        });
+        let selected = selections
+            .iter()
+            .any(|(start, end)| (*start..*end).contains(&(line_start + character_index)));
         let foreground = if highlighted {
             search_foreground
         } else {
@@ -695,12 +709,7 @@ fn render_line_text<W: Write>(
     Ok(())
 }
 
-fn draw_status_bar<W: Write>(
-    out: &mut W,
-    app: &App,
-    row: u16,
-    width: u16,
-) -> io::Result<()> {
+fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
     let mode_color = if app.explorer_focused {
         app.theme.normal_mode
     } else {
@@ -725,7 +734,10 @@ fn draw_status_bar<W: Write>(
     let right = if app.explorer_focused {
         format!(
             " {}/{} items  ",
-            app.project.selected.saturating_add(1).min(app.project.entries.len()),
+            app.project
+                .selected
+                .saturating_add(1)
+                .min(app.project.entries.len()),
             app.project.entries.len()
         )
     } else {
@@ -747,12 +759,7 @@ fn draw_status_bar<W: Write>(
     )
 }
 
-fn draw_prompt_bar<W: Write>(
-    out: &mut W,
-    app: &App,
-    row: u16,
-    width: u16,
-) -> io::Result<()> {
+fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
     let (prompt, background, foreground) = match app.mode {
         Mode::Search => (
             format!("/{}", app.search_input),
@@ -770,9 +777,7 @@ fn draw_prompt_bar<W: Write>(
             app.theme.prompt_text,
         ),
         Mode::QuitConfirm => (
-            format!(
-                " Unsaved changes — [S] Save all & quit   [D] Discard & quit   [Esc] Cancel"
-            ),
+            format!(" Unsaved changes — [S] Save all & quit   [D] Discard & quit   [Esc] Cancel"),
             app.theme.error,
             app.theme.background,
         ),
@@ -798,12 +803,7 @@ fn draw_prompt_bar<W: Write>(
     )
 }
 
-fn draw_hotkey_bar<W: Write>(
-    out: &mut W,
-    app: &App,
-    row: u16,
-    width: u16,
-) -> io::Result<()> {
+fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
     let mode_color = if app.explorer_focused {
         app.theme.normal_mode
     } else {
@@ -865,7 +865,11 @@ fn draw_hotkey_bar<W: Write>(
             } else {
                 app.theme.status_text
             }),
-            SetAttribute(if clickable { Attribute::Bold } else { Attribute::Reset }),
+            SetAttribute(if clickable {
+                Attribute::Bold
+            } else {
+                Attribute::Reset
+            }),
             Print(&description_text)
         )?;
         x += description_width;
@@ -946,11 +950,7 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Esc", "Close"),
             ("F1", "Close"),
         ],
-        Mode::QuitConfirm => &[
-            ("S", "Save+Quit"),
-            ("D", "Discard+Quit"),
-            ("Esc", "Cancel"),
-        ],
+        Mode::QuitConfirm => &[("S", "Save+Quit"), ("D", "Discard+Quit"), ("Esc", "Cancel")],
     }
 }
 
@@ -971,23 +971,33 @@ fn draw_help<W: Write>(
         ("Shift + Arrow/Home/End", "Select text with the keyboard"),
         ("Mouse drag", "Select text with the mouse"),
         ("Ctrl-C / Ctrl-X / Ctrl-V", "Copy / Cut / Paste selection"),
-        ("Ctrl-D", "Select next occurrence; type to edit all selections"),
+        (
+            "Ctrl-D",
+            "Select next occurrence; type to edit all selections",
+        ),
         ("Backspace / Delete", "Delete text or selection"),
         ("Ctrl-S", "Save the current file"),
         ("i / a  (Normal)", "Insert before / after cursor"),
         ("x / dd  (Normal)", "Delete character / line"),
         ("yy / p  (Normal)", "Copy line / paste below"),
-        ("q{register} / @{register}", "Record / replay a macro in Normal mode"),
-        ("Tab / Shift-Tab  (Normal)", "Indent / outdent the line or selection"),
+        (
+            "q{register} / @{register}",
+            "Record / replay a macro in Normal mode",
+        ),
+        (
+            "Tab / Shift-Tab  (Normal)",
+            "Indent / outdent the line or selection",
+        ),
         ("Ctrl-/", "Toggle language-aware comments"),
         ("u / Ctrl-R  (Normal)", "Undo / Redo"),
     ];
-    const NAVIGATION: [(&str, &str); 11] = [
+    const NAVIGATION: [(&str, &str); 12] = [
         ("Arrows or h j k l", "Move the cursor"),
         ("w / b", "Next / previous word"),
         ("0 / $", "Start / end of line"),
         ("gg / G", "Top / bottom of file"),
         ("PageUp / PageDown", "Move one screen"),
+        ("zc / zo / za / zM / zR", "Close, open, toggle, fold all, unfold all"),
         ("Alt-Left / Alt-Right", "Go back / forward in history"),
         ("/", "Search for text"),
         ("n / N", "Next / previous search result"),
@@ -1003,7 +1013,10 @@ fn draw_help<W: Write>(
         ("Enter", "Open a file or expand a folder"),
         ("Left / Right", "Collapse / expand a folder"),
         ("Backspace", "Move to the parent folder"),
-        ("Shift-Left / Shift-Right", "Collapse recursively / expand one level"),
+        (
+            "Shift-Left / Shift-Right",
+            "Collapse recursively / expand one level",
+        ),
         ("* / -", "Expand all / collapse all"),
         (".", "Show or hide hidden files"),
         ("r", "Refresh the explorer"),
@@ -1089,7 +1102,11 @@ fn draw_help<W: Write>(
             } else {
                 app.theme.muted
             }),
-            SetAttribute(if active { Attribute::Bold } else { Attribute::Reset }),
+            SetAttribute(if active {
+                Attribute::Bold
+            } else {
+                Attribute::Reset
+            }),
             Print(&tab),
             SetAttribute(Attribute::Reset)
         )?;
@@ -1129,7 +1146,10 @@ fn draw_help<W: Write>(
         MoveTo(start_x + 3, start_y + box_height.saturating_sub(2) as u16),
         SetForegroundColor(app.theme.muted),
         Print("←/→ or 1-4 change page"),
-        MoveTo(start_x + box_width.saturating_sub(25) as u16, start_y + box_height.saturating_sub(2) as u16),
+        MoveTo(
+            start_x + box_width.saturating_sub(25) as u16,
+            start_y + box_height.saturating_sub(2) as u16
+        ),
         Print("Esc / F1 / ? closes")
     )?;
 
@@ -1165,11 +1185,11 @@ fn place_cursor<W: Write>(
         return queue!(out, MoveTo(x, terminal_height - 2), Show);
     }
 
-    if app.editor.cursor.line < app.editor.scroll_line
-        || app.editor.cursor.line >= app.editor.scroll_line + content_height
-    {
+    let Some(screen_row) = (0..content_height).find(|row| {
+        app.editor.visible_line_at(app.editor.scroll_line, *row) == Some(app.editor.cursor.line)
+    }) else {
         return queue!(out, Hide);
-    }
+    };
 
     let line = app.editor.line_text(app.editor.cursor.line);
     let prefix: String = line.chars().take(app.editor.cursor.column).collect();
@@ -1184,7 +1204,7 @@ fn place_cursor<W: Write>(
         return queue!(out, Hide);
     }
 
-    let y = content_top + (app.editor.cursor.line - app.editor.scroll_line) as u16;
+    let y = content_top + screen_row as u16;
     queue!(out, MoveTo(x as u16, y), Show)
 }
 

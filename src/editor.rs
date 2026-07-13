@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -39,6 +40,7 @@ pub struct Editor {
     pub dirty: bool,
     pub show_line_numbers: bool,
     pub tab_width: usize,
+    folded_ranges: BTreeMap<usize, usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     undo_group_active: bool,
@@ -60,6 +62,7 @@ impl Editor {
                 dirty: false,
                 show_line_numbers: true,
                 tab_width: 4,
+                folded_ranges: BTreeMap::new(),
                 undo: Vec::new(),
                 redo: Vec::new(),
                 undo_group_active: false,
@@ -81,6 +84,7 @@ impl Editor {
             dirty: false,
             show_line_numbers: true,
             tab_width: 4,
+            folded_ranges: BTreeMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             undo_group_active: false,
@@ -101,6 +105,7 @@ impl Editor {
             dirty: false,
             show_line_numbers: true,
             tab_width: 4,
+            folded_ranges: BTreeMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             undo_group_active: false,
@@ -165,6 +170,7 @@ impl Editor {
     /// and deletion operations share a single undo entry until navigation or
     /// a mode change ends the group.
     fn begin_undo_group(&mut self) {
+        self.folded_ranges.clear();
         if !self.undo_group_active {
             self.push_undo_snapshot();
             self.undo_group_active = true;
@@ -302,7 +308,8 @@ impl Editor {
     }
 
     pub fn buffer_line_to_char(&self, line: usize) -> usize {
-        self.buffer.line_to_char(line.min(self.line_count().saturating_sub(1)))
+        self.buffer
+            .line_to_char(line.min(self.line_count().saturating_sub(1)))
     }
 
     pub fn current_char_index(&self) -> usize {
@@ -404,7 +411,9 @@ impl Editor {
 
         let Some(start) = matches.into_iter().find(|start| {
             let end = *start + query_len;
-            !occupied.iter().any(|(used_start, used_end)| *start < *used_end && end > *used_start)
+            !occupied
+                .iter()
+                .any(|(used_start, used_end)| *start < *used_end && end > *used_start)
         }) else {
             return false;
         };
@@ -437,7 +446,12 @@ impl Editor {
         let anchor = anchor?;
         let anchor_index = buffer.line_to_char(anchor.line) + anchor.column;
         let cursor_index = buffer.line_to_char(cursor.line) + cursor.column;
-        (anchor_index != cursor_index).then(|| (anchor_index.min(cursor_index), anchor_index.max(cursor_index)))
+        (anchor_index != cursor_index).then(|| {
+            (
+                anchor_index.min(cursor_index),
+                anchor_index.max(cursor_index),
+            )
+        })
     }
 
     fn cursor_from_char_index(&self, index: usize) -> Cursor {
@@ -457,15 +471,13 @@ impl Editor {
         let line_start = self.buffer.line_to_char(line);
 
         self.cursor.line = line;
-        self.cursor.column = index.saturating_sub(line_start).min(self.line_len_chars(line));
+        self.cursor.column = index
+            .saturating_sub(line_start)
+            .min(self.line_len_chars(line));
         self.preferred_column = None;
     }
 
-    pub fn set_cursor_from_display_position(
-        &mut self,
-        line: usize,
-        display_column: usize,
-    ) {
+    pub fn set_cursor_from_display_position(&mut self, line: usize, display_column: usize) {
         let line = line.min(self.line_count().saturating_sub(1));
         let text = self.line_text(line);
         let mut visual = 0usize;
@@ -745,7 +757,10 @@ impl Editor {
         }
 
         self.cursor.line = self.cursor.line.min(self.line_count().saturating_sub(1));
-        self.cursor.column = self.cursor.column.min(self.line_len_chars(self.cursor.line));
+        self.cursor.column = self
+            .cursor
+            .column
+            .min(self.line_len_chars(self.cursor.line));
         self.dirty = true;
         self.preferred_column = None;
         Some(removed)
@@ -795,7 +810,8 @@ impl Editor {
         let logical_line_count = self.logical_lines().len();
         let line = self.cursor.line.min(logical_line_count.saturating_sub(1));
         let target = if down {
-            line.checked_add(1).filter(|next| *next < logical_line_count)
+            line.checked_add(1)
+                .filter(|next| *next < logical_line_count)
         } else {
             line.checked_sub(1)
         };
@@ -828,7 +844,12 @@ impl Editor {
         let left = self.line_text(line);
         let right = self.line_text(line + 1);
         let line_end = self.buffer.line_to_char(line) + self.line_with_ending(line).chars().count();
-        let newline_start = line_end.saturating_sub(if self.line_with_ending(line).ends_with("\r\n") { 2 } else { 1 });
+        let newline_start =
+            line_end.saturating_sub(if self.line_with_ending(line).ends_with("\r\n") {
+                2
+            } else {
+                1
+            });
         let mut right_start = 0;
         for character in right.chars() {
             if !character.is_whitespace() {
@@ -837,7 +858,10 @@ impl Editor {
             right_start += 1;
         }
         self.buffer.remove(newline_start..line_end + right_start);
-        if !left.is_empty() && right.chars().nth(right_start).is_some() && !left.ends_with(char::is_whitespace) {
+        if !left.is_empty()
+            && right.chars().nth(right_start).is_some()
+            && !left.ends_with(char::is_whitespace)
+        {
             self.buffer.insert_char(newline_start, ' ');
         }
         self.cursor.column = self.cursor.column.min(self.line_len_chars(line));
@@ -938,7 +962,8 @@ impl Editor {
                 format!("{prefix} {content}")
             };
             if start + offset == self.cursor.line {
-                current_delta = replacement.chars().count() as isize - content.chars().count() as isize;
+                current_delta =
+                    replacement.chars().count() as isize - content.chars().count() as isize;
             }
             *line = format!("{indent}{replacement}");
         }
@@ -966,13 +991,19 @@ impl Editor {
 
     fn finish_line_edit(&mut self, start: usize, end: usize, selected: bool, current_delta: isize) {
         if selected {
-            self.selection_anchor = Some(Cursor { line: start, column: 0 });
+            self.selection_anchor = Some(Cursor {
+                line: start,
+                column: 0,
+            });
             self.cursor = Cursor {
                 line: end,
                 column: self.line_len_chars(end),
             };
         } else if current_delta.is_negative() {
-            self.cursor.column = self.cursor.column.saturating_sub(current_delta.unsigned_abs());
+            self.cursor.column = self
+                .cursor
+                .column
+                .saturating_sub(current_delta.unsigned_abs());
         } else {
             self.cursor.column = (self.cursor.column + current_delta as usize)
                 .min(self.line_len_chars(self.cursor.line));
@@ -1046,7 +1077,7 @@ impl Editor {
         }
 
         let preferred = self.preferred_column.unwrap_or(self.cursor.column);
-        self.cursor.line -= 1;
+        self.cursor.line = self.previous_visible_line(self.cursor.line).unwrap_or(0);
         self.cursor.column = preferred.min(self.line_len_chars(self.cursor.line));
         self.preferred_column = Some(preferred);
     }
@@ -1058,7 +1089,10 @@ impl Editor {
         }
 
         let preferred = self.preferred_column.unwrap_or(self.cursor.column);
-        self.cursor.line += 1;
+        let Some(line) = self.next_visible_line(self.cursor.line) else {
+            return;
+        };
+        self.cursor.line = line;
         self.cursor.column = preferred.min(self.line_len_chars(self.cursor.line));
         self.preferred_column = Some(preferred);
     }
@@ -1224,7 +1258,10 @@ impl Editor {
     pub fn goto_line(&mut self, line: usize) {
         self.finish_undo_group();
         self.cursor.line = line.min(self.line_count().saturating_sub(1));
-        self.cursor.column = self.cursor.column.min(self.line_len_chars(self.cursor.line));
+        self.cursor.column = self
+            .cursor
+            .column
+            .min(self.line_len_chars(self.cursor.line));
         self.preferred_column = None;
     }
 
@@ -1268,7 +1305,10 @@ impl Editor {
 
     pub fn cursor_display_column(&self) -> usize {
         let line = self.line_text(self.cursor.line);
-        display_width(&line.chars().take(self.cursor.column).collect::<String>(), self.tab_width)
+        display_width(
+            &line.chars().take(self.cursor.column).collect::<String>(),
+            self.tab_width,
+        )
     }
 
     pub fn ensure_cursor_visible(&mut self, rows: usize, columns: usize) {
@@ -1276,10 +1316,18 @@ impl Editor {
             return;
         }
 
+        self.reveal_line(self.cursor.line);
         if self.cursor.line < self.scroll_line {
             self.scroll_line = self.cursor.line;
-        } else if self.cursor.line >= self.scroll_line + rows {
-            self.scroll_line = self.cursor.line + 1 - rows;
+        } else if self
+            .visible_distance(self.scroll_line, self.cursor.line)
+            .is_some_and(|d| d >= rows)
+        {
+            let mut line = self.cursor.line;
+            for _ in 1..rows {
+                line = self.previous_visible_line(line).unwrap_or(0);
+            }
+            self.scroll_line = line;
         }
 
         let display_column = self.cursor_display_column();
@@ -1291,18 +1339,130 @@ impl Editor {
         }
     }
 
-    pub fn scroll_vertical(&mut self, delta: isize, viewport_rows: usize) {
+    pub fn scroll_vertical(&mut self, delta: isize, _viewport_rows: usize) {
         if delta < 0 {
-            self.scroll_line = self.scroll_line.saturating_sub(delta.unsigned_abs());
+            for _ in 0..delta.unsigned_abs() {
+                self.scroll_line = self.previous_visible_line(self.scroll_line).unwrap_or(0);
+            }
         } else {
-            let maximum = self.line_count().saturating_sub(viewport_rows.max(1));
-            self.scroll_line = (self.scroll_line + delta as usize).min(maximum);
+            for _ in 0..delta as usize {
+                let Some(line) = self.next_visible_line(self.scroll_line) else {
+                    break;
+                };
+                self.scroll_line = line;
+            }
         }
+    }
+
+    pub fn toggle_fold(&mut self, ranges: &[(usize, usize)]) -> Option<bool> {
+        if let Some(start) = self.fold_containing(self.cursor.line) {
+            self.folded_ranges.remove(&start);
+            return Some(false);
+        }
+        let (start, end) = ranges
+            .iter()
+            .copied()
+            .filter(|(start, end)| *start <= self.cursor.line && self.cursor.line <= *end)
+            .min_by_key(|(start, end)| end - start)?;
+        self.folded_ranges.insert(start, end);
+        self.cursor.line = start;
+        Some(true)
+    }
+
+    pub fn close_fold(&mut self, ranges: &[(usize, usize)]) -> bool {
+        self.fold_containing(self.cursor.line).is_none() && self.toggle_fold(ranges) == Some(true)
+    }
+
+    pub fn open_fold(&mut self) -> bool {
+        let Some(start) = self.fold_containing(self.cursor.line) else {
+            return false;
+        };
+        self.folded_ranges.remove(&start);
+        true
+    }
+
+    pub fn close_all_folds(&mut self, ranges: &[(usize, usize)]) -> usize {
+        self.folded_ranges.clear();
+        for &(start, end) in ranges {
+            self.folded_ranges
+                .entry(start)
+                .and_modify(|old| *old = (*old).max(end))
+                .or_insert(end);
+        }
+        self.reveal_line(self.cursor.line);
+        self.folded_ranges.len()
+    }
+
+    pub fn open_all_folds(&mut self) -> usize {
+        let count = self.folded_ranges.len();
+        self.folded_ranges.clear();
+        count
+    }
+
+    pub fn folded_end(&self, line: usize) -> Option<usize> {
+        self.folded_ranges.get(&line).copied()
+    }
+
+    pub fn visible_line_at(&self, start: usize, row: usize) -> Option<usize> {
+        let mut line = start;
+        for _ in 0..row {
+            line = self.next_visible_line(line)?;
+        }
+        (line < self.line_count()).then_some(line)
+    }
+
+    fn fold_containing(&self, line: usize) -> Option<usize> {
+        self.folded_ranges
+            .iter()
+            .find_map(|(&start, &end)| (start <= line && line <= end).then_some(start))
+    }
+
+    fn reveal_line(&mut self, line: usize) {
+        let hidden = self
+            .folded_ranges
+            .iter()
+            .filter_map(|(&start, &end)| (start < line && line <= end).then_some(start))
+            .collect::<Vec<_>>();
+        for start in hidden {
+            self.folded_ranges.remove(&start);
+        }
+    }
+
+    fn next_visible_line(&self, line: usize) -> Option<usize> {
+        let next = self.folded_end(line).map_or(line + 1, |end| end + 1);
+        (next < self.line_count()).then_some(next)
+    }
+
+    fn previous_visible_line(&self, line: usize) -> Option<usize> {
+        if line == 0 {
+            return None;
+        }
+        let candidate = line - 1;
+        Some(
+            self.folded_ranges
+                .iter()
+                .find_map(|(&start, &end)| (start < candidate && candidate <= end).then_some(start))
+                .unwrap_or(candidate),
+        )
+    }
+
+    fn visible_distance(&self, start: usize, target: usize) -> Option<usize> {
+        let mut line = start;
+        for distance in 0..self.line_count() {
+            if line == target {
+                return Some(distance);
+            }
+            line = self.next_visible_line(line)?;
+        }
+        None
     }
 
     fn clamp_cursor(&mut self) {
         self.cursor.line = self.cursor.line.min(self.line_count().saturating_sub(1));
-        self.cursor.column = self.cursor.column.min(self.line_len_chars(self.cursor.line));
+        self.cursor.column = self
+            .cursor
+            .column
+            .min(self.line_len_chars(self.cursor.line));
     }
 
     fn has_trailing_newline(&self) -> bool {
@@ -1318,7 +1478,9 @@ impl Editor {
     }
 
     fn logical_lines(&self) -> Vec<String> {
-        let count = self.line_count().saturating_sub(self.has_trailing_newline() as usize);
+        let count = self
+            .line_count()
+            .saturating_sub(self.has_trailing_newline() as usize);
         if count == 0 {
             vec![String::new()]
         } else {
@@ -1359,7 +1521,10 @@ fn leading_indent_width(line: &str, tab_width: usize) -> usize {
     if line.starts_with('\t') {
         1
     } else {
-        line.chars().take_while(|character| *character == ' ').take(tab_width).count()
+        line.chars()
+            .take_while(|character| *character == ' ')
+            .take(tab_width)
+            .count()
     }
 }
 
@@ -1371,12 +1536,14 @@ fn line_char_byte_index(line: &str, characters: usize) -> usize {
 
 fn is_commented(line: &str, prefix: &str, suffix: Option<&str>) -> bool {
     let content = line.trim_start();
-    content.starts_with(prefix)
-        && suffix.is_none_or(|suffix| content.trim_end().ends_with(suffix))
+    content.starts_with(prefix) && suffix.is_none_or(|suffix| content.trim_end().ends_with(suffix))
 }
 
 fn uncomment_line(content: &str, prefix: &str, suffix: Option<&str>) -> String {
-    let content = content.strip_prefix(prefix).unwrap_or(content).trim_start_matches(' ');
+    let content = content
+        .strip_prefix(prefix)
+        .unwrap_or(content)
+        .trim_start_matches(' ');
     let content = if let Some(suffix) = suffix {
         content
             .trim_end()
@@ -1538,19 +1705,45 @@ mod tests {
     fn comments_selected_lines_and_preserves_markdown_delimiters() {
         let mut editor = Editor::blank();
         editor.buffer = Rope::from_str("fn main() {}\n\n    run();");
-        editor.cursor = Cursor { line: 2, column: 10 };
+        editor.cursor = Cursor {
+            line: 2,
+            column: 10,
+        };
         editor.selection_anchor = Some(Cursor { line: 0, column: 0 });
 
         assert_eq!(editor.toggle_line_comments("//", None), Some(true));
-        assert_eq!(editor.buffer.to_string(), "// fn main() {}\n\n    // run();");
+        assert_eq!(
+            editor.buffer.to_string(),
+            "// fn main() {}\n\n    // run();"
+        );
         assert_eq!(editor.toggle_line_comments("//", None), Some(false));
         assert_eq!(editor.buffer.to_string(), "fn main() {}\n\n    run();");
 
         editor.cursor = Cursor { line: 0, column: 0 };
         editor.selection_anchor = None;
         assert_eq!(editor.toggle_line_comments("<!--", Some("-->")), Some(true));
-        assert_eq!(editor.buffer.to_string(), "<!-- fn main() {} -->\n\n    run();");
-        assert_eq!(editor.toggle_line_comments("<!--", Some("-->")), Some(false));
+        assert_eq!(
+            editor.buffer.to_string(),
+            "<!-- fn main() {} -->\n\n    run();"
+        );
+        assert_eq!(
+            editor.toggle_line_comments("<!--", Some("-->")),
+            Some(false)
+        );
         assert_eq!(editor.buffer.to_string(), "fn main() {}\n\n    run();");
+    }
+
+    #[test]
+    fn folded_lines_are_skipped_by_rendering_and_navigation() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("start\ninside\nend\nafter");
+        assert!(editor.close_fold(&[(0, 2)]));
+        assert_eq!(editor.visible_line_at(0, 1), Some(3));
+        editor.move_down();
+        assert_eq!(editor.cursor.line, 3);
+        editor.move_up();
+        assert_eq!(editor.cursor.line, 0);
+        assert!(editor.open_fold());
+        assert_eq!(editor.visible_line_at(0, 1), Some(1));
     }
 }

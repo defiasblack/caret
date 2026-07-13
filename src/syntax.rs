@@ -185,8 +185,27 @@ pub fn highlight_line(line: &str, language: Language, theme: &Theme) -> Vec<Colo
 
         if matches!(
             chars[index],
-            '{' | '}' | '[' | ']' | '(' | ')' | ':' | ';' | ',' | '.' | '=' | '+' | '-' | '*'
-                | '/' | '%' | '&' | '|' | '!' | '<' | '>' | '?'
+            '{' | '}'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | ':'
+                | ';'
+                | ','
+                | '.'
+                | '='
+                | '+'
+                | '-'
+                | '*'
+                | '/'
+                | '%'
+                | '&'
+                | '|'
+                | '!'
+                | '<'
+                | '>'
+                | '?'
         ) {
             colors[index] = theme.punctuation;
         }
@@ -198,7 +217,12 @@ pub fn highlight_line(line: &str, language: Language, theme: &Theme) -> Vec<Colo
     colors
 }
 
-fn apply_tree_sitter_highlights(line: &str, language: Language, theme: &Theme, colors: &mut [Color]) {
+fn apply_tree_sitter_highlights(
+    line: &str,
+    language: Language,
+    theme: &Theme,
+    colors: &mut [Color],
+) {
     let Some(tree_language) = tree_sitter_language(language) else {
         return;
     };
@@ -226,11 +250,44 @@ fn tree_sitter_language(language: Language) -> Option<TreeLanguage> {
     }
 }
 
+pub fn fold_ranges(source: &str, language: Language) -> Vec<(usize, usize)> {
+    let Some(tree_language) = tree_sitter_language(language) else {
+        return Vec::new();
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&tree_language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    let mut ranges = Vec::new();
+    collect_fold_ranges(root, root.id(), &mut ranges);
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+}
+
+fn collect_fold_ranges(node: Node<'_>, root_id: usize, ranges: &mut Vec<(usize, usize)>) {
+    let start = node.start_position().row;
+    let end = node.end_position().row;
+    if node.id() != root_id && node.is_named() && start < end {
+        ranges.push((start, end));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_fold_ranges(child, root_id, ranges);
+    }
+}
+
 fn apply_node_highlights(node: Node<'_>, line: &str, theme: &Theme, colors: &mut [Color]) {
     let color = match node.kind() {
         kind if kind.contains("comment") => Some(theme.comment),
         kind if kind.contains("string") || kind.contains("quoted") => Some(theme.string),
-        kind if kind.contains("integer") || kind.contains("float") || kind.contains("number") => Some(theme.number),
+        kind if kind.contains("integer") || kind.contains("float") || kind.contains("number") => {
+            Some(theme.number)
+        }
         kind if kind.contains("type") => Some(theme.type_name),
         _ => None,
     };
@@ -251,7 +308,9 @@ fn apply_node_highlights(node: Node<'_>, line: &str, theme: &Theme, colors: &mut
 }
 
 fn highlight_markdown(chars: &[char], colors: &mut [Color], theme: &Theme) {
-    let first_non_space = chars.iter().position(|character| !character.is_whitespace());
+    let first_non_space = chars
+        .iter()
+        .position(|character| !character.is_whitespace());
 
     if let Some(position) = first_non_space {
         if chars[position] == '#' {
@@ -320,8 +379,7 @@ fn is_keyword(language: Language, token: &str) -> bool {
     match language {
         Language::Rust => matches!(
             token,
-            "as"
-                | "async"
+            "as" | "async"
                 | "await"
                 | "break"
                 | "const"
@@ -606,8 +664,14 @@ mod tests {
     fn configured_tree_sitter_languages_parse_valid_source() {
         for (language, source) in [
             (Language::Rust, "fn main() { let value: u32 = 42; }"),
-            (Language::Go, "package main\nfunc main() { value := 42; _ = value }"),
-            (Language::CSharp, "class Program { static void Main() { var value = 42; } }"),
+            (
+                Language::Go,
+                "package main\nfunc main() { value := 42; _ = value }",
+            ),
+            (
+                Language::CSharp,
+                "class Program { static void Main() { var value = 42; } }",
+            ),
             (Language::Yaml, "value: 42\nitems:\n  - one"),
             (Language::Json, r#"{"value": 42}"#),
             (Language::Toml, "value = 42"),
@@ -635,5 +699,15 @@ mod tests {
         }
         let type_index = line.find("double").expect("type index");
         assert_eq!(colors[type_index], theme.type_name);
+    }
+
+    #[test]
+    fn finds_multiline_syntax_folds() {
+        let ranges = fold_ranges(
+            "fn main() {\n    if true {\n        work();\n    }\n}\n",
+            Language::Rust,
+        );
+        assert!(ranges.contains(&(0, 4)));
+        assert!(ranges.contains(&(1, 3)));
     }
 }

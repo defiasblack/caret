@@ -10,7 +10,6 @@ milestone.
 
 - Language Server Protocol integration: completion, hover, definitions,
   references, rename, formatting, code actions, and diagnostics
-- Code folding
 - Symbol outline and breadcrumbs
 - Format on save
 
