@@ -18,8 +18,6 @@ milestone.
 
 ## Customization and ecosystem
 
-- Additional built-in themes and live theme gallery
-- Full custom keymap profiles, including Caret, Vim, and conventional presets
 - Context menus for files, tabs, and selected text
 - Plugin API for commands, languages, themes, and editor behavior
 

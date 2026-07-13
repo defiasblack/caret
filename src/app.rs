@@ -17,7 +17,7 @@ use crossterm::{
 use serde_json::json;
 
 use crate::{
-    config::{self, Settings},
+    config::{self, KeymapProfile, Settings},
     editor::Cursor,
     lsp::{self, LspClient},
     project::ProjectTree,
@@ -36,11 +36,16 @@ pub enum Mode {
     QuitConfirm,
     ReloadConfirm,
     GitDiff,
+    GitHistory,
+    ThemeGallery,
+    KeymapGallery,
+    ContextMenu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoverTarget {
     Files,
+    Themes,
     Help,
     Quit,
     Command,
@@ -66,6 +71,10 @@ impl Mode {
             Self::QuitConfirm => "QUIT?",
             Self::ReloadConfirm => "RELOAD?",
             Self::GitDiff => "DIFF",
+            Self::GitHistory => "HISTORY",
+            Self::ThemeGallery => "THEMES",
+            Self::KeymapGallery => "KEYMAPS",
+            Self::ContextMenu => "MENU",
         }
     }
 }
@@ -93,6 +102,72 @@ pub struct SplitViews {
     pub secondary: EditorView,
     pub secondary_active: bool,
     pub vertical: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitHistoryEntry { pub hash: String, pub summary: String }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextAction {
+    Open,
+    Rename,
+    Duplicate,
+    NewFile,
+    NewFolder,
+    Stage,
+    Unstage,
+    SaveTab,
+    CloseTab,
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
+    ToggleComment,
+    Format,
+}
+
+impl ContextAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Rename => "Rename…",
+            Self::Duplicate => "Duplicate…",
+            Self::NewFile => "New file…",
+            Self::NewFolder => "New folder…",
+            Self::Stage => "Stage changes",
+            Self::Unstage => "Unstage changes",
+            Self::SaveTab => "Save",
+            Self::CloseTab => "Close tab",
+            Self::Copy => "Copy",
+            Self::Cut => "Cut",
+            Self::Paste => "Paste",
+            Self::SelectAll => "Select all",
+            Self::ToggleComment => "Toggle comment",
+            Self::Format => "Format document",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Rename => "F2",
+            Self::SaveTab => "Ctrl-S",
+            Self::CloseTab => "Ctrl-W",
+            Self::Copy => "Ctrl-C",
+            Self::Cut => "Ctrl-X",
+            Self::Paste => "Ctrl-V",
+            Self::SelectAll => "Ctrl-A",
+            Self::ToggleComment => "Ctrl-/",
+            _ => "",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    pub x: u16,
+    pub y: u16,
+    pub selected: usize,
+    pub actions: Vec<ContextAction>,
 }
 
 pub struct App {
@@ -141,6 +216,12 @@ pub struct App {
     pending_save_after_disk_change: bool,
     pub git_diff_lines: Vec<String>,
     pub git_diff_scroll: usize,
+    pub git_history: Vec<GitHistoryEntry>,
+    pub git_history_selected: usize,
+    pub theme_gallery_selected: usize,
+    theme_gallery_original: ThemeKind,
+    pub keymap_gallery_selected: usize,
+    pub context_menu: Option<ContextMenu>,
 }
 
 impl App {
@@ -177,11 +258,12 @@ impl App {
         project.show_hidden = settings.show_hidden_files;
         let _ = project.refresh();
         project.refresh_git_status();
-        let mode = if explorer_focused {
+        let mode = if explorer_focused || settings.keymap == KeymapProfile::Vim {
             Mode::Normal
         } else {
             Mode::Insert
         };
+        let initial_theme = settings.theme;
 
         Ok(Self {
             editor,
@@ -235,6 +317,12 @@ impl App {
             pending_save_after_disk_change: false,
             git_diff_lines: Vec::new(),
             git_diff_scroll: 0,
+            git_history: Vec::new(),
+            git_history_selected: 0,
+            theme_gallery_selected: 0,
+            theme_gallery_original: initial_theme,
+            keymap_gallery_selected: 0,
+            context_menu: None,
         })
     }
 
@@ -265,6 +353,27 @@ impl App {
                 true
             }
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                if self.mode == Mode::ThemeGallery {
+                    if let Ok((width, height)) = terminal::size() {
+                        if let Some(index) = crate::ui::theme_gallery_item_at(self, width, height, mouse.column, mouse.row) {
+                            if index != self.theme_gallery_selected {
+                                self.theme_gallery_selected = index;
+                                self.preview_gallery_theme();
+                                return true;
+                            }
+                        }
+                    }
+                }
+                if self.mode == Mode::KeymapGallery {
+                    if let Ok((width, height)) = terminal::size() {
+                        if let Some(index) = crate::ui::keymap_gallery_item_at(self, width, height, mouse.column, mouse.row) {
+                            if index != self.keymap_gallery_selected {
+                                self.keymap_gallery_selected = index;
+                                return true;
+                            }
+                        }
+                    }
+                }
                 self.update_hover(mouse.column, mouse.row)
             }
             Event::Resize(_, _) => true,
@@ -296,6 +405,24 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if self.mode == Mode::ThemeGallery {
+                if let Some(index) = crate::ui::theme_gallery_item_at(self, width, height, mouse.column, mouse.row) {
+                    self.theme_gallery_selected = index;
+                    self.preview_gallery_theme();
+                    self.settings.theme = self.theme_kind;
+                    self.persist_settings();
+                    self.mode = self.preferred_editor_mode();
+                    self.message = format!("Theme: {}", self.theme_kind.name());
+                }
+                return;
+            }
+            if self.mode == Mode::KeymapGallery {
+                if let Some(index) = crate::ui::keymap_gallery_item_at(self, width, height, mouse.column, mouse.row) {
+                    self.keymap_gallery_selected = index;
+                    self.apply_selected_keymap();
+                }
+                return;
+            }
             if let Some(index) = crate::ui::command_suggestion_at(self, width, height, mouse.column, mouse.row) {
                 if let Some(command) = self.command_suggestions().get(index) {
                     self.command_input = (*command).to_string();
@@ -357,6 +484,11 @@ impl App {
             Some(HoverTarget::Files)
         } else if row == 0 && column >= width.saturating_sub(8) {
             Some(HoverTarget::Quit)
+        } else if row == 0
+            && column >= width.saturating_sub(30)
+            && column < width.saturating_sub(20)
+        {
+            Some(HoverTarget::Themes)
         } else if row == 0 && column >= width.saturating_sub(20) {
             Some(HoverTarget::Help)
         } else if row == layout.hotkey_row
@@ -404,6 +536,15 @@ impl App {
             return;
         }
 
+        if row == 0
+            && column >= width.saturating_sub(30)
+            && column < width.saturating_sub(20)
+        {
+            self.explorer_focused = false;
+            self.open_theme_gallery();
+            return;
+        }
+
         if row == 0 && column >= width.saturating_sub(20) {
             self.explorer_focused = false;
             self.mode = Mode::Help;
@@ -415,7 +556,7 @@ impl App {
             if let Some(index) = crate::ui::tab_index_at(self, width, column) {
                 self.select_tab_with_history(index);
                 self.explorer_focused = false;
-                self.mode = Mode::Insert;
+                self.mode = self.preferred_editor_mode();
             }
             return;
         }
@@ -491,7 +632,7 @@ impl App {
         let before = self.current_location();
         self.explorer_focused = false;
         self.follow_cursor = true;
-        self.mode = Mode::Insert;
+        self.mode = self.preferred_editor_mode();
         self.pending_key = None;
 
         let screen_row = (row - layout.content_top) as usize;
@@ -555,7 +696,7 @@ impl App {
 
         self.explorer_focused = false;
         self.follow_cursor = true;
-        self.mode = Mode::Insert;
+        self.mode = self.preferred_editor_mode();
         self.editor.finish_undo_group();
         self.editor.begin_selection();
         let screen_row = (row - layout.content_top) as usize;
@@ -660,11 +801,49 @@ impl App {
         }
         if self.mode == Mode::GitDiff {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                KeyCode::Esc | KeyCode::Char('q') => self.mode = self.preferred_editor_mode(),
                 KeyCode::Up | KeyCode::Char('k') => self.git_diff_scroll = self.git_diff_scroll.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => self.git_diff_scroll = (self.git_diff_scroll + 1).min(self.git_diff_lines.len().saturating_sub(1)),
                 KeyCode::PageUp => self.git_diff_scroll = self.git_diff_scroll.saturating_sub(self.viewport_rows.saturating_sub(2)),
                 KeyCode::PageDown => self.git_diff_scroll = (self.git_diff_scroll + self.viewport_rows.saturating_sub(2)).min(self.git_diff_lines.len().saturating_sub(1)),
+                _ => {}
+            }
+            return;
+        }
+        if self.mode == Mode::GitHistory {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.mode = self.preferred_editor_mode(),
+                KeyCode::Up | KeyCode::Char('k') => self.git_history_selected = self.git_history_selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => self.git_history_selected = (self.git_history_selected + 1).min(self.git_history.len().saturating_sub(1)),
+                KeyCode::Enter => self.show_selected_history_diff(),
+                _ => {}
+            }
+            return;
+        }
+        if self.mode == Mode::ThemeGallery {
+            match key.code {
+                KeyCode::Esc => { self.theme_kind = self.theme_gallery_original; self.theme = Theme::for_kind(self.theme_kind); self.mode = self.preferred_editor_mode(); self.message = "Theme preview cancelled".to_string(); }
+                KeyCode::Up | KeyCode::Char('k') => { self.theme_gallery_selected = self.theme_gallery_selected.saturating_sub(1); self.preview_gallery_theme(); }
+                KeyCode::Down | KeyCode::Char('j') => { self.theme_gallery_selected = (self.theme_gallery_selected + 1).min(ThemeKind::ALL.len() - 1); self.preview_gallery_theme(); }
+                KeyCode::Enter => { self.settings.theme = self.theme_kind; self.persist_settings(); self.mode = self.preferred_editor_mode(); self.message = format!("Theme: {}", self.theme_kind.name()); }
+                _ => {}
+            }
+            return;
+        }
+        if self.mode == Mode::KeymapGallery {
+            match key.code {
+                KeyCode::Esc => {
+                    self.mode = self.preferred_editor_mode();
+                    self.message = "Keymap selection cancelled".to_string();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.keymap_gallery_selected = self.keymap_gallery_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.keymap_gallery_selected = (self.keymap_gallery_selected + 1)
+                        .min(KeymapProfile::ALL.len().saturating_sub(1));
+                }
+                KeyCode::Enter => self.apply_selected_keymap(),
                 _ => {}
             }
             return;
@@ -699,20 +878,20 @@ impl App {
             Mode::Command => self.handle_command_input(key),
             Mode::Help => match key.code {
                 KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
-                    self.mode = Mode::Normal;
+                    self.mode = self.preferred_editor_mode();
                 }
                 KeyCode::Left | KeyCode::Up | KeyCode::PageUp => {
                     self.help_page = self.help_page.saturating_sub(1);
                 }
                 KeyCode::Right | KeyCode::Down | KeyCode::PageDown => {
-                    self.help_page = (self.help_page + 1).min(3);
+                    self.help_page = (self.help_page + 1).min(4);
                 }
-                KeyCode::Char(page @ '1'..='4') => {
+                KeyCode::Char(page @ '1'..='5') => {
                     self.help_page = page.to_digit(10).unwrap_or(1) as usize - 1;
                 }
                 _ => {}
             },
-            Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff => {}
+            Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery => {}
         }
     }
 
@@ -786,7 +965,7 @@ impl App {
     fn handle_quit_confirmation(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
-                self.mode = Mode::Normal;
+                self.mode = self.preferred_editor_mode();
                 self.message = "Quit cancelled".to_string();
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
@@ -798,7 +977,7 @@ impl App {
                 } else {
                     // A common reason is an unnamed tab that needs a filename.
                     // Return to the editor and preserve the detailed save error.
-                    self.mode = Mode::Normal;
+                    self.mode = self.preferred_editor_mode();
                 }
             }
             _ => {}
@@ -808,22 +987,22 @@ impl App {
     fn handle_reload_confirmation(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('r') | KeyCode::Char('R') => match self.editor.reload_from_disk() {
-                Ok(()) => { self.pending_save_after_disk_change = false; self.mode = Mode::Normal; self.message = "Reloaded changed file".to_string(); }
+                Ok(()) => { self.pending_save_after_disk_change = false; self.mode = self.preferred_editor_mode(); self.message = "Reloaded changed file".to_string(); }
                 Err(error) => self.message = format!("Reload failed: {error}"),
             },
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 if self.pending_save_after_disk_change {
                     self.pending_save_after_disk_change = false;
                     self.editor.clear_pending_external_change();
-                    self.mode = Mode::Normal;
+                    self.mode = self.preferred_editor_mode();
                     self.save_internal();
                 } else {
                     self.editor.keep_disk_change();
-                    self.mode = Mode::Normal;
+                    self.mode = self.preferred_editor_mode();
                     self.message = "Kept current buffer; save will ask before overwriting disk changes".to_string();
                 }
             }
-            KeyCode::Esc => { self.pending_save_after_disk_change = false; self.editor.acknowledge_disk_change(); self.mode = Mode::Normal; self.message = "Reload deferred".to_string(); }
+            KeyCode::Esc => { self.pending_save_after_disk_change = false; self.editor.acknowledge_disk_change(); self.mode = self.preferred_editor_mode(); self.message = "Reload deferred".to_string(); }
             _ => {}
         }
     }
@@ -831,6 +1010,30 @@ impl App {
     fn handle_global_shortcut(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('p' | 'P') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.command_input.clear();
+                    self.command_cursor = 0;
+                    self.command_anchor = None;
+                    self.command_selection = None;
+                    self.command_suggestion = 0;
+                    self.mode = Mode::Command;
+                    self.message = "Command palette".to_string();
+                    return true;
+                }
+                KeyCode::Char('f') => {
+                    self.search_origin = self.editor.cursor;
+                    self.search_input.clear();
+                    self.mode = Mode::Search;
+                    return true;
+                }
+                KeyCode::Char('z') => {
+                    self.message = if self.editor.undo() { "Undone" } else { "Nothing to undo" }.to_string();
+                    return true;
+                }
+                KeyCode::Char('y') => {
+                    self.message = if self.editor.redo() { "Redone" } else { "Nothing to redo" }.to_string();
+                    return true;
+                }
                 KeyCode::Char('\\') => {
                     if let Some(mut views) = self.split_views { self.sync_focused_view(); views.secondary_active = !views.secondary_active; self.split_views = Some(views); self.activate_focused_view(); }
                     return true;
@@ -935,6 +1138,7 @@ impl App {
                         self.mode = Mode::Normal;
                         self.message = "FILES · Enter opens · Ctrl-E returns to editor".to_string();
                     } else {
+                        self.mode = self.preferred_editor_mode();
                         self.message = "Editor focused".to_string();
                     }
                     return true;
@@ -1145,6 +1349,26 @@ impl App {
         self.mode = Mode::GitDiff;
     }
 
+    fn show_git_history(&mut self) {
+        let path = self.selected_project_path().or_else(|| self.editor.path.clone());
+        let Some(path) = path else { self.message = "Select or open a file first".to_string(); return; };
+        let relative = path.strip_prefix(&self.project.root).unwrap_or(&path).to_string_lossy().to_string();
+        let output = Command::new("git").arg("-C").arg(&self.project.root).args(["log", "--format=%h%x09%s", "-n", "30", "--", &relative]).output();
+        let Ok(output) = output else { self.message = "Git history failed".to_string(); return; };
+        self.git_history = String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| line.split_once('\t').map(|(hash, summary)| GitHistoryEntry { hash: hash.to_string(), summary: summary.to_string() })).collect();
+        self.git_history_selected = 0;
+        self.mode = Mode::GitHistory;
+    }
+
+    fn show_selected_history_diff(&mut self) {
+        let Some(entry) = self.git_history.get(self.git_history_selected) else { return; };
+        let output = Command::new("git").arg("-C").arg(&self.project.root).args(["show", "--format=fuller", "--stat", &entry.hash]).output();
+        let Ok(output) = output else { self.message = "Git show failed".to_string(); return; };
+        self.git_diff_lines = String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect();
+        self.git_diff_scroll = 0;
+        self.mode = Mode::GitDiff;
+    }
+
     fn close_fold(&mut self) {
         let ranges = self.available_fold_ranges();
         self.message = if self.editor.close_fold(&ranges) {
@@ -1192,7 +1416,7 @@ impl App {
             None => self.editor.new_buffer(),
         }
         self.explorer_focused = false;
-        self.mode = Mode::Insert;
+        self.mode = self.preferred_editor_mode();
         self.pending_key = None;
         self.search_origin = self.editor.cursor;
         self.commit_navigation(before);
@@ -1267,7 +1491,7 @@ impl App {
         self.editor.scroll_line = location.scroll_line;
         self.editor.scroll_column = location.scroll_column;
         self.explorer_focused = false;
-        self.mode = Mode::Normal;
+        self.mode = self.preferred_editor_mode();
         self.pending_key = None;
         self.search_origin = self.editor.cursor;
         Ok(())
@@ -1326,7 +1550,7 @@ impl App {
             self.mode,
             Mode::Search | Mode::Command | Mode::Help | Mode::QuitConfirm
         ) {
-            self.mode = Mode::Normal;
+            self.mode = self.preferred_editor_mode();
         }
         self.message = format!(
             "Tab {}/{}: {}",
@@ -1360,7 +1584,7 @@ impl App {
         if self.sidebar_view == SidebarView::Outline {
             let symbols = self.outline_symbols();
             match key.code {
-                KeyCode::Esc => { self.explorer_focused = false; self.mode = Mode::Normal; }
+                KeyCode::Esc => { self.explorer_focused = false; self.mode = self.preferred_editor_mode(); }
                 KeyCode::Up | KeyCode::Char('k') => self.outline_selected = self.outline_selected.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => self.outline_selected = (self.outline_selected + 1).min(symbols.len().saturating_sub(1)),
                 KeyCode::PageUp => self.outline_selected = self.outline_selected.saturating_sub(self.viewport_rows.saturating_sub(2)),
@@ -1380,7 +1604,7 @@ impl App {
             }
             KeyCode::Esc => {
                 self.explorer_focused = false;
-                self.mode = Mode::Normal;
+                self.mode = self.preferred_editor_mode();
                 self.message = "Editor focused".to_string();
             }
             KeyCode::Up | KeyCode::Char('k') => self.project.move_up(),
@@ -1458,7 +1682,7 @@ impl App {
                     Ok(disposition) => {
                         self.commit_navigation(before);
                         self.explorer_focused = false;
-                        self.mode = Mode::Insert;
+                        self.mode = self.preferred_editor_mode();
                         self.pending_key = None;
                         self.search_origin = self.editor.cursor;
                         self.message = match disposition {
@@ -1551,6 +1775,19 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // Conventional mode is intentionally non-modal. If an overlay or
+        // explorer action left the editor in Normal mode, printable input
+        // still behaves like a regular text field instead of running a Vim
+        // command by surprise.
+        if self.settings.keymap == KeymapProfile::Conventional
+            && matches!(key.code, KeyCode::Char(_))
+            && key.modifiers.is_empty()
+        {
+            self.mode = Mode::Insert;
+            self.handle_insert(key);
             return;
         }
 
@@ -1773,9 +2010,15 @@ impl App {
             KeyCode::Esc => {
                 self.command_selection = None;
                 self.command_anchor = None;
-                self.mode = Mode::Normal;
                 self.editor.finish_undo_group();
-                self.message = "-- NORMAL --".to_string();
+                if self.settings.keymap == KeymapProfile::Conventional {
+                    self.editor.clear_selection();
+                    self.mode = Mode::Insert;
+                    self.message = "Selection cleared".to_string();
+                } else {
+                    self.mode = Mode::Normal;
+                    self.message = "-- NORMAL --".to_string();
+                }
             }
             KeyCode::Enter => self.editor.insert_char('\n'),
             KeyCode::Backspace => {
@@ -1880,7 +2123,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.editor.cursor = self.search_origin;
-                self.mode = Mode::Normal;
+                self.mode = self.preferred_editor_mode();
                 self.message = "Search cancelled".to_string();
             }
             KeyCode::Enter => {
@@ -1890,7 +2133,7 @@ impl App {
                     self.last_search = self.search_input.clone();
                     self.message = format!("Search: {}", self.last_search);
                 }
-                self.mode = Mode::Normal;
+                self.mode = self.preferred_editor_mode();
             }
             KeyCode::Backspace => {
                 self.search_input.pop();
@@ -1931,14 +2174,14 @@ impl App {
     fn handle_command_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.mode = Mode::Normal;
+                self.mode = self.preferred_editor_mode();
                 self.message = "Command cancelled".to_string();
             }
             KeyCode::Enter => {
                 let command = self.selected_command().unwrap_or_else(|| self.command_input.trim().to_string());
                 self.command_selection = None;
                 self.command_anchor = None;
-                self.mode = Mode::Normal;
+                self.mode = self.preferred_editor_mode();
                 self.execute_command(&command);
             }
             KeyCode::Backspace => {
@@ -1989,7 +2232,7 @@ impl App {
     }
 
     pub fn command_suggestions(&self) -> Vec<&'static str> {
-        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "newfile", "newdir", "rename", "copy", "move", "delete", "delete!", "refresh", "gitrefresh", "stage", "unstage", "diff", "symbols", "outline", "split", "vsplit", "only", "unsplit", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set number", "set nonumber", "set", "theme", "help"];
+        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "newfile", "newdir", "rename", "copy", "move", "delete", "delete!", "refresh", "gitrefresh", "stage", "unstage", "diff", "history", "symbols", "outline", "split", "vsplit", "only", "unsplit", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set number", "set nonumber", "set", "theme", "themes", "keymap", "keymaps", "help"];
         let query = self.command_input.trim().to_ascii_lowercase();
         COMMANDS.iter().copied().filter(|command| command.contains(&query)).collect()
     }
@@ -2066,7 +2309,7 @@ impl App {
                             Ok(disposition) => {
                                 self.commit_navigation(before);
                                 self.explorer_focused = false;
-                                self.mode = Mode::Insert;
+                                self.mode = self.preferred_editor_mode();
                                 self.search_origin = self.editor.cursor;
                                 self.message = match disposition {
                                     OpenDisposition::Opened => {
@@ -2092,7 +2335,7 @@ impl App {
                         Ok(_) => {
                             self.commit_navigation(before);
                             self.explorer_focused = false;
-                            self.mode = Mode::Insert;
+                            self.mode = self.preferred_editor_mode();
                             self.after_tab_switch();
                         }
                         Err(error) => self.message = format!("Open failed: {error}"),
@@ -2167,6 +2410,7 @@ impl App {
             "stage" => self.git_selected(true),
             "unstage" => self.git_selected(false),
             "diff" => self.show_git_diff(),
+            "history" | "log" => self.show_git_history(),
             "pwd" => self.message = self.project.root.display().to_string(),
             "back" | "previous" => self.go_back(),
             "forward" | "nextlocation" => self.go_forward(),
@@ -2256,6 +2500,9 @@ impl App {
             }
             "set" => self.execute_set(&argument),
             "theme" => self.execute_theme(&argument),
+            "themes" | "themegallery" => self.open_theme_gallery(),
+            "keymap" => self.execute_keymap(&argument),
+            "keymaps" | "keymapgallery" => self.open_keymap_gallery(),
             "config" => self.message = config::config_path().display().to_string(),
             "lsp" => self.start_lsp(),
             "lspstop" => {
@@ -2675,8 +2922,12 @@ impl App {
         let kind = match argument {
             "oxide" | "" => ThemeKind::Oxide,
             "mono" | "monochrome" => ThemeKind::Mono,
+            "nord" => ThemeKind::Nord,
+            "dracula" => ThemeKind::Dracula,
+            "solarized" | "solarized-dark" => ThemeKind::Solarized,
+            "gallery" => { self.open_theme_gallery(); return; }
             _ => {
-                self.message = "Themes: oxide, mono".to_string();
+                self.message = "Themes: oxide, nord, dracula, solarized, mono, gallery".to_string();
                 return;
             }
         };
@@ -2686,6 +2937,69 @@ impl App {
         self.settings.theme = kind;
         self.persist_settings();
         self.message = format!("Theme: {argument}");
+    }
+
+    fn open_theme_gallery(&mut self) {
+        self.theme_gallery_original = self.theme_kind;
+        self.theme_gallery_selected = ThemeKind::ALL.iter().position(|kind| *kind == self.theme_kind).unwrap_or(0);
+        self.mode = Mode::ThemeGallery;
+        self.preview_gallery_theme();
+    }
+
+    fn preview_gallery_theme(&mut self) {
+        self.theme_kind = ThemeKind::ALL[self.theme_gallery_selected];
+        self.theme = Theme::for_kind(self.theme_kind);
+    }
+
+    pub fn keymap_profile(&self) -> KeymapProfile { self.settings.keymap }
+
+    fn preferred_editor_mode(&self) -> Mode {
+        match self.settings.keymap {
+            KeymapProfile::Vim => Mode::Normal,
+            KeymapProfile::Caret | KeymapProfile::Conventional => Mode::Insert,
+        }
+    }
+
+    fn open_keymap_gallery(&mut self) {
+        self.keymap_gallery_selected = KeymapProfile::ALL
+            .iter()
+            .position(|profile| *profile == self.settings.keymap)
+            .unwrap_or(0);
+        self.mode = Mode::KeymapGallery;
+        self.message = "Choose a keymap · click or press Enter to apply".to_string();
+    }
+
+    fn apply_selected_keymap(&mut self) {
+        self.settings.keymap = KeymapProfile::ALL[self.keymap_gallery_selected];
+        self.persist_settings();
+        self.pending_key = None;
+        self.macro_prefix = None;
+        self.mode = self.preferred_editor_mode();
+        self.message = format!("Keymap: {}", self.settings.keymap.name());
+    }
+
+    fn execute_keymap(&mut self, argument: &str) {
+        if argument.is_empty() || argument == "gallery" {
+            self.open_keymap_gallery();
+            return;
+        }
+        let profile = match argument.to_ascii_lowercase().as_str() {
+            "caret" | "default" => KeymapProfile::Caret,
+            "vim" => KeymapProfile::Vim,
+            "conventional" | "standard" | "classic" => KeymapProfile::Conventional,
+            _ => {
+                self.message = "Keymaps: caret, vim, conventional".to_string();
+                return;
+            }
+        };
+        self.settings.keymap = profile;
+        self.keymap_gallery_selected = KeymapProfile::ALL
+            .iter()
+            .position(|candidate| *candidate == profile)
+            .unwrap_or(0);
+        self.persist_settings();
+        self.mode = self.preferred_editor_mode();
+        self.message = format!("Keymap: {}", profile.name());
     }
 
     fn persist_settings(&mut self) {
@@ -2870,5 +3184,36 @@ mod tests {
         app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
 
         assert!(app.follow_cursor);
+    }
+
+    #[test]
+    fn conventional_profile_never_turns_printable_input_into_normal_commands() {
+        let mut app = App::new(None).expect("create app");
+        app.settings.keymap = KeymapProfile::Conventional;
+        app.mode = Mode::Normal;
+
+        app.handle_key(key('i'));
+
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.editor.line_text(0), "i");
+    }
+
+    #[test]
+    fn vim_profile_prefers_normal_mode() {
+        let mut app = App::new(None).expect("create app");
+        app.settings.keymap = KeymapProfile::Vim;
+
+        assert_eq!(app.preferred_editor_mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn ctrl_shift_p_opens_command_palette() {
+        let mut app = App::new(None).expect("create app");
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('P'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(app.mode, Mode::Command);
     }
 }

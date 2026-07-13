@@ -11,10 +11,12 @@ use crossterm::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, HoverTarget, Mode, SidebarView},
+    app::{App, ContextAction, HoverTarget, Mode, SidebarView},
+    config::{KeymapProfile},
     editor::display_width,
     project::GitStatus,
     syntax::{self, Language},
+    theme::ThemeKind,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +144,18 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if app.mode == Mode::GitDiff {
         draw_git_diff(out, app, width, height)?;
     }
+    if app.mode == Mode::GitHistory {
+        draw_git_history(out, app, width, height)?;
+    }
+    if app.mode == Mode::ThemeGallery {
+        draw_theme_gallery(out, app, width, height)?;
+    }
+    if app.mode == Mode::KeymapGallery {
+        draw_keymap_gallery(out, app, width, height)?;
+    }
+    if app.mode == Mode::ContextMenu {
+        draw_context_menu(out, app, width, height)?;
+    }
 
     let (cursor_editor_x, cursor_editor_width, cursor_gutter_width) = if let Some(views) = app.split_views {
         let pane_width = editor_width.saturating_sub(1) / 2;
@@ -202,7 +216,7 @@ fn draw_top_bar<W: Write>(out: &mut W, app: &App, width: u16) -> io::Result<()> 
     let breadcrumb = app.current_breadcrumbs();
     let location = if breadcrumb.is_empty() { String::new() } else { format!("  › {breadcrumb}") };
     let title = format!("  CARET  │ [FILES] │  {filename}{dirty}{location}");
-    let right = format!(" {}  │ [F1 Help] │ [Quit] ", app.project.root_name());
+    let right = format!(" {}  │ [Themes] │ [F1 Help] │ [Quit] ", app.project.root_name());
 
     queue!(
         out,
@@ -216,6 +230,7 @@ fn draw_top_bar<W: Write>(out: &mut W, app: &App, width: u16) -> io::Result<()> 
 
     for (target, x, label) in [
         (HoverTarget::Files, 11u16, "[FILES]"),
+        (HoverTarget::Themes, width.saturating_sub(30), "[Themes]"),
         (HoverTarget::Help, width.saturating_sub(19), "[F1 Help]"),
         (HoverTarget::Quit, width.saturating_sub(7), "[Quit]"),
     ] {
@@ -784,14 +799,15 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Search => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
-            Mode::GitDiff => app.theme.command_mode,
+            Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery => app.theme.command_mode,
         }
     };
 
     let language = Language::from_path(app.editor.path.as_deref());
     let left = format!(
-        " {}  │  Tab {}/{}  │  {} lines  │  {} ",
+        " {}  │  {} keys  │  Tab {}/{}  │  {} lines  │  {} ",
         app.active_panel_label(),
+        app.keymap_profile().name(),
         app.editor.active_index() + 1,
         app.editor.len(),
         app.editor.line_count(),
@@ -856,6 +872,133 @@ fn draw_git_diff<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> i
         queue!(out, MoveTo(x, y + 1 + row as u16), SetForegroundColor(color), Print(pad_or_truncate(line, panel_width)))?;
     }
     Ok(())
+}
+
+fn draw_git_history<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
+    let panel_width = width.saturating_sub(6) as usize;
+    let panel_height = height.saturating_sub(4) as usize;
+    let x = 3u16; let y = 2u16;
+    for row in 0..panel_height { queue!(out, MoveTo(x, y + row as u16), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.overlay_text), Print(" ".repeat(panel_width)))?; }
+    queue!(out, MoveTo(x, y), SetAttribute(Attribute::Bold), SetForegroundColor(app.theme.top_bar_text), Print(pad_or_truncate(" GIT HISTORY  ·  Enter inspects commit  ·  Esc closes", panel_width)), SetAttribute(Attribute::Reset))?;
+    if app.git_history.is_empty() { queue!(out, MoveTo(x, y + 2), Print(" No commits for this file."))?; }
+    for (index, entry) in app.git_history.iter().take(panel_height.saturating_sub(2)).enumerate() {
+        let selected = index == app.git_history_selected;
+        let label = format!(" {}  {}", entry.hash, entry.summary);
+        queue!(out, MoveTo(x, y + 1 + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print(pad_or_truncate(&label, panel_width)))?;
+    }
+    Ok(())
+}
+
+fn draw_theme_gallery<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
+    let panel_width = 46usize.min(width.saturating_sub(4) as usize);
+    let panel_height = ThemeKind::ALL.len() + 4;
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = height.saturating_sub(panel_height as u16) / 2;
+    for row in 0..panel_height { queue!(out, MoveTo(x, y + row as u16), SetBackgroundColor(app.theme.overlay), Print(" ".repeat(panel_width)))?; }
+    queue!(out, MoveTo(x + 2, y + 1), SetForegroundColor(app.theme.top_bar_text), SetAttribute(Attribute::Bold), Print("THEME GALLERY · live preview"), SetAttribute(Attribute::Reset))?;
+    for (index, kind) in ThemeKind::ALL.iter().enumerate() {
+        let selected = index == app.theme_gallery_selected;
+        queue!(out, MoveTo(x + 2, y + 2 + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print(pad_or_truncate(&format!(" {}  {}", if selected { "▶" } else { " " }, kind.name()), panel_width.saturating_sub(4))))?;
+    }
+    queue!(out, MoveTo(x + 2, y + panel_height as u16 - 1), SetForegroundColor(app.theme.muted), Print("Hover preview · Click apply · ↑↓/Enter · Esc cancel"))?;
+    Ok(())
+}
+
+fn draw_keymap_gallery<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
+    let panel_width = 62usize.min(width.saturating_sub(4) as usize);
+    let panel_height = KeymapProfile::ALL.len() + 5;
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = height.saturating_sub(panel_height as u16) / 2;
+    for row in 0..panel_height {
+        queue!(out, MoveTo(x, y + row as u16), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.overlay_text), Print(" ".repeat(panel_width)))?;
+    }
+    queue!(out, MoveTo(x + 2, y + 1), SetForegroundColor(app.theme.top_bar_text), SetAttribute(Attribute::Bold), Print("KEYMAP PROFILES"), SetAttribute(Attribute::Reset))?;
+    for (index, profile) in KeymapProfile::ALL.iter().enumerate() {
+        let selected = index == app.keymap_gallery_selected;
+        let active = *profile == app.keymap_profile();
+        let label = format!(" {} {:<13} {}{}", if selected { "▶" } else { " " }, profile.name(), profile.description(), if active { "  ✓" } else { "" });
+        queue!(out, MoveTo(x + 2, y + 2 + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print(pad_or_truncate(&label, panel_width.saturating_sub(4))))?;
+    }
+    queue!(out, MoveTo(x + 2, y + panel_height as u16 - 1), SetForegroundColor(app.theme.muted), Print("Click/Enter apply · ↑↓ select · Esc cancel"))?;
+    Ok(())
+}
+
+pub fn keymap_gallery_item_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<usize> {
+    if app.mode != Mode::KeymapGallery { return None; }
+    let panel_width = 62usize.min(width.saturating_sub(4) as usize);
+    let panel_height = KeymapProfile::ALL.len() + 5;
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = height.saturating_sub(panel_height as u16) / 2;
+    let first = y.saturating_add(2);
+    if column < x || column >= x.saturating_add(panel_width as u16)
+        || row < first || row >= first.saturating_add(KeymapProfile::ALL.len() as u16)
+    {
+        return None;
+    }
+    Some((row - first) as usize)
+}
+
+fn context_menu_geometry(app: &App, width: u16, height: u16) -> Option<(u16, u16, usize)> {
+    let menu = app.context_menu.as_ref()?;
+    let content_width = menu.actions.iter().map(|action| {
+        let hint = action.hint();
+        action.label().len() + if hint.is_empty() { 0 } else { hint.len() + 2 }
+    }).max().unwrap_or(12) + 4;
+    let menu_width = content_width.clamp(20, width.saturating_sub(2) as usize);
+    let menu_height = menu.actions.len().saturating_add(2) as u16;
+    let x = menu.x.min(width.saturating_sub(menu_width as u16 + 1));
+    let y = menu.y.min(height.saturating_sub(menu_height + 1));
+    Some((x, y, menu_width))
+}
+
+fn draw_context_menu<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
+    let Some(menu) = app.context_menu.as_ref() else { return Ok(()); };
+    let Some((x, y, menu_width)) = context_menu_geometry(app, width, height) else { return Ok(()); };
+    queue!(out, MoveTo(x, y), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.border), Print(format!("┌{}┐", "─".repeat(menu_width.saturating_sub(2)))))?;
+    for (index, action) in menu.actions.iter().enumerate() {
+        let selected = index == menu.selected;
+        let hint = action.hint();
+        let inner = menu_width.saturating_sub(2);
+        let label = if hint.is_empty() {
+            format!("  {}", action.label())
+        } else {
+            let left = format!("  {}", action.label());
+            format!("{}{}{} ", left, " ".repeat(inner.saturating_sub(left.len() + hint.len() + 1)), hint)
+        };
+        queue!(out, MoveTo(x, y + 1 + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print("│"), Print(pad_or_truncate(&label, inner)), Print("│"))?;
+    }
+    queue!(out, MoveTo(x, y + menu.actions.len() as u16 + 1), SetBackgroundColor(app.theme.overlay), SetForegroundColor(app.theme.border), Print(format!("└{}┘", "─".repeat(menu_width.saturating_sub(2)))))?;
+    Ok(())
+}
+
+pub fn context_menu_action_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<usize> {
+    let menu = app.context_menu.as_ref()?;
+    let (x, y, menu_width) = context_menu_geometry(app, width, height)?;
+    if column <= x || column >= x.saturating_add(menu_width as u16).saturating_sub(1) {
+        return None;
+    }
+    let first = y.saturating_add(1);
+    if row < first || row >= first.saturating_add(menu.actions.len() as u16) { return None; }
+    Some((row - first) as usize)
+}
+
+/// Returns the theme row under the mouse, if it is inside the gallery list.
+pub fn theme_gallery_item_at(app: &App, width: u16, height: u16, column: u16, row: u16) -> Option<usize> {
+    if app.mode != Mode::ThemeGallery {
+        return None;
+    }
+    let panel_width = 46usize.min(width.saturating_sub(4) as usize);
+    let panel_height = ThemeKind::ALL.len() + 4;
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = height.saturating_sub(panel_height as u16) / 2;
+    if column < x || column >= x.saturating_add(panel_width as u16) {
+        return None;
+    }
+    let first = y.saturating_add(2);
+    if row < first || row >= first.saturating_add(ThemeKind::ALL.len() as u16) {
+        return None;
+    }
+    Some((row - first) as usize)
 }
 
 fn draw_command_palette<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
@@ -941,7 +1084,7 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Search => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
-            Mode::GitDiff => app.theme.command_mode,
+            Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery => app.theme.command_mode,
         }
     };
 
@@ -1051,8 +1194,15 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
         ];
     }
 
-    match app.mode {
-        Mode::Insert => &[
+    match (app.mode, app.keymap_profile()) {
+        (Mode::Insert, KeymapProfile::Conventional) => &[
+            ("Ctrl-S", "Save"),
+            ("Ctrl-F", "Find"),
+            ("Ctrl-Z/Y", "Undo/Redo"),
+            ("Ctrl-Shift-P", "Command"),
+            ("Ctrl-E", "Files"),
+        ],
+        (Mode::Insert, _) => &[
             ("Esc", "Normal"),
             ("Alt-←", "Back"),
             ("Alt-→", "Forward"),
@@ -1061,7 +1211,15 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Ctrl-S", "Save"),
             ("Ctrl-E", "Files"),
         ],
-        Mode::Normal => &[
+        (Mode::Normal, KeymapProfile::Vim) => &[
+            ("i/a/o", "Insert"),
+            ("h j k l", "Move"),
+            ("/", "Find"),
+            ("u/Ctrl-R", "Undo/Redo"),
+            ("Ctrl-E", "Files"),
+            (":", "Command"),
+        ],
+        (Mode::Normal, _) => &[
             ("i", "Insert"),
             ("Alt-←", "Back"),
             ("Alt-→", "Forward"),
@@ -1070,28 +1228,31 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Ctrl-E", "Files"),
             (":", "Command"),
         ],
-        Mode::Search => &[
+        (Mode::Search, _) => &[
             ("Enter", "Accept"),
             ("Esc", "Cancel"),
             ("Alt-←", "Back"),
             ("Alt-→", "Forward"),
         ],
-        Mode::Command => &[
+        (Mode::Command, _) => &[
             ("Enter", "Run"),
             ("Esc", "Cancel"),
             ("Alt-←", "Back"),
             ("Alt-→", "Forward"),
             ("F1", "Help"),
         ],
-        Mode::Help => &[
+        (Mode::Help, _) => &[
             ("←/→", "Page"),
-            ("1-4", "Section"),
+            ("1-5", "Section"),
             ("Esc", "Close"),
             ("F1", "Close"),
         ],
-        Mode::QuitConfirm => &[("S", "Save+Quit"), ("D", "Discard+Quit"), ("Esc", "Cancel")],
-        Mode::ReloadConfirm => &[("R", "Reload"), ("K", "Keep"), ("Esc", "Later")],
-        Mode::GitDiff => &[("↑↓", "Scroll"), ("Esc", "Close")],
+        (Mode::QuitConfirm, _) => &[("S", "Save+Quit"), ("D", "Discard+Quit"), ("Esc", "Cancel")],
+        (Mode::ReloadConfirm, _) => &[("R", "Reload"), ("K", "Keep"), ("Esc", "Later")],
+        (Mode::GitDiff, _) => &[("↑↓", "Scroll"), ("Esc", "Close")],
+        (Mode::GitHistory, _) => &[("↑↓", "Select"), ("Enter", "Inspect"), ("Esc", "Close")],
+        (Mode::ThemeGallery, _) => &[("↑↓", "Preview"), ("Enter", "Apply"), ("Esc", "Cancel")],
+        (Mode::KeymapGallery, _) => &[("↑↓", "Select"), ("Enter", "Apply"), ("Esc", "Cancel")],
     }
 }
 
@@ -1101,7 +1262,7 @@ fn draw_help<W: Write>(
     terminal_width: u16,
     terminal_height: u16,
 ) -> io::Result<()> {
-    const PAGES: [&str; 4] = ["EDITING", "NAVIGATION", "FILES", "COMMANDS"];
+    const PAGES: [&str; 5] = ["EDITING", "NAVIGATION", "FILES", "COMMANDS", "CUSTOMIZE"];
     const EDITING: [(&str, &str); 19] = [
         ("Type normally", "Enter text while in Insert mode"),
         ("Esc", "Switch to Normal mode"),
@@ -1175,13 +1336,25 @@ fn draw_help<W: Write>(
         (":theme oxide / mono", "Change the color theme"),
         ("Ctrl-Q", "Save, discard, or cancel quitting"),
     ];
+    const CUSTOMIZE: [(&str, &str); 9] = [
+        ("Click Themes / :themes", "Open the live theme gallery"),
+        ("Hover a theme", "Temporarily preview its colors"),
+        ("Click / Enter", "Apply and remember the selected theme"),
+        (":keymaps", "Open the keymap profile chooser"),
+        (":keymap caret", "Insert-first Caret workflow"),
+        (":keymap vim", "Modal Vim-style workflow"),
+        (":keymap conventional", "Always-type workflow with Ctrl shortcuts"),
+        ("Ctrl-Shift-P", "Open the command palette from any profile"),
+        (":config", "Show the saved configuration path"),
+    ];
 
     let page = app.help_page.min(PAGES.len() - 1);
     let rows: &[(&str, &str)] = match page {
         0 => &EDITING,
         1 => &NAVIGATION,
         2 => &FILES,
-        _ => &COMMANDS,
+        3 => &COMMANDS,
+        _ => &CUSTOMIZE,
     };
 
     let box_width = 76usize.min(terminal_width.saturating_sub(4) as usize);
@@ -1309,7 +1482,7 @@ fn place_cursor<W: Write>(
     terminal_width: u16,
     terminal_height: u16,
 ) -> io::Result<()> {
-    if matches!(app.mode, Mode::Help | Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff)
+    if matches!(app.mode, Mode::Help | Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery)
         || (app.explorer_focused && !matches!(app.mode, Mode::Command | Mode::Search)) {
         return queue!(out, Hide);
     }

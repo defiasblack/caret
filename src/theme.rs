@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 pub enum ThemeKind {
     Oxide,
     Mono,
+    Nord,
+    Dracula,
+    Solarized,
+}
+
+impl ThemeKind {
+    pub const ALL: [Self; 5] = [Self::Oxide, Self::Nord, Self::Dracula, Self::Solarized, Self::Mono];
+    pub fn name(self) -> &'static str { match self { Self::Oxide => "Oxide", Self::Mono => "Monochrome", Self::Nord => "Nord", Self::Dracula => "Dracula", Self::Solarized => "Solarized Dark" } }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +55,9 @@ impl Theme {
         match kind {
             ThemeKind::Oxide => Self::oxide(),
             ThemeKind::Mono => Self::mono(),
+            ThemeKind::Nord => Self::nord(),
+            ThemeKind::Dracula => Self::dracula(),
+            ThemeKind::Solarized => Self::solarized(),
         }
     }
 
@@ -118,5 +129,35 @@ impl Theme {
             error: Color::White,
             success: Color::White,
         }
+    }
+
+    fn nord() -> Self {
+        let mut theme = Self::oxide();
+        theme.background = Color::Rgb { r: 46, g: 52, b: 64 }; theme.foreground = Color::Rgb { r: 216, g: 222, b: 233 };
+        theme.current_line = Color::Rgb { r: 59, g: 66, b: 82 }; theme.top_bar = Color::Rgb { r: 59, g: 66, b: 82 };
+        theme.prompt_bar = Color::Rgb { r: 36, g: 41, b: 51 }; theme.keyword = Color::Rgb { r: 180, g: 142, b: 173 };
+        theme.string = Color::Rgb { r: 163, g: 190, b: 140 }; theme.type_name = Color::Rgb { r: 136, g: 192, b: 208 };
+        theme.heading = Color::Rgb { r: 129, g: 161, b: 193 }; theme.top_bar_text = Color::Rgb { r: 136, g: 192, b: 208 };
+        theme
+    }
+
+    fn dracula() -> Self {
+        let mut theme = Self::oxide();
+        theme.background = Color::Rgb { r: 40, g: 42, b: 54 }; theme.foreground = Color::Rgb { r: 248, g: 248, b: 242 };
+        theme.current_line = Color::Rgb { r: 68, g: 71, b: 90 }; theme.top_bar = Color::Rgb { r: 68, g: 71, b: 90 };
+        theme.prompt_bar = Color::Rgb { r: 33, g: 34, b: 44 }; theme.keyword = Color::Rgb { r: 255, g: 121, b: 198 };
+        theme.string = Color::Rgb { r: 241, g: 250, b: 140 }; theme.number = Color::Rgb { r: 189, g: 147, b: 249 };
+        theme.type_name = Color::Rgb { r: 139, g: 233, b: 253 }; theme.heading = Color::Rgb { r: 80, g: 250, b: 123 };
+        theme.top_bar_text = Color::Rgb { r: 255, g: 184, b: 108 }; theme
+    }
+
+    fn solarized() -> Self {
+        let mut theme = Self::oxide();
+        theme.background = Color::Rgb { r: 0, g: 43, b: 54 }; theme.foreground = Color::Rgb { r: 131, g: 148, b: 150 };
+        theme.current_line = Color::Rgb { r: 7, g: 54, b: 66 }; theme.top_bar = Color::Rgb { r: 7, g: 54, b: 66 };
+        theme.prompt_bar = Color::Rgb { r: 0, g: 34, b: 43 }; theme.keyword = Color::Rgb { r: 133, g: 153, b: 0 };
+        theme.string = Color::Rgb { r: 42, g: 161, b: 152 }; theme.number = Color::Rgb { r: 211, g: 54, b: 130 };
+        theme.type_name = Color::Rgb { r: 181, g: 137, b: 0 }; theme.heading = Color::Rgb { r: 38, g: 139, b: 210 };
+        theme.top_bar_text = Color::Rgb { r: 203, g: 75, b: 22 }; theme
     }
 }
