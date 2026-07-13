@@ -7,10 +7,12 @@
 - [x] Periodic crash-recovery journal in the platform application-data directory
 - [x] Recovery commands: `:recover` and `:discardrecovery`
 - [x] Structured panic log, terminal restoration, `caret doctor`, and safe in-editor diagnostic-copy commands
+- [x] Headless SSH clipboard fallback through OSC 52 terminal clipboard transfer
 - [x] Session restoration for projects, tabs, active tab, cursor/scroll, split layout, and sidebar state (terminals are intentionally excluded)
 - [x] External-change reload, overwrite, and compare choices
 - [x] Recovery discovery with filename/timestamp and recover/compare/discard commands
 - [x] Windows, macOS, and Linux CI build/test/diagnostic smoke matrix
+- [x] Ubuntu install and pseudo-terminal startup smoke test
 - [ ] Run the documented forced-termination smoke tests on Windows, macOS, and Linux before release (`docs/SMOKE_TEST_0.6.md`)
 
 

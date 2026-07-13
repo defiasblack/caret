@@ -311,7 +311,7 @@ pub struct App {
 impl App {
     pub fn new(path: Option<&Path>) -> io::Result<Self> {
         let (settings, mut config_message) = config::load();
-        let restored_session = if settings.restore_session && path.is_none() {
+        let restored_session = if !cfg!(test) && settings.restore_session && path.is_none() {
             match crate::session::load() {
                 Ok(session) => session,
                 Err(error) => {
@@ -535,6 +535,12 @@ impl App {
         }
         if path.is_some() {
             app.remember_current_project();
+        }
+        // Opening an explicit file is an editor action. Keep the project tree
+        // visible, but never leave it focused after startup.
+        if editor_path.is_some() {
+            app.explorer_focused = false;
+            app.mode = app.preferred_editor_mode();
         }
         app.refresh_git_line_changes();
         Ok(app)
@@ -1322,12 +1328,7 @@ impl App {
         };
 
         self.yank = text;
-        self.message = match arboard::Clipboard::new()
-            .and_then(|mut clipboard| clipboard.set_text(self.yank.clone()))
-        {
-            Ok(()) => "Copied selection to clipboard".to_string(),
-            Err(_) => "Copied selection (internal clipboard)".to_string(),
-        };
+        self.message = copy_message(crate::clipboard::copy(&self.yank), "Copied selection");
     }
 
     fn show_diagnostic_report(&mut self) {
@@ -1343,12 +1344,10 @@ impl App {
 
     fn copy_diagnostic_report(&mut self) {
         self.yank = crate::diagnostics::report(env!("CARGO_PKG_VERSION"));
-        self.message = match arboard::Clipboard::new()
-            .and_then(|mut clipboard| clipboard.set_text(self.yank.clone()))
-        {
-            Ok(()) => "Diagnostic report copied to clipboard".to_string(),
-            Err(_) => "Diagnostic report copied to internal clipboard".to_string(),
-        };
+        self.message = copy_message(
+            crate::clipboard::copy(&self.yank),
+            "Diagnostic report copied",
+        );
     }
 
     pub fn active_search_query(&self) -> &str {
@@ -1787,6 +1786,23 @@ impl App {
             return;
         }
 
+        if self.explorer_focused
+            && matches!(self.mode, Mode::Normal | Mode::Insert)
+            && key.code == KeyCode::Char(':')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.command_input.clear();
+            self.command_cursor = 0;
+            self.command_anchor = None;
+            self.command_selection = None;
+            self.command_suggestion = 0;
+            self.mode = Mode::Command;
+            self.message = "Command palette".to_string();
+            return;
+        }
+
         if matches!(self.mode, Mode::Normal | Mode::Insert) && self.explorer_focused {
             self.handle_explorer(key);
             return;
@@ -2018,12 +2034,8 @@ impl App {
                         self.editor.checkpoint();
                         self.yank = text;
                         self.editor.delete_selection();
-                        self.message = match arboard::Clipboard::new()
-                            .and_then(|mut clipboard| clipboard.set_text(self.yank.clone()))
-                        {
-                            Ok(()) => "Cut selection to clipboard".to_string(),
-                            Err(_) => "Cut selection (internal clipboard)".to_string(),
-                        };
+                        self.message =
+                            copy_message(crate::clipboard::copy(&self.yank), "Cut selection");
                     } else {
                         self.message = "Select text to cut".to_string();
                     }
@@ -3233,7 +3245,8 @@ impl App {
                 }
             }
             KeyCode::Char(':') | KeyCode::Char(';')
-                if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                if key.code == KeyCode::Char(':')
+                    || key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 self.command_input.clear();
                 self.command_cursor = 0;
@@ -5524,6 +5537,16 @@ fn previous_char_boundary(text: &str, index: usize) -> usize {
         .map_or(0, |(offset, _)| offset)
 }
 
+fn copy_message(result: io::Result<crate::clipboard::CopyMethod>, action: &str) -> String {
+    match result {
+        Ok(crate::clipboard::CopyMethod::System) => format!("{action} to clipboard"),
+        Ok(crate::clipboard::CopyMethod::TerminalOsc52) => {
+            format!("{action} via terminal clipboard")
+        }
+        Err(error) => format!("{action} (internal clipboard only: {error})"),
+    }
+}
+
 fn recovery_diff_lines(current: &str, recovered: &str) -> Vec<String> {
     let current = current.lines().collect::<Vec<_>>();
     let recovered = recovered.lines().collect::<Vec<_>>();
@@ -5735,5 +5758,38 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.editor.text(), "Console");
         assert!(app.lsp_panel.is_none());
+    }
+
+    #[test]
+    fn colon_opens_the_command_palette_from_the_file_explorer() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::Normal;
+        app.explorer_focused = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.message, "Command palette");
+    }
+
+    #[test]
+    fn colon_opens_the_command_palette_in_normal_mode_without_shift_metadata() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Command);
+    }
+
+    #[test]
+    fn explicit_file_startup_focuses_the_editor() {
+        let path = std::env::temp_dir().join(format!("caret-startup-{}.txt", std::process::id()));
+        fs::write(&path, "content").expect("write file");
+
+        let app = App::new(Some(&path)).expect("create app");
+
+        assert!(!app.explorer_focused);
+        let _ = fs::remove_file(path);
     }
 }

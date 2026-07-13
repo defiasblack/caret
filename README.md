@@ -259,6 +259,10 @@ The pane uses a real PTY/ConPTY, so interactive shells, terminal colors, and
 full-screen terminal programs work inside Caret. Set `CARET_SHELL` to override
 the default shell.
 
+When no desktop clipboard is available—for example in a headless SSH session—
+Caret copies through the OSC 52 terminal clipboard protocol. The terminal
+emulator must permit OSC 52 for copied text to reach the local clipboard.
+
 ## Plugins
 
 Run `:plugindir` to find the plugin directory, add a TOML manifest, and run
