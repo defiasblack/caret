@@ -13,8 +13,6 @@ milestone.
 
 ## Project workflow
 
-- Git status, gutter indicators, diff viewer, and basic stage/history actions
-- Integrated terminal pane
 
 ## Customization and ecosystem
 
@@ -22,9 +20,6 @@ milestone.
 
 ## Polish
 
-- Recent-project dashboard
-- Better progress, notification, and background-task status UI
-- Accessibility audit and terminal compatibility test matrix
 
 ## Known bugs
 

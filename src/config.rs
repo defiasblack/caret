@@ -47,6 +47,8 @@ pub struct Settings {
     pub tree_width: usize,
     pub show_hidden_files: bool,
     pub restore_session: bool,
+    pub recent_projects: Vec<PathBuf>,
+    pub reduced_motion: bool,
     pub max_search_results: usize,
     pub format_on_save: bool,
 }
@@ -61,6 +63,8 @@ impl Default for Settings {
             tree_width: 40,
             show_hidden_files: false,
             restore_session: true,
+            recent_projects: Vec::new(),
+            reduced_motion: false,
             max_search_results: 500,
             format_on_save: false,
         }

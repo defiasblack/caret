@@ -23,6 +23,7 @@ use crate::{
     project::ProjectTree,
     syntax::Language,
     tabs::{OpenDisposition, Tabs},
+    terminal::TerminalPane,
     theme::{Theme, ThemeKind},
 };
 
@@ -40,6 +41,7 @@ pub enum Mode {
     ThemeGallery,
     KeymapGallery,
     ContextMenu,
+    Dashboard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +77,7 @@ impl Mode {
             Self::ThemeGallery => "THEMES",
             Self::KeymapGallery => "KEYMAPS",
             Self::ContextMenu => "MENU",
+            Self::Dashboard => "WELCOME",
         }
     }
 }
@@ -106,6 +109,15 @@ pub struct SplitViews {
 
 #[derive(Debug, Clone)]
 pub struct GitHistoryEntry { pub hash: String, pub summary: String }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitLineChange { Added, Modified, Deleted }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundState { Working, Ready, Warning, Error }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LspStatus { Off, Starting, Loading, Ready, Error }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextAction {
@@ -194,6 +206,7 @@ pub struct App {
     pub follow_cursor: bool,
     pub split_views: Option<SplitViews>,
     pub help_page: usize,
+    help_return_mode: Mode,
     pub hover_target: Option<HoverTarget>,
     settings: Settings,
     pending_key: Option<char>,
@@ -212,17 +225,31 @@ pub struct App {
     lsp_requests: HashMap<u64, String>,
     lsp_initialized: bool,
     lsp_workspace_ready: bool,
+    lsp_status: LspStatus,
+    lsp_started_at: Option<Instant>,
+    diagnostic_count: usize,
+    background_tick: usize,
+    last_background_animation: Instant,
+    observed_message: String,
+    message_changed_at: Instant,
     lsp_last_text: String,
     pending_save_after_disk_change: bool,
     pub git_diff_lines: Vec<String>,
     pub git_diff_scroll: usize,
     pub git_history: Vec<GitHistoryEntry>,
     pub git_history_selected: usize,
+    git_line_changes: HashMap<usize, GitLineChange>,
     pub theme_gallery_selected: usize,
     theme_gallery_original: ThemeKind,
+    theme_gallery_return_mode: Mode,
     pub keymap_gallery_selected: usize,
+    keymap_gallery_return_mode: Mode,
     pub context_menu: Option<ContextMenu>,
     context_menu_previous_mode: Mode,
+    pub dashboard_selected: usize,
+    pub dashboard_hover: Option<usize>,
+    terminal: Option<TerminalPane>,
+    pub terminal_focused: bool,
 }
 
 impl App {
@@ -259,14 +286,17 @@ impl App {
         project.show_hidden = settings.show_hidden_files;
         let _ = project.refresh();
         project.refresh_git_status();
-        let mode = if explorer_focused || settings.keymap == KeymapProfile::Vim {
+        let show_dashboard = path.is_none();
+        let mode = if show_dashboard {
+            Mode::Dashboard
+        } else if explorer_focused || settings.keymap == KeymapProfile::Vim {
             Mode::Normal
         } else {
             Mode::Insert
         };
-        let initial_theme = settings.theme;
+        let initial_theme = if std::env::var_os("NO_COLOR").is_some() { ThemeKind::Mono } else { settings.theme };
 
-        Ok(Self {
+        let mut app = Self {
             editor,
             project,
             explorer_focused,
@@ -283,19 +313,23 @@ impl App {
             search_input: String::new(),
             last_search: String::new(),
             message: config_message.unwrap_or_else(|| {
+                if show_dashboard {
+                    return "Welcome to Caret · choose a recent project or open the current folder".to_string();
+                }
                 if explorer_focused {
                     "FILES · Enter opens · Ctrl-E returns to editor".to_string()
                 } else {
                     "-- INSERT -- · Ctrl-E opens files · Ctrl-S saves".to_string()
                 }
             }),
-            theme_kind: settings.theme,
-            theme: Theme::for_kind(settings.theme),
+            theme_kind: initial_theme,
+            theme: Theme::for_kind(initial_theme),
             viewport_rows: 1,
             viewport_columns: 1,
             follow_cursor: true,
             split_views: None,
             help_page: 0,
+            help_return_mode: mode,
             hover_target: None,
             settings,
             pending_key: None,
@@ -314,18 +348,35 @@ impl App {
             lsp_requests: HashMap::new(),
             lsp_initialized: false,
             lsp_workspace_ready: false,
+            lsp_status: LspStatus::Off,
+            lsp_started_at: None,
+            diagnostic_count: 0,
+            background_tick: 0,
+            last_background_animation: Instant::now(),
+            observed_message: String::new(),
+            message_changed_at: Instant::now(),
             lsp_last_text: String::new(),
             pending_save_after_disk_change: false,
             git_diff_lines: Vec::new(),
             git_diff_scroll: 0,
             git_history: Vec::new(),
             git_history_selected: 0,
+            git_line_changes: HashMap::new(),
             theme_gallery_selected: 0,
             theme_gallery_original: initial_theme,
+            theme_gallery_return_mode: mode,
             keymap_gallery_selected: 0,
+            keymap_gallery_return_mode: mode,
             context_menu: None,
             context_menu_previous_mode: mode,
-        })
+            dashboard_selected: 0,
+            dashboard_hover: None,
+            terminal: None,
+            terminal_focused: false,
+        };
+        if path.is_some() { app.remember_current_project(); }
+        app.refresh_git_line_changes();
+        Ok(app)
     }
 
     pub fn handle_event(&mut self, event: Event) -> bool {
@@ -355,6 +406,18 @@ impl App {
                 true
             }
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                if self.mode == Mode::Dashboard {
+                    if let Ok((width, height)) = terminal::size() {
+                        let hit = crate::ui::dashboard_hit_at(self, width, height, mouse.column, mouse.row);
+                        if hit != self.dashboard_hover {
+                            self.dashboard_hover = hit;
+                            if let Some(index) = hit.filter(|index| *index < self.settings.recent_projects.len()) {
+                                self.dashboard_selected = index;
+                            }
+                            return true;
+                        }
+                    }
+                }
                 if self.mode == Mode::ContextMenu {
                     if let Ok((width, height)) = terminal::size() {
                         if let Some(index) = crate::ui::context_menu_action_at(self, width, height, mouse.column, mouse.row) {
@@ -397,12 +460,34 @@ impl App {
 
     pub fn poll_background(&mut self) -> bool {
         let message = self.message.clone();
+        let mut changed = false;
+        if let Some(terminal) = self.terminal.as_mut() { changed |= terminal.poll(); }
         self.poll_lsp();
         if self.mode != Mode::ReloadConfirm && self.editor.changed_on_disk() {
             self.mode = Mode::ReloadConfirm;
             self.message = "File changed on disk — [R] Reload   [K] Keep buffer   [Esc] Later".to_string();
         }
-        self.message != message
+        if self.message != self.observed_message {
+            self.observed_message = self.message.clone();
+            self.message_changed_at = Instant::now();
+            changed = true;
+        } else if matches!(self.mode, Mode::Normal | Mode::Insert)
+            && !self.message.is_empty()
+            && self.message_changed_at.elapsed() >= Duration::from_secs(7)
+        {
+            self.message.clear();
+            self.observed_message.clear();
+            changed = true;
+        }
+        if matches!(self.lsp_status, LspStatus::Starting | LspStatus::Loading)
+            && !self.reduced_motion()
+            && self.last_background_animation.elapsed() >= Duration::from_millis(200)
+        {
+            self.background_tick = self.background_tick.wrapping_add(1);
+            self.last_background_animation = Instant::now();
+            changed = true;
+        }
+        changed || self.message != message
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -419,6 +504,25 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if self.mode == Mode::Dashboard {
+                if let Some(hit) = crate::ui::dashboard_hit_at(self, width, height, mouse.column, mouse.row) {
+                    if hit < self.settings.recent_projects.len() {
+                        self.dashboard_selected = hit;
+                        self.open_selected_recent_project();
+                    } else if hit == self.settings.recent_projects.len() {
+                        self.open_current_folder_from_dashboard();
+                    } else {
+                        self.command_input = "e ".to_string();
+                        self.command_cursor = self.command_input.len();
+                        self.command_selection = None;
+                        self.command_anchor = None;
+                        self.mode = Mode::Command;
+                        self.message = "Enter a file or folder path".to_string();
+                    }
+                    return;
+                }
+                if mouse.row != 0 { return; }
+            }
             if self.mode == Mode::ContextMenu {
                 if let Some(index) = crate::ui::context_menu_action_at(self, width, height, mouse.column, mouse.row) {
                     if let Some(menu) = self.context_menu.as_mut() { menu.selected = index; }
@@ -434,7 +538,7 @@ impl App {
                     self.preview_gallery_theme();
                     self.settings.theme = self.theme_kind;
                     self.persist_settings();
-                    self.mode = self.preferred_editor_mode();
+                    self.mode = self.theme_gallery_return_mode;
                     self.message = format!("Theme: {}", self.theme_kind.name());
                 }
                 return;
@@ -461,10 +565,15 @@ impl App {
             && (mouse.column as usize) < layout.sidebar_width
             && mouse.row >= layout.content_top
             && (mouse.row as usize) < layout.content_top as usize + layout.content_height;
+        let over_terminal = layout.terminal_height > 0
+            && mouse.row >= layout.terminal_top.saturating_sub(1)
+            && mouse.row < layout.terminal_top.saturating_add(layout.terminal_height as u16);
 
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if over_sidebar {
+                if over_terminal {
+                    if let Some(terminal) = self.terminal.as_mut() { terminal.scroll_up(3); }
+                } else if over_sidebar {
                     for _ in 0..3 {
                         self.project.move_up();
                     }
@@ -476,7 +585,9 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if over_sidebar {
+                if over_terminal {
+                    if let Some(terminal) = self.terminal.as_mut() { terminal.scroll_down(3); }
+                } else if over_sidebar {
                     for _ in 0..3 {
                         self.project.move_down();
                     }
@@ -631,6 +742,17 @@ impl App {
         self.follow_cursor = true;
         let layout = crate::ui::screen_layout(self, width, height);
 
+        if layout.terminal_height > 0
+            && row >= layout.terminal_top.saturating_sub(1)
+            && row < layout.terminal_top.saturating_add(layout.terminal_height as u16)
+        {
+            self.terminal_focused = true;
+            self.explorer_focused = false;
+            self.message = "Terminal focused · Ctrl-` returns to editor".to_string();
+            return;
+        }
+        self.terminal_focused = false;
+
         if row == layout.hotkey_row {
             if crate::ui::hotkey_action_at(self, width, column) == Some("Command") {
                 self.explorer_focused = false;
@@ -667,7 +789,7 @@ impl App {
 
         if row == 0 && column >= width.saturating_sub(20) {
             self.explorer_focused = false;
-            self.mode = Mode::Help;
+            self.open_help();
             return;
         }
 
@@ -870,7 +992,9 @@ impl App {
     }
 
     pub fn active_panel_label(&self) -> &'static str {
-        if self.explorer_focused {
+        if self.terminal_focused {
+            "TERMINAL"
+        } else if self.explorer_focused {
             match self.sidebar_view {
                 SidebarView::Files => "FILES",
                 SidebarView::Outline => "SYMBOLS",
@@ -878,6 +1002,41 @@ impl App {
         } else {
             self.mode.label()
         }
+    }
+
+    pub fn background_status(&self) -> Option<(String, BackgroundState)> {
+        const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+        match self.lsp_status {
+            LspStatus::Off => None,
+            LspStatus::Starting => {
+                let slow = self.lsp_started_at.is_some_and(|started| started.elapsed() > Duration::from_secs(30));
+                Some((
+                    if slow { "LSP starting slowly".to_string() } else if self.reduced_motion() { "LSP starting".to_string() } else { format!("{} LSP starting", SPINNER[self.background_tick % SPINNER.len()]) },
+                    if slow { BackgroundState::Warning } else { BackgroundState::Working },
+                ))
+            }
+            LspStatus::Loading => {
+                let slow = self.lsp_started_at.is_some_and(|started| started.elapsed() > Duration::from_secs(30));
+                Some((
+                    if slow { "LSP workspace still loading".to_string() } else if self.reduced_motion() { "LSP loading".to_string() } else { format!("{} LSP loading", SPINNER[self.background_tick % SPINNER.len()]) },
+                    if slow { BackgroundState::Warning } else { BackgroundState::Working },
+                ))
+            }
+            LspStatus::Ready => Some((
+                if self.diagnostic_count == 0 { "LSP ready".to_string() } else { format!("LSP ready · {} issues", self.diagnostic_count) },
+                if self.diagnostic_count == 0 { BackgroundState::Ready } else { BackgroundState::Warning },
+            )),
+            LspStatus::Error => Some(("LSP error".to_string(), BackgroundState::Error)),
+        }
+    }
+
+    pub fn reduced_motion(&self) -> bool {
+        self.settings.reduced_motion || std::env::var_os("CARET_REDUCED_MOTION").is_some()
+    }
+
+    fn open_help(&mut self) {
+        if self.mode != Mode::Help { self.help_return_mode = self.mode; }
+        self.mode = Mode::Help;
     }
 
     fn activate_focused_view(&mut self) {
@@ -908,6 +1067,45 @@ impl App {
         }
     }
 
+    pub fn terminal_visible(&self) -> bool { self.terminal.is_some() }
+    pub fn terminal_shell_name(&self) -> &str { self.terminal.as_ref().map_or("Terminal", |terminal| terminal.shell_name.as_str()) }
+    pub fn terminal_cwd(&self) -> Option<&Path> { self.terminal.as_ref().map(|terminal| terminal.cwd.as_path()) }
+    pub fn terminal_lines(&self, rows: usize) -> Vec<String> { self.terminal.as_ref().map_or_else(Vec::new, |terminal| terminal.visible_lines(rows)) }
+    pub fn terminal_input(&self) -> &str { self.terminal.as_ref().map_or("", TerminalPane::input) }
+    pub fn terminal_cursor_column(&self) -> usize { self.terminal.as_ref().map_or(2, TerminalPane::cursor_column) }
+    pub fn terminal_exited(&self) -> bool { self.terminal.as_ref().is_some_and(TerminalPane::is_exited) }
+
+    fn open_terminal(&mut self) {
+        if self.terminal.is_none() {
+            match TerminalPane::start(&self.project.root) {
+                Ok(terminal) => self.terminal = Some(terminal),
+                Err(error) => {
+                    self.message = format!("Could not start terminal: {error}");
+                    return;
+                }
+            }
+        }
+        if self.mode == Mode::Dashboard { self.mode = self.preferred_editor_mode(); }
+        self.explorer_focused = false;
+        self.terminal_focused = true;
+        self.message = "Terminal focused · Ctrl-` returns to editor".to_string();
+    }
+
+    fn toggle_terminal_focus(&mut self) {
+        if self.terminal.is_none() {
+            self.open_terminal();
+        } else {
+            self.terminal_focused = !self.terminal_focused;
+            self.message = if self.terminal_focused { "Terminal focused · Ctrl-` returns to editor" } else { "Editor focused · Ctrl-` returns to terminal" }.to_string();
+        }
+    }
+
+    fn close_terminal(&mut self) {
+        self.terminal = None;
+        self.terminal_focused = false;
+        self.message = "Terminal closed".to_string();
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         // Quit confirmation gets first chance at every key so terminal/editor
         // shortcuts cannot accidentally dismiss or bypass the prompt.
@@ -917,6 +1115,58 @@ impl App {
         }
         if self.mode == Mode::ReloadConfirm {
             self.handle_reload_confirmation(key);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('`' | '~'))
+        {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.close_terminal();
+            } else {
+                self.toggle_terminal_focus();
+            }
+            return;
+        }
+        if self.terminal_focused {
+            if key.code == KeyCode::F(1) {
+                self.terminal_focused = false;
+                self.open_help();
+            } else if let Some(terminal) = self.terminal.as_mut() {
+                if let Err(error) = terminal.handle_key(key) {
+                    self.message = format!("Terminal input failed: {error}");
+                }
+            }
+            return;
+        }
+        if self.mode == Mode::Dashboard {
+            if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::Char('p' | 'P'))
+                && self.handle_global_shortcut(key)
+            {
+                return;
+            }
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.dashboard_selected = self.dashboard_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.dashboard_selected = (self.dashboard_selected + 1)
+                        .min(self.settings.recent_projects.len().saturating_sub(1));
+                }
+                KeyCode::Enter => self.open_selected_recent_project(),
+                KeyCode::Char('c') | KeyCode::Esc => self.open_current_folder_from_dashboard(),
+                KeyCode::Char('e') | KeyCode::Char(':') => {
+                    self.command_input = "e ".to_string();
+                    self.command_cursor = self.command_input.len();
+                    self.command_selection = None;
+                    self.command_anchor = None;
+                    self.mode = Mode::Command;
+                    self.message = "Enter a file or folder path".to_string();
+                }
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::F(1) | KeyCode::Char('?') => self.open_help(),
+                _ => {}
+            }
             return;
         }
         if self.mode == Mode::GitDiff {
@@ -942,10 +1192,10 @@ impl App {
         }
         if self.mode == Mode::ThemeGallery {
             match key.code {
-                KeyCode::Esc => { self.theme_kind = self.theme_gallery_original; self.theme = Theme::for_kind(self.theme_kind); self.mode = self.preferred_editor_mode(); self.message = "Theme preview cancelled".to_string(); }
+                KeyCode::Esc => { self.theme_kind = self.theme_gallery_original; self.theme = Theme::for_kind(self.theme_kind); self.mode = self.theme_gallery_return_mode; self.message = "Theme preview cancelled".to_string(); }
                 KeyCode::Up | KeyCode::Char('k') => { self.theme_gallery_selected = self.theme_gallery_selected.saturating_sub(1); self.preview_gallery_theme(); }
                 KeyCode::Down | KeyCode::Char('j') => { self.theme_gallery_selected = (self.theme_gallery_selected + 1).min(ThemeKind::ALL.len() - 1); self.preview_gallery_theme(); }
-                KeyCode::Enter => { self.settings.theme = self.theme_kind; self.persist_settings(); self.mode = self.preferred_editor_mode(); self.message = format!("Theme: {}", self.theme_kind.name()); }
+                KeyCode::Enter => { self.settings.theme = self.theme_kind; self.persist_settings(); self.mode = self.theme_gallery_return_mode; self.message = format!("Theme: {}", self.theme_kind.name()); }
                 _ => {}
             }
             return;
@@ -953,7 +1203,7 @@ impl App {
         if self.mode == Mode::KeymapGallery {
             match key.code {
                 KeyCode::Esc => {
-                    self.mode = self.preferred_editor_mode();
+                    self.mode = self.keymap_gallery_return_mode;
                     self.message = "Keymap selection cancelled".to_string();
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -1016,7 +1266,7 @@ impl App {
             Mode::Command => self.handle_command_input(key),
             Mode::Help => match key.code {
                 KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
-                    self.mode = self.preferred_editor_mode();
+                    self.mode = self.help_return_mode;
                 }
                 KeyCode::Left | KeyCode::Up | KeyCode::PageUp => {
                     self.help_page = self.help_page.saturating_sub(1);
@@ -1029,7 +1279,7 @@ impl App {
                 }
                 _ => {}
             },
-            Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery | Mode::ContextMenu => {}
+            Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery | Mode::ContextMenu | Mode::Dashboard => {}
         }
     }
 
@@ -1463,10 +1713,46 @@ impl App {
         command.arg("-C").arg(&self.project.root);
         if stage { command.args(["add", "--", &relative]); } else { command.args(["restore", "--staged", "--", &relative]); }
         match command.output() {
-            Ok(output) if output.status.success() => { self.project.refresh_git_status(); self.message = if stage { "Staged selected file" } else { "Unstaged selected file" }.to_string(); }
+            Ok(output) if output.status.success() => { self.project.refresh_git_status(); self.refresh_git_line_changes(); self.message = if stage { "Staged selected file" } else { "Unstaged selected file" }.to_string(); }
             Ok(output) => self.message = format!("Git failed: {}", String::from_utf8_lossy(&output.stderr).trim()),
             Err(error) => self.message = format!("Git failed: {error}"),
         }
+    }
+
+    pub fn git_line_change(&self, line: usize) -> Option<GitLineChange> {
+        self.git_line_changes.get(&line).copied()
+    }
+
+    fn refresh_git_line_changes(&mut self) {
+        self.git_line_changes.clear();
+        let Some(path) = self.editor.path.as_ref() else { return; };
+        let Ok(relative) = path.strip_prefix(&self.project.root) else { return; };
+        let relative_text = relative.to_string_lossy().to_string();
+
+        let tracked = Command::new("git")
+            .arg("-C").arg(&self.project.root)
+            .args(["ls-files", "--error-unmatch", "--", &relative_text])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !tracked {
+            if path.exists() {
+                for line in 0..self.editor.line_count() {
+                    self.git_line_changes.insert(line, GitLineChange::Added);
+                }
+            }
+            return;
+        }
+
+        let Ok(output) = Command::new("git")
+            .arg("-C").arg(&self.project.root)
+            .args(["diff", "HEAD", "--unified=0", "--", &relative_text])
+            .output()
+        else { return; };
+        if !output.status.success() { return; }
+        self.git_line_changes = parse_git_hunks(
+            &String::from_utf8_lossy(&output.stdout),
+            self.editor.line_count(),
+        );
     }
 
     fn show_git_diff(&mut self) {
@@ -1696,6 +1982,7 @@ impl App {
             self.editor.len(),
             self.editor.active_title()
         );
+        self.refresh_git_line_changes();
     }
 
     fn close_active_tab(&mut self, force: bool) {
@@ -1738,7 +2025,7 @@ impl App {
         match key.code {
             KeyCode::F(1) | KeyCode::Char('?') => {
                 self.explorer_focused = false;
-                self.mode = Mode::Help;
+                self.open_help();
             }
             KeyCode::Esc => {
                 self.explorer_focused = false;
@@ -1829,6 +2116,7 @@ impl App {
                             }
                             OpenDisposition::Switched => format!("Switched to {}", path.display()),
                         };
+                        self.refresh_git_line_changes();
                     }
                     Err(error) => self.message = format!("Open failed: {error}"),
                 }
@@ -1973,7 +2261,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::F(1) | KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::F(1) | KeyCode::Char('?') => self.open_help(),
             KeyCode::Char('i') => self.enter_insert(false),
             KeyCode::Char('a') => self.enter_insert(true),
             KeyCode::Char('o') => {
@@ -2139,7 +2427,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::F(1) => self.mode = Mode::Help,
+            KeyCode::F(1) => self.open_help(),
             KeyCode::F(7) => {
                 self.editor.checkpoint();
                 self.editor.duplicate_line();
@@ -2370,7 +2658,7 @@ impl App {
     }
 
     pub fn command_suggestions(&self) -> Vec<&'static str> {
-        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "newfile", "newdir", "rename", "copy", "move", "delete", "delete!", "refresh", "gitrefresh", "stage", "unstage", "diff", "history", "symbols", "outline", "split", "vsplit", "only", "unsplit", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set number", "set nonumber", "set", "theme", "themes", "keymap", "keymaps", "help"];
+        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "newfile", "newdir", "rename", "copy", "move", "delete", "delete!", "refresh", "gitrefresh", "stage", "unstage", "diff", "history", "symbols", "outline", "split", "vsplit", "only", "unsplit", "terminal", "terminalfocus", "terminalclose", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set reducedmotion", "set noreducedmotion", "set number", "set nonumber", "set", "theme", "themes", "keymap", "keymaps", "help"];
         let query = self.command_input.trim().to_ascii_lowercase();
         COMMANDS.iter().copied().filter(|command| command.contains(&query)).collect()
     }
@@ -2544,7 +2832,7 @@ impl App {
                 Ok(()) => { self.project.refresh_git_status(); self.message = "File tree refreshed".to_string() },
                 Err(error) => self.message = format!("Refresh failed: {error}"),
             },
-            "gitrefresh" => { self.project.refresh_git_status(); self.message = "Git status refreshed".to_string(); },
+            "gitrefresh" => { self.project.refresh_git_status(); self.refresh_git_line_changes(); self.message = "Git status and gutter refreshed".to_string(); },
             "stage" => self.git_selected(true),
             "unstage" => self.git_selected(false),
             "diff" => self.show_git_diff(),
@@ -2593,6 +2881,11 @@ impl App {
             "split" => self.open_split(false),
             "vsplit" => self.open_split(true),
             "only" | "unsplit" => { self.split_views = None; self.message = "Split closed".to_string(); }
+            "terminal" | "term" => {
+                if self.terminal.is_none() { self.open_terminal(); } else { self.toggle_terminal_focus(); }
+            }
+            "terminalfocus" | "termfocus" => self.open_terminal(),
+            "terminalclose" | "termclose" => self.close_terminal(),
             "fold" | "foldclose" => self.close_fold(),
             "foldopen" => self.open_fold(),
             "foldtoggle" => self.toggle_fold(),
@@ -2645,6 +2938,9 @@ impl App {
             "lsp" => self.start_lsp(),
             "lspstop" => {
                 self.lsp = None;
+                self.lsp_status = LspStatus::Off;
+                self.lsp_started_at = None;
+                self.diagnostic_count = 0;
                 self.message = "LSP stopped".to_string();
             }
             "hover" => self.request_hover(),
@@ -2653,7 +2949,7 @@ impl App {
             "references" | "refs" => self.request_lsp_position("textDocument/references"),
             "actions" => self.request_lsp_position("textDocument/codeAction"),
             "format" => self.request_formatting(),
-            "help" | "h" => self.mode = Mode::Help,
+            "help" | "h" => self.open_help(),
             _ => self.message = format!("Unknown command: {command}"),
         }
     }
@@ -2664,10 +2960,48 @@ impl App {
                 self.project.visible = true;
                 self.explorer_focused = true;
                 self.mode = Mode::Normal;
+                self.remember_current_project();
                 self.message = format!("Project: {}", self.project.root.display());
             }
             Err(error) => self.message = format!("Cannot open folder: {error}"),
         }
+    }
+
+    pub fn recent_projects(&self) -> &[PathBuf] { &self.settings.recent_projects }
+
+    fn remember_current_project(&mut self) {
+        let project = self.project.root.canonicalize().unwrap_or_else(|_| self.project.root.clone());
+        self.settings.recent_projects.retain(|existing| {
+            existing.canonicalize().unwrap_or_else(|_| existing.clone()) != project
+        });
+        self.settings.recent_projects.insert(0, project);
+        self.settings.recent_projects.truncate(10);
+        self.persist_settings();
+    }
+
+    fn open_selected_recent_project(&mut self) {
+        if self.settings.recent_projects.is_empty() {
+            self.open_current_folder_from_dashboard();
+            return;
+        }
+        let index = self.dashboard_selected.min(self.settings.recent_projects.len() - 1);
+        let path = self.settings.recent_projects[index].clone();
+        if !path.is_dir() {
+            self.settings.recent_projects.remove(index);
+            self.dashboard_selected = self.dashboard_selected.min(self.settings.recent_projects.len().saturating_sub(1));
+            self.persist_settings();
+            self.message = format!("Removed missing project: {}", path.display());
+            return;
+        }
+        self.change_project_root(path);
+    }
+
+    fn open_current_folder_from_dashboard(&mut self) {
+        self.mode = Mode::Normal;
+        self.project.visible = true;
+        self.explorer_focused = true;
+        self.remember_current_project();
+        self.message = format!("Project: {}", self.project.root.display());
     }
 
     fn resolve_project_path(&self, value: &str) -> PathBuf {
@@ -2715,6 +3049,16 @@ impl App {
                 self.persist_settings();
                 self.message = "Format on save disabled".to_string();
             }
+            "reducedmotion" | "reduce-motion" => {
+                self.settings.reduced_motion = true;
+                self.persist_settings();
+                self.message = "Reduced motion enabled".to_string();
+            }
+            "noreducedmotion" | "no-reduce-motion" => {
+                self.settings.reduced_motion = false;
+                self.persist_settings();
+                self.message = "Reduced motion disabled".to_string();
+            }
             value if value.starts_with("tabstop=") || value.starts_with("ts=") => {
                 let number = value
                     .split_once('=')
@@ -2745,11 +3089,14 @@ impl App {
                     _ => self.message = "Tree width must be between 22 and 80".to_string(),
                 }
             }
-            _ => self.message = "Try :set number, :set formatonsave, or :set tabstop=4".to_string(),
+            _ => self.message = "Try :set number, :set formatonsave, :set reducedmotion, or :set tabstop=4".to_string(),
         }
     }
 
     fn start_lsp(&mut self) {
+        self.lsp = None;
+        self.lsp_status = LspStatus::Off;
+        self.diagnostic_count = 0;
         let Some(path) = self.editor.path.clone() else {
             self.message = "Save the buffer before starting LSP".to_string();
             return;
@@ -2762,6 +3109,9 @@ impl App {
         match LspClient::start(server, &root) {
             Ok(client) => {
                 self.lsp = Some(client);
+                self.lsp_status = LspStatus::Starting;
+                self.lsp_started_at = Some(Instant::now());
+                self.last_background_animation = Instant::now();
                 self.lsp_initialized = false;
                 // csharp-ls may keep reporting workspace progress indefinitely
                 // for a standalone file. Initialization is sufficient for
@@ -2770,7 +3120,10 @@ impl App {
                 self.lsp_last_text.clear();
                 self.message = format!("Starting LSP: {server}");
             }
-            Err(error) => self.message = format!("Could not start {server}: {error}"),
+            Err(error) => {
+                self.lsp_status = LspStatus::Error;
+                self.message = format!("Could not start {server}: {error}");
+            }
         }
     }
 
@@ -2904,9 +3257,13 @@ impl App {
         };
         if message.get("method").and_then(|method| method.as_str()) == Some("$/progress") {
             match message["params"]["value"]["kind"].as_str() {
-                Some("begin") => self.message = "LSP loading workspace…".to_string(),
+                Some("begin") => {
+                    self.lsp_status = LspStatus::Loading;
+                    self.message = "LSP loading workspace…".to_string();
+                }
                 Some("end") => {
                     self.lsp_workspace_ready = true;
+                    self.lsp_status = LspStatus::Ready;
                     self.message = "LSP ready".to_string();
                 }
                 _ => {}
@@ -2949,8 +3306,14 @@ impl App {
             .and_then(|id| id.as_u64())
             .and_then(|id| self.lsp_requests.remove(&id));
         if message.get("id").and_then(|id| id.as_u64()) == Some(1) {
+            if message.get("error").is_some() {
+                self.lsp_status = LspStatus::Error;
+                self.message = format!("LSP initialization failed: {}", message["error"]);
+                return;
+            }
             let Some(lsp) = &self.lsp else { return };
             if lsp.notify("initialized", json!({})).is_err() {
+                self.lsp_status = LspStatus::Error;
                 self.message = "LSP initialization failed".to_string();
                 return;
             }
@@ -2960,6 +3323,7 @@ impl App {
             let language_id = lsp_language_id(crate::syntax::Language::from_path(Some(path)));
             if lsp.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lsp::file_uri(path), "languageId": language_id, "version": 1, "text": self.editor.text() } })).is_ok() {
                 self.lsp_initialized = true;
+                self.lsp_status = LspStatus::Ready;
                 self.lsp_last_text = self.editor.text();
                 self.message = "LSP ready".to_string();
             }
@@ -3014,6 +3378,7 @@ impl App {
             let count = message["params"]["diagnostics"]
                 .as_array()
                 .map_or(0, Vec::len);
+            self.diagnostic_count = count;
             self.message = format!("LSP diagnostics: {count}");
         } else if let Some(result) = message.get("result") {
             let text = result["contents"]
@@ -3078,6 +3443,7 @@ impl App {
     }
 
     fn open_theme_gallery(&mut self) {
+        self.theme_gallery_return_mode = if self.mode == Mode::Command { self.preferred_editor_mode() } else { self.mode };
         self.theme_gallery_original = self.theme_kind;
         self.theme_gallery_selected = ThemeKind::ALL.iter().position(|kind| *kind == self.theme_kind).unwrap_or(0);
         self.mode = Mode::ThemeGallery;
@@ -3099,6 +3465,7 @@ impl App {
     }
 
     fn open_keymap_gallery(&mut self) {
+        self.keymap_gallery_return_mode = if self.mode == Mode::Command { self.preferred_editor_mode() } else { self.mode };
         self.keymap_gallery_selected = KeymapProfile::ALL
             .iter()
             .position(|profile| *profile == self.settings.keymap)
@@ -3112,7 +3479,7 @@ impl App {
         self.persist_settings();
         self.pending_key = None;
         self.macro_prefix = None;
-        self.mode = self.preferred_editor_mode();
+        self.mode = self.keymap_gallery_return_mode;
         self.message = format!("Keymap: {}", self.settings.keymap.name());
     }
 
@@ -3179,6 +3546,8 @@ impl App {
         match self.editor.save_as(&path) {
             Ok(()) => {
                 let _ = self.project.refresh();
+                self.project.refresh_git_status();
+                self.refresh_git_line_changes();
                 self.message = format!("Saved {}", path.display());
                 self.request_formatting_after_save();
             }
@@ -3196,6 +3565,8 @@ impl App {
         match self.editor.save() {
             Ok(()) => {
                 let _ = self.project.refresh();
+                self.project.refresh_git_status();
+                self.refresh_git_line_changes();
                 let name = self
                     .editor
                     .path
@@ -3224,6 +3595,46 @@ impl App {
         self.mode = Mode::QuitConfirm;
         self.message = format!("{} unsaved tab(s): {}", dirty.len(), dirty.join(", "));
     }
+}
+
+fn parse_git_hunks(diff: &str, line_count: usize) -> HashMap<usize, GitLineChange> {
+    let mut changes = HashMap::new();
+    if line_count == 0 { return changes; }
+    for line in diff.lines().filter(|line| line.starts_with("@@ ")) {
+        let Some(header) = line.split(" @@").next() else { continue; };
+        let mut ranges = header.split_whitespace().skip(1);
+        let Some(old) = ranges.next().and_then(|range| parse_diff_range(range, '-')) else { continue; };
+        let Some(new) = ranges.next().and_then(|range| parse_diff_range(range, '+')) else { continue; };
+        let new_index = new.0.saturating_sub(1);
+        if old.1 == 0 {
+            for index in new_index..new_index.saturating_add(new.1).min(line_count) {
+                changes.insert(index, GitLineChange::Added);
+            }
+            continue;
+        }
+        if new.1 == 0 {
+            changes.insert(new_index.min(line_count - 1), GitLineChange::Deleted);
+            continue;
+        }
+        let common = old.1.min(new.1);
+        for index in new_index..new_index.saturating_add(common).min(line_count) {
+            changes.insert(index, GitLineChange::Modified);
+        }
+        for index in new_index.saturating_add(common)..new_index.saturating_add(new.1).min(line_count) {
+            changes.insert(index, GitLineChange::Added);
+        }
+        if old.1 > new.1 {
+            let marker = new_index.saturating_add(new.1.saturating_sub(1)).min(line_count - 1);
+            changes.insert(marker, GitLineChange::Deleted);
+        }
+    }
+    changes
+}
+
+fn parse_diff_range(value: &str, prefix: char) -> Option<(usize, usize)> {
+    let value = value.strip_prefix(prefix)?;
+    let (start, count) = value.split_once(',').unwrap_or((value, "1"));
+    Some((start.parse().ok()?, count.parse().ok()?))
 }
 
 fn lsp_workspace_root(path: &Path) -> Option<PathBuf> {
@@ -3373,5 +3784,40 @@ mod tests {
         assert_eq!(app.mode, Mode::Insert);
         assert_eq!(app.editor.selected_text().as_deref(), Some("hello"));
         assert!(app.context_menu.is_none());
+    }
+
+    #[test]
+    fn parses_added_modified_and_deleted_git_hunks_for_the_gutter() {
+        let diff = "@@ -2,1 +2,1 @@\n-old\n+new\n@@ -4,0 +5,2 @@\n+a\n+b\n@@ -8,2 +9,0 @@\n-old\n-old\n";
+        let changes = parse_git_hunks(diff, 12);
+
+        assert_eq!(changes.get(&1), Some(&GitLineChange::Modified));
+        assert_eq!(changes.get(&4), Some(&GitLineChange::Added));
+        assert_eq!(changes.get(&5), Some(&GitLineChange::Added));
+        assert_eq!(changes.get(&8), Some(&GitLineChange::Deleted));
+    }
+
+    #[test]
+    fn help_returns_to_the_recent_project_dashboard() {
+        let mut app = App::new(None).expect("create app");
+        assert_eq!(app.mode, Mode::Dashboard);
+
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Help);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Dashboard);
+    }
+
+    #[test]
+    fn long_running_lsp_work_is_reported_as_a_warning() {
+        let mut app = App::new(None).expect("create app");
+        app.lsp_status = LspStatus::Loading;
+        app.lsp_started_at = Some(Instant::now() - Duration::from_secs(31));
+
+        let (label, state) = app.background_status().expect("background status");
+
+        assert_eq!(state, BackgroundState::Warning);
+        assert!(label.contains("still loading"));
     }
 }

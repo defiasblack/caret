@@ -24,6 +24,10 @@ undo/redo.
 - Context-sensitive hotkey strip
 - Mouse-wheel scrolling
 - Commands for save, save-as, open, quit, goto-line, themes, and settings
+- Recent-project welcome dashboard, right-click context menus, and Git gutter markers
+- Caret, Vim, and conventional keymap profiles
+- Persistent LSP/background status with reduced-motion support
+- Built-in persistent shell pane with live output and command history
 
 ## Build and install
 
@@ -58,6 +62,9 @@ Caret enables terminal mouse capture automatically.
 
 Mouse support depends on the terminal forwarding mouse events. Windows Terminal,
 GNOME Terminal, Konsole, and most modern terminal emulators support this.
+
+See [Accessibility and terminal compatibility](docs/ACCESSIBILITY.md) for the
+keyboard-only workflow, monochrome/reduced-motion options, and release matrix.
 
 ## Easy quit confirmation
 
@@ -204,8 +211,29 @@ read.
 | `:sort` | Sort current line or selected lines |
 | `:indent` / `:outdent` | Indent or outdent the current line or selection |
 | `:comment` | Toggle comments using the active file's language |
+| `:terminal` | Open or focus the integrated shell pane |
+| `:terminalclose` | Close the integrated shell pane |
 | `:42` | Jump to line 42 |
 | `:set treewidth=40` | Change sidebar width |
 | `:set number` / `:set nonumber` | Toggle line numbers |
 | `:set tabstop=4` | Change tab width |
 | `:theme oxide` / `:theme mono` | Change theme |
+
+## Integrated terminal
+
+Press `Ctrl-Backtick` or run `:terminal` to open a persistent shell below the
+editor. The shell inherits the project folder and works through standard input
+and output, so it remains usable in SSH sessions without a desktop GUI.
+
+| Key | Action |
+|---|---|
+| `Ctrl-Backtick` | Switch between editor and terminal |
+| `Ctrl-Shift-Backtick` | Close the terminal pane |
+| `Up` / `Down` | Browse command history |
+| `PageUp` / `PageDown` | Scroll terminal output |
+| `Ctrl-L` | Clear terminal output |
+| `Ctrl-C` | Clear the current terminal input |
+
+The pane is intended for shell commands, builds, tests, Git, and scripts.
+Full-screen terminal programs that require a PTY should be run in a separate
+terminal or tmux pane.

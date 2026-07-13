@@ -310,7 +310,8 @@ impl Editor {
             return 0;
         }
 
-        self.line_count().max(1).to_string().len() + 2
+        // One column for Git changes, one for fold state, and one spacer.
+        self.line_count().max(1).to_string().len() + 3
     }
 
     pub fn line_text(&self, line: usize) -> String {

@@ -5,6 +5,7 @@ mod lsp;
 mod project;
 mod syntax;
 mod tabs;
+mod terminal;
 mod theme;
 mod ui;
 
