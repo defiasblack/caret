@@ -45,6 +45,52 @@ impl Tabs {
         })
     }
 
+    pub fn from_session(
+        states: &[crate::session::TabState],
+        active: usize,
+    ) -> io::Result<Option<Self>> {
+        let mut tabs = Vec::new();
+        for state in states {
+            let Ok(mut editor) = Editor::from_file(&state.path) else {
+                continue;
+            };
+            editor.cursor = state.cursor.into();
+            editor.scroll_line = state.scroll_line;
+            editor.scroll_column = state.scroll_column;
+            editor.checkpoint();
+            tabs.push(BufferTab {
+                editor,
+                untitled_id: 0,
+            });
+        }
+        if tabs.is_empty() {
+            return Ok(None);
+        }
+        let active = active.min(tabs.len() - 1);
+        Ok(Some(Self {
+            tabs,
+            active,
+            next_untitled_id: 1,
+        }))
+    }
+
+    pub fn session_tabs(&self) -> Vec<crate::session::TabState> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| {
+                tab.editor
+                    .path
+                    .as_ref()
+                    .map(|path| crate::session::TabState {
+                        path: path.clone(),
+                        cursor: tab.editor.cursor.into(),
+                        scroll_line: tab.editor.scroll_line,
+                        scroll_column: tab.editor.scroll_column,
+                    })
+            })
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.tabs.len()
     }
@@ -257,6 +303,20 @@ impl Tabs {
         }
 
         (saved, errors)
+    }
+
+    pub fn dirty_recovery_entries(&self) -> Vec<crate::recovery::RecoveryEntry> {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.editor.dirty)
+            .map(|tab| {
+                crate::recovery::entry(
+                    tab.editor.path.clone(),
+                    tab.editor.text(),
+                    tab.editor.cursor,
+                )
+            })
+            .collect()
     }
 
     fn active_settings(&self) -> (bool, usize) {

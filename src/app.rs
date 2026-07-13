@@ -286,6 +286,8 @@ pub struct App {
     pending_save_after_disk_change: bool,
     pub git_diff_lines: Vec<String>,
     pub git_diff_scroll: usize,
+    pub git_diff_title: String,
+    git_diff_return_mode: Mode,
     pub git_history: Vec<GitHistoryEntry>,
     pub git_history_selected: usize,
     git_line_changes: HashMap<usize, GitLineChange>,
@@ -302,11 +304,24 @@ pub struct App {
     pub dashboard_hover: Option<usize>,
     terminal: Option<TerminalPane>,
     pub terminal_focused: bool,
+    last_recovery_checkpoint: Instant,
+    last_session_checkpoint: Instant,
 }
 
 impl App {
     pub fn new(path: Option<&Path>) -> io::Result<Self> {
-        let (settings, config_message) = config::load();
+        let (settings, mut config_message) = config::load();
+        let restored_session = if settings.restore_session && path.is_none() {
+            match crate::session::load() {
+                Ok(session) => session,
+                Err(error) => {
+                    config_message = Some(format!("Session ignored: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let plugins = PluginRegistry::load(&config::plugins_dir());
         let current_dir = std::env::current_dir()?;
 
@@ -326,10 +341,18 @@ impl App {
                         .unwrap_or_else(|| current_dir.clone());
                     (Some(file_path), root, false)
                 }
-                None => (None, current_dir, false),
+                None => restored_session
+                    .as_ref()
+                    .map_or((None, current_dir, false), |session| {
+                        (None, session.project_root.clone(), false)
+                    }),
             };
 
-        let mut editor = Tabs::new(editor_path.as_deref())?;
+        let mut editor = match restored_session.as_ref() {
+            Some(session) => Tabs::from_session(&session.tabs, session.active_tab)?
+                .unwrap_or(Tabs::new(editor_path.as_deref())?),
+            None => Tabs::new(editor_path.as_deref())?,
+        };
         editor.show_line_numbers = settings.show_line_numbers;
         editor.tab_width = settings.tab_width.clamp(1, 16);
         editor.checkpoint();
@@ -434,6 +457,8 @@ impl App {
             pending_save_after_disk_change: false,
             git_diff_lines: Vec::new(),
             git_diff_scroll: 0,
+            git_diff_title: "GIT DIFF".to_string(),
+            git_diff_return_mode: mode,
             git_history: Vec::new(),
             git_history_selected: 0,
             git_line_changes: HashMap::new(),
@@ -450,7 +475,64 @@ impl App {
             dashboard_hover: None,
             terminal: None,
             terminal_focused: false,
+            last_recovery_checkpoint: Instant::now(),
+            last_session_checkpoint: Instant::now(),
         };
+        if let Some(session) = restored_session {
+            app.project.visible = session.sidebar_visible;
+            app.sidebar_view = if session.sidebar_outline {
+                SidebarView::Outline
+            } else {
+                SidebarView::Files
+            };
+            if !session.tabs.is_empty() {
+                app.message = format!(
+                    "Restored {} tab(s) from the previous session",
+                    app.editor.len()
+                );
+            }
+            app.split_views = session.split.and_then(|split| {
+                let view = |state: crate::session::ViewState| EditorView {
+                    tab_index: state.tab_index,
+                    cursor: state.cursor.into(),
+                    scroll_line: state.scroll_line,
+                    scroll_column: state.scroll_column,
+                };
+                (split.primary.tab_index < app.editor.len()
+                    && split.secondary.tab_index < app.editor.len())
+                .then(|| SplitViews {
+                    primary: view(split.primary),
+                    secondary: view(split.secondary),
+                    secondary_active: split.secondary_active,
+                    vertical: split.vertical,
+                })
+            });
+        }
+        if let Ok(entries) = crate::recovery::load() {
+            if !entries.is_empty() {
+                let summary = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        format!(
+                            "{}:{}@{}",
+                            index + 1,
+                            entry
+                                .path
+                                .as_ref()
+                                .and_then(|path| path.file_name())
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("untitled"),
+                            entry.saved_unix_secs
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                app.message = format!(
+                    "Recovery: {summary} — :recover N, :recovercompare N, or :discardrecovery"
+                );
+            }
+        }
         if path.is_some() {
             app.remember_current_project();
         }
@@ -460,6 +542,46 @@ impl App {
 
     pub fn handle_event(&mut self, event: Event) -> bool {
         self.poll_lsp();
+        if self.last_recovery_checkpoint.elapsed() >= Duration::from_secs(2) {
+            let entries = self.editor.dirty_recovery_entries();
+            if entries.is_empty() {
+                let _ = crate::recovery::discard();
+            } else if let Err(error) = crate::recovery::save(entries) {
+                self.message = format!("Recovery checkpoint failed: {error}");
+            }
+            self.last_recovery_checkpoint = Instant::now();
+        }
+        if self.settings.restore_session
+            && self.last_session_checkpoint.elapsed() >= Duration::from_secs(2)
+        {
+            let session = crate::session::SessionState {
+                project_root: self.project.root.clone(),
+                tabs: self.editor.session_tabs(),
+                active_tab: self.editor.active_index(),
+                sidebar_visible: self.project.visible,
+                sidebar_outline: self.sidebar_view == SidebarView::Outline,
+                split: self.split_views.map(|split| crate::session::SplitState {
+                    primary: crate::session::ViewState {
+                        tab_index: split.primary.tab_index,
+                        cursor: split.primary.cursor.into(),
+                        scroll_line: split.primary.scroll_line,
+                        scroll_column: split.primary.scroll_column,
+                    },
+                    secondary: crate::session::ViewState {
+                        tab_index: split.secondary.tab_index,
+                        cursor: split.secondary.cursor.into(),
+                        scroll_line: split.secondary.scroll_line,
+                        scroll_column: split.secondary.scroll_column,
+                    },
+                    secondary_active: split.secondary_active,
+                    vertical: split.vertical,
+                }),
+            };
+            if let Err(error) = crate::session::save(&session) {
+                self.message = format!("Session checkpoint failed: {error}");
+            }
+            self.last_session_checkpoint = Instant::now();
+        }
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.activate_focused_view();
@@ -591,7 +713,8 @@ impl App {
         if self.mode != Mode::ReloadConfirm && self.editor.changed_on_disk() {
             self.mode = Mode::ReloadConfirm;
             self.message =
-                "File changed on disk — [R] Reload   [K] Keep buffer   [Esc] Later".to_string();
+                "File changed on disk — [R] Reload   [K] Keep buffer   [C] Compare   [Esc] Later"
+                    .to_string();
         }
         if self.message != self.observed_message {
             self.observed_message = self.message.clone();
@@ -1207,6 +1330,27 @@ impl App {
         };
     }
 
+    fn show_diagnostic_report(&mut self) {
+        self.git_diff_lines = crate::diagnostics::report(env!("CARGO_PKG_VERSION"))
+            .lines()
+            .map(str::to_string)
+            .collect();
+        self.git_diff_scroll = 0;
+        self.git_diff_title = "DIAGNOSTIC REPORT".to_string();
+        self.git_diff_return_mode = self.preferred_editor_mode();
+        self.mode = Mode::GitDiff;
+    }
+
+    fn copy_diagnostic_report(&mut self) {
+        self.yank = crate::diagnostics::report(env!("CARGO_PKG_VERSION"));
+        self.message = match arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(self.yank.clone()))
+        {
+            Ok(()) => "Diagnostic report copied to clipboard".to_string(),
+            Err(_) => "Diagnostic report copied to internal clipboard".to_string(),
+        };
+    }
+
     pub fn active_search_query(&self) -> &str {
         if self.mode == Mode::Search {
             &self.search_input
@@ -1521,7 +1665,7 @@ impl App {
         }
         if self.mode == Mode::GitDiff {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.mode = self.preferred_editor_mode(),
+                KeyCode::Esc | KeyCode::Char('q') => self.mode = self.git_diff_return_mode,
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.git_diff_scroll = self.git_diff_scroll.saturating_sub(1)
                 }
@@ -1792,6 +1936,7 @@ impl App {
                             .to_string();
                 }
             }
+            KeyCode::Char('c') | KeyCode::Char('C') => self.compare_external_change(),
             KeyCode::Esc => {
                 self.pending_save_after_disk_change = false;
                 self.editor.acknowledge_disk_change();
@@ -2392,6 +2537,47 @@ impl App {
             text.lines().map(str::to_string).collect()
         };
         self.git_diff_scroll = 0;
+        self.git_diff_title = "GIT DIFF".to_string();
+        self.git_diff_return_mode = self.preferred_editor_mode();
+        self.mode = Mode::GitDiff;
+    }
+
+    fn compare_external_change(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let disk = match crate::document::read_text(&path) {
+            Ok((text, _)) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                "[file no longer exists on disk]".to_string()
+            }
+            Err(error) => {
+                self.message = format!("Could not compare disk version: {error}");
+                return;
+            }
+        };
+        let buffer = self.editor.text();
+        let buffer_lines = buffer.lines().collect::<Vec<_>>();
+        let disk_lines = disk.lines().collect::<Vec<_>>();
+        let count = buffer_lines.len().max(disk_lines.len());
+        self.git_diff_lines = (0..count)
+            .flat_map(
+                |line| match (buffer_lines.get(line), disk_lines.get(line)) {
+                    (Some(left), Some(right)) if left == right => vec![format!("  {left}")],
+                    (Some(left), Some(right)) => vec![format!("- {left}"), format!("+ {right}")],
+                    (Some(left), None) => vec![format!("- {left}")],
+                    (None, Some(right)) => vec![format!("+ {right}")],
+                    (None, None) => Vec::new(),
+                },
+            )
+            .collect();
+        if self.git_diff_lines.is_empty() {
+            self.git_diff_lines
+                .push("No content differences; metadata changed on disk.".to_string());
+        }
+        self.git_diff_scroll = 0;
+        self.git_diff_title = "EXTERNAL FILE CHANGE".to_string();
+        self.git_diff_return_mode = Mode::ReloadConfirm;
         self.mode = Mode::GitDiff;
     }
 
@@ -3416,6 +3602,11 @@ impl App {
             "terminalfocus",
             "terminalclose",
             "plugins",
+            "doctor",
+            "copydiagnostics",
+            "recover",
+            "recovercompare",
+            "discardrecovery",
             "plugin",
             "pluginreload",
             "plugindir",
@@ -3800,6 +3991,55 @@ impl App {
                 self.run_plugin_command(name, values.map(str::to_string).collect(), "command");
             }
             "config" => self.message = config::config_path().display().to_string(),
+            "doctor" => self.show_diagnostic_report(),
+            "copydiagnostics" => self.copy_diagnostic_report(),
+            "recover" => match crate::recovery::load() {
+                Ok(entries) if entries.is_empty() => {
+                    self.message = "No recovery snapshots available".to_string()
+                }
+                Ok(entries) => {
+                    let index = argument.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                    let Some(entry) = entries.get(index) else {
+                        self.message = "Recovery snapshot index is out of range".to_string();
+                        return;
+                    };
+                    self.editor.replace_text(&entry.text);
+                    self.editor.cursor = Cursor {
+                        line: entry.cursor_line,
+                        column: entry.cursor_column,
+                    };
+                    self.message = format!(
+                        "Recovered {} from {}",
+                        entry
+                            .path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "untitled buffer".to_string()),
+                        entry.saved_unix_secs
+                    );
+                }
+                Err(error) => self.message = format!("Recovery load failed: {error}"),
+            },
+            "recovercompare" => match crate::recovery::load() {
+                Ok(entries) => {
+                    let index = argument.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                    let Some(entry) = entries.get(index) else {
+                        self.message = "Recovery snapshot index is out of range".to_string();
+                        return;
+                    };
+                    let current = self.editor.text();
+                    self.git_diff_lines = recovery_diff_lines(&current, &entry.text);
+                    self.git_diff_scroll = 0;
+                    self.git_diff_title = format!("RECOVERY SNAPSHOT {}", index + 1);
+                    self.git_diff_return_mode = self.preferred_editor_mode();
+                    self.mode = Mode::GitDiff;
+                }
+                Err(error) => self.message = format!("Recovery load failed: {error}"),
+            },
+            "discardrecovery" => match crate::recovery::discard() {
+                Ok(()) => self.message = "Recovery snapshots discarded".to_string(),
+                Err(error) => self.message = format!("Could not discard recovery: {error}"),
+            },
             "lsp" => self.start_lsp(),
             "lspstop" => {
                 self.lsp = None;
@@ -5035,7 +5275,7 @@ impl App {
         if self.editor.has_pending_external_change() {
             self.pending_save_after_disk_change = true;
             self.mode = Mode::ReloadConfirm;
-            self.message = "Disk changes were kept — [R] Reload   [K] Overwrite with current buffer   [Esc] Cancel".to_string();
+            self.message = "Disk changes were kept — [R] Reload   [K] Overwrite with current buffer   [C] Compare   [Esc] Cancel".to_string();
             return false;
         }
         match self.editor.save() {
@@ -5282,6 +5522,29 @@ fn previous_char_boundary(text: &str, index: usize) -> usize {
         .char_indices()
         .last()
         .map_or(0, |(offset, _)| offset)
+}
+
+fn recovery_diff_lines(current: &str, recovered: &str) -> Vec<String> {
+    let current = current.lines().collect::<Vec<_>>();
+    let recovered = recovered.lines().collect::<Vec<_>>();
+    let count = current.len().max(recovered.len());
+    let mut lines = Vec::new();
+    for index in 0..count {
+        match (current.get(index), recovered.get(index)) {
+            (Some(left), Some(right)) if left == right => lines.push(format!("  {left}")),
+            (Some(left), Some(right)) => {
+                lines.push(format!("- {left}"));
+                lines.push(format!("+ {right}"));
+            }
+            (Some(left), None) => lines.push(format!("- {left}")),
+            (None, Some(right)) => lines.push(format!("+ {right}")),
+            (None, None) => {}
+        }
+    }
+    if lines.is_empty() {
+        lines.push("No content differences.".to_string());
+    }
+    lines
 }
 
 fn next_char_boundary(text: &str, index: usize) -> usize {

@@ -60,3 +60,9 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked
+
+      - name: Run platform test suite
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Smoke-test command-line diagnostics
+        run: cargo run --locked -- doctor

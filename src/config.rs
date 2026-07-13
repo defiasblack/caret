@@ -87,12 +87,9 @@ pub fn load() -> (Settings, Option<String>) {
 
 pub fn save(settings: &Settings) -> io::Result<()> {
     let path = config_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let contents = toml::to_string_pretty(settings)
         .map_err(|error| io::Error::other(format!("config serialization failed: {error}")))?;
-    fs::write(path, contents)
+    crate::document::atomic_write(&path, contents.as_bytes())
 }
 
 pub fn config_path() -> PathBuf {

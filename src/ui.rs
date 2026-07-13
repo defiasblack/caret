@@ -1170,7 +1170,7 @@ fn draw_git_diff<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> i
         SetAttribute(Attribute::Bold),
         SetForegroundColor(app.theme.top_bar_text),
         Print(pad_or_truncate(
-            " GIT DIFF  ·  Esc closes  ·  ↑↓ scroll",
+            &format!(" {}  ·  Esc closes  ·  ↑↓ scroll", app.git_diff_title),
             panel_width
         )),
         SetAttribute(Attribute::Reset)
@@ -2115,7 +2115,12 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("F1", "Close"),
         ],
         (Mode::QuitConfirm, _) => &[("S", "Save+Quit"), ("D", "Discard+Quit"), ("Esc", "Cancel")],
-        (Mode::ReloadConfirm, _) => &[("R", "Reload"), ("K", "Keep"), ("Esc", "Later")],
+        (Mode::ReloadConfirm, _) => &[
+            ("R", "Reload"),
+            ("K", "Keep"),
+            ("C", "Compare"),
+            ("Esc", "Later"),
+        ],
         (Mode::GitDiff, _) => &[("↑↓", "Scroll"), ("Esc", "Close")],
         (Mode::GitHistory, _) => &[("↑↓", "Select"), ("Enter", "Inspect"), ("Esc", "Close")],
         (Mode::ThemeGallery, _) => &[("↑↓", "Preview"), ("Enter", "Apply"), ("Esc", "Cancel")],

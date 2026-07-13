@@ -1,9 +1,13 @@
 mod app;
 mod config;
+mod diagnostics;
+mod document;
 mod editor;
 mod lsp;
 mod plugin;
 mod project;
+mod recovery;
+mod session;
 mod syntax;
 mod tabs;
 mod terminal;
@@ -59,6 +63,7 @@ fn print_help() {
          \n\
          USAGE:\n\
          \x20 caret [FILE_OR_DIRECTORY]\n\
+         \x20 caret doctor\n\
          \n\
          OPTIONS:\n\
          \x20 -h, --help       Show this help\n\
@@ -69,11 +74,19 @@ fn print_help() {
     );
 }
 
+fn print_doctor() {
+    println!("{}", diagnostics::report(env!("CARGO_PKG_VERSION")));
+}
+
 fn parse_args() -> Option<PathBuf> {
     let mut file = None;
 
     for arg in env::args().skip(1) {
         match arg.as_str() {
+            "doctor" => {
+                print_doctor();
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -119,12 +132,15 @@ fn run<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
 
 fn main() {
     std::panic::set_hook(Box::new(|info| {
-        let path = std::env::temp_dir().join("caret-panic.log");
         let location = info
             .location()
             .map(|location| format!("{}:{}", location.file(), location.line()))
             .unwrap_or_else(|| "unknown location".to_string());
-        let _ = std::fs::write(path, format!("Caret panic at {location}\n{info}\n"));
+        let _ = diagnostics::append("panic", &format!("Caret panic at {location}: {info}"));
+        // The release build aborts on panic, so Drop will not run. Restore the
+        // user's terminal from the hook before that abort can strand raw mode.
+        let _ = execute!(stdout(), Show, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
     }));
     let path = parse_args();
 

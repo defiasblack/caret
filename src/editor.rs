@@ -1,11 +1,11 @@
 use std::{
     collections::BTreeMap,
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
+use crate::document::{self, FileFormat, LineEnding};
 use ropey::Rope;
 use unicode_width::UnicodeWidthChar;
 
@@ -42,7 +42,9 @@ pub struct Editor {
     pub show_line_numbers: bool,
     pub tab_width: usize,
     disk_modified: Option<SystemTime>,
+    disk_len: Option<u64>,
     external_change_pending: bool,
+    format: FileFormat,
     folded_ranges: BTreeMap<usize, usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -66,7 +68,13 @@ impl Editor {
                 show_line_numbers: true,
                 tab_width: 4,
                 disk_modified: None,
+                disk_len: None,
                 external_change_pending: false,
+                format: FileFormat {
+                    utf8_bom: false,
+                    line_ending: LineEnding::Lf,
+                    final_newline: false,
+                },
                 folded_ranges: BTreeMap::new(),
                 undo: Vec::new(),
                 redo: Vec::new(),
@@ -90,7 +98,13 @@ impl Editor {
             show_line_numbers: true,
             tab_width: 4,
             disk_modified: None,
+            disk_len: None,
             external_change_pending: false,
+            format: FileFormat {
+                utf8_bom: false,
+                line_ending: LineEnding::Lf,
+                final_newline: false,
+            },
             folded_ranges: BTreeMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -100,7 +114,7 @@ impl Editor {
     }
 
     pub fn from_file(path: &Path) -> io::Result<Self> {
-        let contents = fs::read_to_string(path)?;
+        let (contents, format) = document::read_text(path)?;
         Ok(Self {
             buffer: Rope::from_str(&contents),
             path: Some(path.to_path_buf()),
@@ -115,7 +129,9 @@ impl Editor {
             disk_modified: fs::metadata(path)
                 .and_then(|metadata| metadata.modified())
                 .ok(),
+            disk_len: fs::metadata(path).map(|metadata| metadata.len()).ok(),
             external_change_pending: false,
+            format,
             folded_ranges: BTreeMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -142,18 +158,21 @@ impl Editor {
             }
         }
 
-        let mut file = fs::File::create(path)?;
-        for chunk in self.buffer.chunks() {
-            file.write_all(chunk.as_bytes())?;
+        let mut bytes = Vec::new();
+        if self.format.utf8_bom {
+            bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
         }
-        file.flush()?;
-        file.sync_all()?;
+        for chunk in self.buffer.chunks() {
+            bytes.extend_from_slice(chunk.as_bytes());
+        }
+        document::atomic_write(path, &bytes)?;
 
         self.path = Some(path.to_path_buf());
         self.dirty = false;
         self.disk_modified = fs::metadata(path)
             .and_then(|metadata| metadata.modified())
             .ok();
+        self.disk_len = fs::metadata(path).map(|metadata| metadata.len()).ok();
         self.external_change_pending = false;
         Ok(())
     }
@@ -162,10 +181,12 @@ impl Editor {
         let Some(path) = &self.path else {
             return false;
         };
-        let modified = fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
-        modified.is_some() && modified != self.disk_modified
+        let metadata = fs::metadata(path).ok();
+        let modified = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok());
+        let len = metadata.as_ref().map(|metadata| metadata.len());
+        modified != self.disk_modified || len != self.disk_len
     }
 
     pub fn acknowledge_disk_change(&mut self) {
@@ -174,6 +195,10 @@ impl Editor {
                 .and_then(|metadata| metadata.modified())
                 .ok()
         });
+        self.disk_len = self
+            .path
+            .as_ref()
+            .and_then(|path| fs::metadata(path).map(|metadata| metadata.len()).ok());
     }
 
     pub fn keep_disk_change(&mut self) {
@@ -1787,5 +1812,18 @@ mod tests {
         assert_eq!(editor.cursor.line, 0);
         assert!(editor.open_fold());
         assert_eq!(editor.visible_line_at(0, 1), Some(1));
+    }
+
+    #[test]
+    fn detects_deleted_and_resized_files_as_external_changes() {
+        let path =
+            std::env::temp_dir().join(format!("caret-external-change-{}", std::process::id()));
+        fs::write(&path, "one").unwrap();
+        let editor = Editor::from_file(&path).unwrap();
+        fs::write(&path, "a much longer replacement").unwrap();
+        assert!(editor.changed_on_disk());
+        let editor = Editor::from_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(editor.changed_on_disk());
     }
 }

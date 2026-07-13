@@ -218,6 +218,8 @@ read.
 | `:set number` / `:set nonumber` | Toggle line numbers |
 | `:set tabstop=4` | Change tab width |
 | `:theme oxide` / `:theme mono` | Change theme |
+| `:doctor` / `:copydiagnostics` | View or copy the support diagnostic report |
+| `:recover N` / `:recovercompare N` / `:discardrecovery` | Restore, compare, or discard crash-recovery snapshots |
 
 ## Coding intelligence
 
@@ -263,3 +265,8 @@ Run `:plugindir` to find the plugin directory, add a TOML manifest, and run
 `:pluginreload`. Plugins can contribute commands, language comment rules,
 themes, and save hooks. See [Caret plugins](docs/PLUGINS.md) and the
 [sample plugin](examples/plugins/sample.toml).
+
+## Reliability verification
+
+The release smoke checklist for atomic saves, recovery, external changes, and
+session restoration is in [Milestone 0.6 smoke tests](docs/SMOKE_TEST_0.6.md).
