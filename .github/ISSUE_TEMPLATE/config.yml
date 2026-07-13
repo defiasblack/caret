@@ -3,6 +3,3 @@ contact_links:
   - name: Security vulnerability
     url: https://github.com/defiasblack/caret/security/advisories/new
     about: Report security vulnerabilities privately. Do not open a public issue.
-  - name: Questions and ideas
-    url: https://github.com/defiasblack/caret/discussions
-    about: Ask usage questions or discuss early ideas before filing a formal request.
