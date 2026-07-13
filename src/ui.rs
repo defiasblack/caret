@@ -11,7 +11,7 @@ use crossterm::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, ContextAction, HoverTarget, Mode, SidebarView},
+    app::{App, HoverTarget, Mode, SidebarView},
     config::{KeymapProfile},
     editor::display_width,
     project::GitStatus,
@@ -799,7 +799,7 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Search => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
-            Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery => app.theme.command_mode,
+            Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery | Mode::ContextMenu => app.theme.command_mode,
         }
     };
 
@@ -942,7 +942,7 @@ fn context_menu_geometry(app: &App, width: u16, height: u16) -> Option<(u16, u16
     let menu = app.context_menu.as_ref()?;
     let content_width = menu.actions.iter().map(|action| {
         let hint = action.hint();
-        action.label().len() + if hint.is_empty() { 0 } else { hint.len() + 2 }
+        UnicodeWidthStr::width(action.label()) + if hint.is_empty() { 0 } else { UnicodeWidthStr::width(hint) + 2 }
     }).max().unwrap_or(12) + 4;
     let menu_width = content_width.clamp(20, width.saturating_sub(2) as usize);
     let menu_height = menu.actions.len().saturating_add(2) as u16;
@@ -963,7 +963,8 @@ fn draw_context_menu<W: Write>(out: &mut W, app: &App, width: u16, height: u16) 
             format!("  {}", action.label())
         } else {
             let left = format!("  {}", action.label());
-            format!("{}{}{} ", left, " ".repeat(inner.saturating_sub(left.len() + hint.len() + 1)), hint)
+            let used = UnicodeWidthStr::width(left.as_str()) + UnicodeWidthStr::width(hint);
+            format!("{}{}{} ", left, " ".repeat(inner.saturating_sub(used + 1)), hint)
         };
         queue!(out, MoveTo(x, y + 1 + index as u16), SetBackgroundColor(if selected { app.theme.command_mode } else { app.theme.overlay }), SetForegroundColor(if selected { app.theme.background } else { app.theme.overlay_text }), Print("│"), Print(pad_or_truncate(&label, inner)), Print("│"))?;
     }
@@ -1084,7 +1085,7 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Search => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
-            Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery => app.theme.command_mode,
+            Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery | Mode::ContextMenu => app.theme.command_mode,
         }
     };
 
@@ -1253,6 +1254,7 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
         (Mode::GitHistory, _) => &[("↑↓", "Select"), ("Enter", "Inspect"), ("Esc", "Close")],
         (Mode::ThemeGallery, _) => &[("↑↓", "Preview"), ("Enter", "Apply"), ("Esc", "Cancel")],
         (Mode::KeymapGallery, _) => &[("↑↓", "Select"), ("Enter", "Apply"), ("Esc", "Cancel")],
+        (Mode::ContextMenu, _) => &[("↑↓", "Select"), ("Enter", "Apply"), ("Esc", "Close")],
     }
 }
 
@@ -1263,7 +1265,7 @@ fn draw_help<W: Write>(
     terminal_height: u16,
 ) -> io::Result<()> {
     const PAGES: [&str; 5] = ["EDITING", "NAVIGATION", "FILES", "COMMANDS", "CUSTOMIZE"];
-    const EDITING: [(&str, &str); 19] = [
+    const EDITING: [(&str, &str); 20] = [
         ("Type normally", "Enter text while in Insert mode"),
         ("Esc", "Switch to Normal mode"),
         ("F7", "Duplicate current line"),
@@ -1272,6 +1274,7 @@ fn draw_help<W: Write>(
         ("Double-click", "Select the clicked word"),
         ("Shift + Arrow/Home/End", "Select text with the keyboard"),
         ("Mouse drag", "Select text with the mouse"),
+        ("Right-click editor", "Open selection and editing actions"),
         ("Ctrl-C / Ctrl-X / Ctrl-V", "Copy / Cut / Paste selection"),
         (
             "Ctrl-D",
@@ -1307,12 +1310,13 @@ fn draw_help<W: Write>(
         ("Alt-N / Alt-P", "Next / previous tab"),
         ("Alt-1 ... Alt-9", "Select a tab directly"),
     ];
-    const FILES: [(&str, &str); 11] = [
+    const FILES: [(&str, &str); 12] = [
         ("Ctrl-B", "Show or hide the explorer"),
         ("Click FILES", "Show or hide the explorer"),
         ("Ctrl-E", "Switch between editor and files"),
         ("Up / Down", "Select a file or folder"),
         ("Enter", "Open a file or expand a folder"),
+        ("Right-click file/tab", "Open actions for that item"),
         ("Left / Right", "Collapse / expand a folder"),
         ("Backspace", "Move to the parent folder"),
         (
@@ -1482,7 +1486,7 @@ fn place_cursor<W: Write>(
     terminal_width: u16,
     terminal_height: u16,
 ) -> io::Result<()> {
-    if matches!(app.mode, Mode::Help | Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery)
+    if matches!(app.mode, Mode::Help | Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery | Mode::ContextMenu)
         || (app.explorer_focused && !matches!(app.mode, Mode::Command | Mode::Search)) {
         return queue!(out, Hide);
     }

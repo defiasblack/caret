@@ -18,7 +18,6 @@ milestone.
 
 ## Customization and ecosystem
 
-- Context menus for files, tabs, and selected text
 - Plugin API for commands, languages, themes, and editor behavior
 
 ## Polish

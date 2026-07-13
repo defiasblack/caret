@@ -222,6 +222,7 @@ pub struct App {
     theme_gallery_original: ThemeKind,
     pub keymap_gallery_selected: usize,
     pub context_menu: Option<ContextMenu>,
+    context_menu_previous_mode: Mode,
 }
 
 impl App {
@@ -323,6 +324,7 @@ impl App {
             theme_gallery_original: initial_theme,
             keymap_gallery_selected: 0,
             context_menu: None,
+            context_menu_previous_mode: mode,
         })
     }
 
@@ -353,6 +355,18 @@ impl App {
                 true
             }
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                if self.mode == Mode::ContextMenu {
+                    if let Ok((width, height)) = terminal::size() {
+                        if let Some(index) = crate::ui::context_menu_action_at(self, width, height, mouse.column, mouse.row) {
+                            if let Some(menu) = self.context_menu.as_mut() {
+                                if menu.selected != index {
+                                    menu.selected = index;
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
                 if self.mode == Mode::ThemeGallery {
                     if let Ok((width, height)) = terminal::size() {
                         if let Some(index) = crate::ui::theme_gallery_item_at(self, width, height, mouse.column, mouse.row) {
@@ -405,6 +419,15 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if self.mode == Mode::ContextMenu {
+                if let Some(index) = crate::ui::context_menu_action_at(self, width, height, mouse.column, mouse.row) {
+                    if let Some(menu) = self.context_menu.as_mut() { menu.selected = index; }
+                    self.execute_context_action();
+                } else {
+                    self.close_context_menu();
+                }
+                return;
+            }
             if self.mode == Mode::ThemeGallery {
                 if let Some(index) = crate::ui::theme_gallery_item_at(self, width, height, mouse.column, mouse.row) {
                     self.theme_gallery_selected = index;
@@ -467,7 +490,7 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.handle_left_click(mouse.column, mouse.row, width, height);
             }
-            MouseEventKind::Down(MouseButton::Right) => self.copy_selection_to_clipboard(),
+            MouseEventKind::Down(MouseButton::Right) => self.open_context_menu(mouse.column, mouse.row, width, height),
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.handle_editor_drag(mouse.column, mouse.row, width, height);
             }
@@ -505,6 +528,103 @@ impl App {
             self.hover_target = target;
             true
         }
+    }
+
+    fn open_context_menu(&mut self, column: u16, row: u16, width: u16, height: u16) {
+        if !matches!(self.mode, Mode::Normal | Mode::Insert | Mode::ContextMenu) { return; }
+        let layout = crate::ui::screen_layout(self, width, height);
+        let mut actions = Vec::new();
+        let return_mode;
+
+        if row == 1 {
+            let Some(index) = crate::ui::tab_index_at(self, width, column) else { return; };
+            self.select_tab_with_history(index);
+            self.explorer_focused = false;
+            return_mode = self.preferred_editor_mode();
+            actions.extend([ContextAction::SaveTab, ContextAction::CloseTab]);
+        } else if layout.sidebar_width > 0
+            && (column as usize) < layout.sidebar_width
+            && row >= layout.content_top
+            && (row as usize) < layout.content_top as usize + layout.content_height
+        {
+            let screen_row = (row - layout.content_top) as usize;
+            if screen_row == 0 { return; }
+            let index = self.project.scroll + screen_row - 1;
+            let Some(entry) = self.project.entries.get(index) else { return; };
+            let is_dir = entry.is_dir;
+            self.project.selected = index;
+            self.explorer_focused = true;
+            return_mode = Mode::Normal;
+            actions.push(ContextAction::Open);
+            if is_dir {
+                actions.extend([ContextAction::NewFile, ContextAction::NewFolder]);
+            } else {
+                actions.extend([ContextAction::Duplicate, ContextAction::Stage, ContextAction::Unstage]);
+            }
+            actions.push(ContextAction::Rename);
+        } else {
+            let editor_end = layout.editor_x + layout.editor_width;
+            if row < layout.content_top
+                || (row as usize) >= layout.content_top as usize + layout.content_height
+                || (column as usize) < layout.editor_x
+                || (column as usize) >= editor_end
+            { return; }
+            self.explorer_focused = false;
+            return_mode = self.preferred_editor_mode();
+            if self.editor.selected_text().is_some() {
+                actions.extend([ContextAction::Copy, ContextAction::Cut]);
+            }
+            actions.extend([ContextAction::Paste, ContextAction::SelectAll, ContextAction::ToggleComment, ContextAction::Format]);
+        }
+
+        if actions.is_empty() { return; }
+        self.context_menu_previous_mode = return_mode;
+        self.context_menu = Some(ContextMenu { x: column.saturating_add(1), y: row, selected: 0, actions });
+        self.mode = Mode::ContextMenu;
+        self.message = "Context menu · ↑↓ select · Enter apply · Esc close".to_string();
+    }
+
+    fn close_context_menu(&mut self) {
+        self.context_menu = None;
+        self.mode = self.context_menu_previous_mode;
+        self.message.clear();
+    }
+
+    fn execute_context_action(&mut self) {
+        let Some(action) = self.context_menu.as_ref().and_then(|menu| menu.actions.get(menu.selected)).copied() else {
+            self.close_context_menu();
+            return;
+        };
+        let return_mode = self.context_menu_previous_mode;
+        self.context_menu = None;
+        self.mode = return_mode;
+        match action {
+            ContextAction::Open => self.activate_project_entry(),
+            ContextAction::Rename => self.begin_rename_selected(),
+            ContextAction::Duplicate => self.begin_context_command("copy ", "Enter the duplicate file name"),
+            ContextAction::NewFile => self.begin_context_command("newfile ", "Enter the new file path"),
+            ContextAction::NewFolder => self.begin_context_command("newdir ", "Enter the new folder path"),
+            ContextAction::Stage => self.git_selected(true),
+            ContextAction::Unstage => self.git_selected(false),
+            ContextAction::SaveTab => self.save(),
+            ContextAction::CloseTab => self.close_active_tab(false),
+            ContextAction::Copy => { self.handle_global_shortcut(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)); }
+            ContextAction::Cut => { self.handle_global_shortcut(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)); }
+            ContextAction::Paste => { self.handle_global_shortcut(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)); }
+            ContextAction::SelectAll => { self.handle_global_shortcut(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)); }
+            ContextAction::ToggleComment => self.toggle_comments(),
+            ContextAction::Format => self.request_formatting(),
+        }
+    }
+
+    fn begin_context_command(&mut self, prefix: &str, message: &str) {
+        self.command_input = prefix.to_string();
+        self.command_cursor = self.command_input.len();
+        self.command_anchor = None;
+        self.command_selection = None;
+        self.command_suggestion = 0;
+        self.mode = Mode::Command;
+        self.message = message.to_string();
     }
 
     fn handle_left_click(&mut self, column: u16, row: u16, width: u16, height: u16) {
@@ -848,6 +968,24 @@ impl App {
             }
             return;
         }
+        if self.mode == Mode::ContextMenu {
+            match key.code {
+                KeyCode::Esc => self.close_context_menu(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(menu) = self.context_menu.as_mut() {
+                        menu.selected = menu.selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(menu) = self.context_menu.as_mut() {
+                        menu.selected = (menu.selected + 1).min(menu.actions.len().saturating_sub(1));
+                    }
+                }
+                KeyCode::Enter => self.execute_context_action(),
+                _ => {}
+            }
+            return;
+        }
 
         if self.handle_macro_prefix(key) {
             return;
@@ -891,7 +1029,7 @@ impl App {
                 }
                 _ => {}
             },
-            Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery => {}
+            Mode::QuitConfirm | Mode::ReloadConfirm | Mode::GitDiff | Mode::GitHistory | Mode::ThemeGallery | Mode::KeymapGallery | Mode::ContextMenu => {}
         }
     }
 
@@ -3215,5 +3353,25 @@ mod tests {
         ));
 
         assert_eq!(app.mode, Mode::Command);
+    }
+
+    #[test]
+    fn context_menu_actions_execute_and_restore_editor_mode() {
+        let mut app = App::new(None).expect("create app");
+        app.editor.insert_text("hello");
+        app.context_menu_previous_mode = Mode::Insert;
+        app.context_menu = Some(ContextMenu {
+            x: 1,
+            y: 1,
+            selected: 0,
+            actions: vec![ContextAction::SelectAll],
+        });
+        app.mode = Mode::ContextMenu;
+
+        app.execute_context_action();
+
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.editor.selected_text().as_deref(), Some("hello"));
+        assert!(app.context_menu.is_none());
     }
 }
