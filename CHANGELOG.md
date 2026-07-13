@@ -4,7 +4,7 @@ All notable changes to Caret will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project intends to follow [Semantic Versioning](https://semver.org/) as the public release process matures.
 
-## [Unreleased]
+## Unreleased
 
 ### Added
 
@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Cross-platform continuous integration
 - Automated dependency update configuration
 
-## [0.5.0]
+## 0.5.0
 
 ### Added
 
@@ -23,6 +23,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Language-server workflows for Rust and C#
 - Persistent integrated PTY/ConPTY terminal
 - Plugin manifests for commands, language rules, themes, and save hooks
-
-[Unreleased]: https://github.com/defiasblack/caret/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/defiasblack/caret/releases/tag/v0.5.0
