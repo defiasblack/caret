@@ -1,5 +1,18 @@
 # Caret Roadmap
 
+# This roadmap describes the project's current direction. It is not a promise of specific features or delivery dates, and priorities may change based on user feedback, maintenance needs, and contributor availability.
+
+## Near-term priorities
+
+- Improve reliability across Windows, Linux, macOS, and SSH sessions
+- Expand automated tests for editing, navigation, tabs, project-tree behavior, and terminal integration
+- Make installation and upgrades easier with documented release artifacts
+- Improve error messages and recovery when files, shells, language servers, or plugins fail
+- Continue accessibility work for keyboard-only, monochrome, and reduced-motion use
+- Keep documentation, built-in help, and command discovery synchronized
+
+---
+
 ## Product Vision
 
 **Caret is the friendly terminal code editor for people who want IDE conveniences without IDE weight, complicated configuration, or a steep learning curve.**

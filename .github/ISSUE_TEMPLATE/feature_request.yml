@@ -1,0 +1,68 @@
+name: Feature request
+description: Suggest an improvement or new capability for Caret
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please describe the user problem before the proposed solution.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or need
+      description: What is difficult, missing, or frustrating today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe how you think Caret should solve the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Example workflow
+      description: Show how a user would discover and use the feature, including proposed commands or keys when relevant.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds or other designs you considered.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Feature area
+      options:
+        - Editing
+        - Navigation and tabs
+        - Project tree
+        - Search
+        - Syntax highlighting
+        - LSP and coding intelligence
+        - Integrated terminal
+        - Plugins
+        - Accessibility
+        - Installation and packaging
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and pull requests for similar requests.
+          required: true
+        - label: I described the user problem, not only a preferred implementation.
+          required: true

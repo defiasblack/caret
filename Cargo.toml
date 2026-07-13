@@ -5,7 +5,9 @@ edition = "2021"
 description = "A fast, polished terminal text editor written in Rust"
 license = "MIT"
 authors = ["Thomas Graffam"]
-repository = "https://example.invalid/caret-editor"
+repository = "https://github.com/defiasblack/caret"
+homepage = "https://github.com/defiasblack/caret"
+readme = "README.md"
 keywords = ["editor", "terminal", "tui", "cli", "rust"]
 categories = ["command-line-utilities", "text-editors"]
 
