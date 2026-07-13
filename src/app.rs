@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs,
     io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -100,6 +101,9 @@ pub struct App {
     pub should_quit: bool,
     pub command_input: String,
     pub command_suggestion: usize,
+    command_selection: Option<(usize, usize)>,
+    command_cursor: usize,
+    command_anchor: Option<usize>,
     pub search_input: String,
     pub last_search: String,
     pub message: String,
@@ -122,6 +126,7 @@ pub struct App {
     back_history: Vec<NavigationLocation>,
     forward_history: Vec<NavigationLocation>,
     last_editor_click: Option<(Instant, Cursor)>,
+    last_project_click: Option<(Instant, PathBuf)>,
     lsp: Option<LspClient>,
     lsp_version: i64,
     lsp_requests: HashMap<u64, String>,
@@ -180,6 +185,9 @@ impl App {
             should_quit: false,
             command_input: String::new(),
             command_suggestion: 0,
+            command_selection: None,
+            command_cursor: 0,
+            command_anchor: None,
             search_input: String::new(),
             last_search: String::new(),
             message: config_message.unwrap_or_else(|| {
@@ -208,6 +216,7 @@ impl App {
             back_history: Vec::new(),
             forward_history: Vec::new(),
             last_editor_click: None,
+            last_project_click: None,
             lsp: None,
             lsp_version: 1,
             lsp_requests: HashMap::new(),
@@ -358,6 +367,9 @@ impl App {
             if crate::ui::hotkey_action_at(self, width, column) == Some("Command") {
                 self.explorer_focused = false;
                 self.command_input.clear();
+                self.command_cursor = 0;
+                self.command_anchor = None;
+                self.command_selection = None;
                 self.mode = Mode::Command;
                 self.message = "Command".to_string();
             }
@@ -426,7 +438,14 @@ impl App {
             let entry_index = self.project.scroll + screen_row - 1;
             if entry_index < self.project.entries.len() {
                 self.project.selected = entry_index;
-                self.activate_project_entry();
+                let path = self.project.entries[entry_index].path.clone();
+                let double_click = self.last_project_click.as_ref().is_some_and(|(time, previous)| {
+                    previous == &path && time.elapsed() <= Duration::from_millis(500)
+                });
+                self.last_project_click = Some((Instant::now(), path));
+                if double_click {
+                    self.begin_rename_selected();
+                }
             }
             return;
         }
@@ -635,7 +654,7 @@ impl App {
             return;
         }
 
-        if self.mode != Mode::Help && self.explorer_focused {
+        if matches!(self.mode, Mode::Normal | Mode::Insert) && self.explorer_focused {
             self.handle_explorer(key);
             return;
         }
@@ -955,6 +974,89 @@ impl App {
         };
     }
 
+    fn selected_project_path(&self) -> Option<PathBuf> {
+        self.project.selected_entry().map(|entry| entry.path.clone())
+    }
+
+    fn project_target_path(&self, value: &str) -> Option<PathBuf> {
+        let path = self.resolve_project_path(value);
+        path.starts_with(&self.project.root).then_some(path)
+    }
+
+    fn create_project_file(&mut self, value: &str) {
+        let Some(path) = self.project_target_path(value) else { self.message = "Path must be inside the project".to_string(); return; };
+        if path.exists() { self.message = "File already exists".to_string(); return; }
+        match path.parent().map(fs::create_dir_all).transpose().and_then(|_| fs::File::create(&path).map(|_| ())) {
+            Ok(()) => { let _ = self.project.refresh(); self.message = format!("Created {}", path.display()); }
+            Err(error) => self.message = format!("Create failed: {error}"),
+        }
+    }
+
+    fn create_project_directory(&mut self, value: &str) {
+        let Some(path) = self.project_target_path(value) else { self.message = "Path must be inside the project".to_string(); return; };
+        match fs::create_dir(&path) {
+            Ok(()) => { let _ = self.project.refresh(); self.message = format!("Created {}", path.display()); }
+            Err(error) => self.message = format!("Create failed: {error}"),
+        }
+    }
+
+    fn rename_selected_project_entry(&mut self, value: &str) {
+        let Some(source) = self.selected_project_path() else { self.message = "Select a file or folder first".to_string(); return; };
+        let Some(destination) = source.parent().and_then(|parent| (!value.is_empty()).then(|| parent.join(value))) else { self.message = "Usage: :rename new-name".to_string(); return; };
+        match fs::rename(&source, &destination) {
+            Ok(()) => { let _ = self.project.refresh(); self.message = format!("Renamed to {}", destination.display()); }
+            Err(error) => self.message = format!("Rename failed: {error}"),
+        }
+    }
+
+    fn begin_rename_selected(&mut self) {
+        let Some(path) = self.selected_project_path() else { self.message = "Select a file or folder first".to_string(); return; };
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let prefix = "rename ";
+        self.command_input = format!("{prefix}{name}");
+        let stem_end = name.rfind('.').filter(|index| *index > 0).unwrap_or(name.len());
+        self.command_cursor = prefix.len() + stem_end;
+        self.command_selection = None;
+        self.command_anchor = None;
+        self.command_suggestion = 0;
+        self.command_suggestion = 0;
+        self.mode = Mode::Command;
+        self.message = "Type a new name, then press Enter".to_string();
+    }
+
+    fn replace_command_selection(&mut self) {
+        if let Some((start, end)) = self.command_selection.take() {
+            if start <= end && end <= self.command_input.len() { self.command_input.replace_range(start..end, ""); self.command_cursor = start; }
+        }
+        self.command_anchor = None;
+    }
+
+    fn duplicate_selected_project_file(&mut self, value: &str) {
+        let Some(source) = self.selected_project_path() else { self.message = "Select a file first".to_string(); return; };
+        if source.is_dir() { self.message = "Duplicate currently supports files only".to_string(); return; }
+        let destination = if value.is_empty() { source.with_file_name(format!("{} copy", source.file_stem().and_then(|name| name.to_str()).unwrap_or("file"))).with_extension(source.extension().unwrap_or_default()) } else { source.parent().unwrap_or(&self.project.root).join(value) };
+        match fs::copy(&source, &destination) {
+            Ok(_) => { let _ = self.project.refresh(); self.message = format!("Duplicated to {}", destination.display()); }
+            Err(error) => self.message = format!("Duplicate failed: {error}"),
+        }
+    }
+
+    fn move_selected_project_entry(&mut self, value: &str) {
+        let Some(source) = self.selected_project_path() else { self.message = "Select a file or folder first".to_string(); return; };
+        let Some(destination) = self.project_target_path(value) else { self.message = "Path must be inside the project".to_string(); return; };
+        match fs::rename(&source, &destination) {
+            Ok(()) => { let _ = self.project.refresh(); self.message = format!("Moved to {}", destination.display()); }
+            Err(error) => self.message = format!("Move failed: {error}"),
+        }
+    }
+
+    fn delete_selected_project_entry(&mut self, force: bool) {
+        if !force { self.message = "Deletion is permanent; use :delete!".to_string(); return; }
+        let Some(path) = self.selected_project_path() else { self.message = "Select a file or folder first".to_string(); return; };
+        let result = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+        match result { Ok(()) => { let _ = self.project.refresh(); self.message = format!("Deleted {}", path.display()); }, Err(error) => self.message = format!("Delete failed: {error}"), }
+    }
+
     fn close_fold(&mut self) {
         let ranges = self.available_fold_ranges();
         self.message = if self.editor.close_fold(&ranges) {
@@ -1251,6 +1353,9 @@ impl App {
                 }
                 Err(error) => self.message = format!("Refresh failed: {error}"),
             },
+            KeyCode::F(2) => self.begin_rename_selected(),
+            KeyCode::Char('n') => { self.command_input = "newfile ".to_string(); self.command_suggestion = 0; self.mode = Mode::Command; }
+            KeyCode::Delete => self.delete_selected_project_entry(false),
             _ => {}
         }
     }
@@ -1505,6 +1610,9 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 self.command_input.clear();
+                self.command_cursor = 0;
+                self.command_anchor = None;
+                self.command_selection = None;
                 self.mode = Mode::Command;
             }
             _ => {}
@@ -1573,6 +1681,8 @@ impl App {
                 self.message = "Duplicated line".to_string();
             }
             KeyCode::Esc => {
+                self.command_selection = None;
+                self.command_anchor = None;
                 self.mode = Mode::Normal;
                 self.editor.finish_undo_group();
                 self.message = "-- NORMAL --".to_string();
@@ -1736,13 +1846,29 @@ impl App {
             }
             KeyCode::Enter => {
                 let command = self.selected_command().unwrap_or_else(|| self.command_input.trim().to_string());
+                self.command_selection = None;
+                self.command_anchor = None;
                 self.mode = Mode::Normal;
                 self.execute_command(&command);
             }
             KeyCode::Backspace => {
-                self.command_input.pop();
+                if self.command_selection.is_some() { self.replace_command_selection(); } else if self.command_cursor > 0 {
+                    let start = previous_char_boundary(&self.command_input, self.command_cursor);
+                    self.command_input.replace_range(start..self.command_cursor, "");
+                    self.command_cursor = start;
+                }
                 self.command_suggestion = 0;
             }
+            KeyCode::Delete => {
+                if self.command_selection.is_some() { self.replace_command_selection(); } else if self.command_cursor < self.command_input.len() {
+                    let end = next_char_boundary(&self.command_input, self.command_cursor);
+                    self.command_input.replace_range(self.command_cursor..end, "");
+                }
+            }
+            KeyCode::Home => { self.command_cursor = 0; self.command_anchor = None; self.command_selection = None; }
+            KeyCode::End => { self.command_cursor = self.command_input.len(); self.command_anchor = None; self.command_selection = None; }
+            KeyCode::Left => self.move_command_cursor(false, key.modifiers.contains(KeyModifiers::SHIFT)),
+            KeyCode::Right => self.move_command_cursor(true, key.modifiers.contains(KeyModifiers::SHIFT)),
             KeyCode::Up => self.command_suggestion = self.command_suggestion.saturating_sub(1),
             KeyCode::Down => self.command_suggestion = (self.command_suggestion + 1).min(self.command_suggestions().len().saturating_sub(1)),
             KeyCode::Char(character)
@@ -1750,18 +1876,37 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.command_input.push(character);
+                self.replace_command_selection();
+                self.command_input.insert(self.command_cursor, character);
+                self.command_cursor += character.len_utf8();
                 self.command_suggestion = 0;
             }
             _ => {}
         }
     }
 
+    fn move_command_cursor(&mut self, forward: bool, extend: bool) {
+        if !extend && self.command_selection.is_some() {
+            let (start, end) = self.command_selection.take().unwrap();
+            self.command_cursor = if forward { end } else { start };
+            self.command_anchor = None;
+            return;
+        }
+        if extend && self.command_anchor.is_none() { self.command_anchor = Some(self.command_cursor); }
+        self.command_cursor = if forward { next_char_boundary(&self.command_input, self.command_cursor) } else { previous_char_boundary(&self.command_input, self.command_cursor) };
+        self.command_selection = self.command_anchor.and_then(|anchor| (anchor != self.command_cursor).then_some((anchor.min(self.command_cursor), anchor.max(self.command_cursor))));
+        if !extend { self.command_anchor = None; }
+    }
+
     pub fn command_suggestions(&self) -> Vec<&'static str> {
-        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "refresh", "symbols", "outline", "split", "vsplit", "only", "unsplit", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set number", "set nonumber", "set", "theme", "help"];
+        const COMMANDS: &[&str] = &["w", "wa", "q", "q!", "wq", "e", "new", "tabnew", "tabnext", "tabprev", "tree", "newfile", "newdir", "rename", "copy", "move", "delete", "delete!", "refresh", "symbols", "outline", "split", "vsplit", "only", "unsplit", "fold", "foldopen", "foldall", "unfoldall", "format", "lsp", "lspstop", "set formatonsave", "set noformatonsave", "set number", "set nonumber", "set", "theme", "help"];
         let query = self.command_input.trim().to_ascii_lowercase();
         COMMANDS.iter().copied().filter(|command| command.contains(&query)).collect()
     }
+
+    pub fn command_cursor(&self) -> usize { self.command_cursor.min(self.command_input.len()) }
+
+    pub fn command_selection(&self) -> Option<(usize, usize)> { self.command_selection }
 
     fn selected_command(&self) -> Option<String> {
         let suggestions = self.command_suggestions();
@@ -1911,6 +2056,19 @@ impl App {
                     "File tree hidden".to_string()
                 };
             }
+            "newfile" | "touch" => {
+                if argument.is_empty() { self.message = "Usage: :newfile path".to_string(); } else { self.create_project_file(&argument); }
+            }
+            "newdir" | "mkdir" => {
+                if argument.is_empty() { self.message = "Usage: :newdir path".to_string(); } else { self.create_project_directory(&argument); }
+            }
+            "rename" => self.rename_selected_project_entry(&argument),
+            "copy" => self.duplicate_selected_project_file(&argument),
+            "move" => {
+                if argument.is_empty() { self.message = "Usage: :move path".to_string(); } else { self.move_selected_project_entry(&argument); }
+            }
+            "delete" | "rm" => self.delete_selected_project_entry(false),
+            "delete!" | "rm!" => self.delete_selected_project_entry(true),
             "refresh" | "reloadtree" => match self.project.refresh() {
                 Ok(()) => self.message = "File tree refreshed".to_string(),
                 Err(error) => self.message = format!("Refresh failed: {error}"),
@@ -2548,6 +2706,14 @@ fn lsp_text_offset(text: &str, line: usize, character: usize) -> Option<usize> {
     let prefix = &text[line_start..line_end];
     let byte_offset = prefix.char_indices().nth(character).map_or(prefix.len(), |(offset, _)| offset);
     Some(line_start + byte_offset)
+}
+
+fn previous_char_boundary(text: &str, index: usize) -> usize {
+    text[..index.min(text.len())].char_indices().last().map_or(0, |(offset, _)| offset)
+}
+
+fn next_char_boundary(text: &str, index: usize) -> usize {
+    text[index.min(text.len())..].chars().next().map_or(text.len(), |character| index + character.len_utf8())
 }
 
 fn lsp_language_id(language: crate::syntax::Language) -> &'static str {

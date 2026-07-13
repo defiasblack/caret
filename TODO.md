@@ -13,7 +13,6 @@ milestone.
 
 ## Project workflow
 
-- Explorer file operations: create, rename, duplicate, move, and delete
 - File-change detection and reload prompts
 - Git status, gutter indicators, diff viewer, and basic stage/history actions
 - Integrated terminal pane

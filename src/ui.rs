@@ -810,7 +810,24 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         SetAttribute(Attribute::Bold),
         Print(fit_bar(&left, &right, width as usize)),
         SetAttribute(Attribute::Reset)
-    )
+    )?;
+
+    if app.mode == Mode::Command {
+        if let Some((start, end)) = app.command_selection() {
+            if start <= end && end <= app.command_input.len() {
+                let before = UnicodeWidthStr::width(&app.command_input[..start]);
+                let selected = &app.command_input[start..end];
+                queue!(
+                    out,
+                    MoveTo((1 + before).min(width as usize) as u16, row),
+                    SetBackgroundColor(app.theme.search_background),
+                    SetForegroundColor(app.theme.search_foreground),
+                    Print(pad_or_truncate(selected, width.saturating_sub(1 + before as u16) as usize))
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn draw_command_palette<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
@@ -830,7 +847,11 @@ pub fn command_suggestion_at(app: &App, width: u16, height: u16, column: u16, ro
     if app.mode != Mode::Command || column == 0 || column as usize > 30usize.min(width.saturating_sub(2) as usize) { return None; }
     let rows = app.command_suggestions().len().min(8);
     let start = height.saturating_sub(2 + rows as u16);
-    (row >= start && row < start + rows as u16).then_some((row - start) as usize)
+    if row >= start && row < start.saturating_add(rows as u16) {
+        Some((row - start) as usize)
+    } else {
+        None
+    }
 }
 
 fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
@@ -1252,7 +1273,8 @@ fn place_cursor<W: Write>(
     terminal_width: u16,
     terminal_height: u16,
 ) -> io::Result<()> {
-    if matches!(app.mode, Mode::Help | Mode::QuitConfirm) || app.explorer_focused {
+    if matches!(app.mode, Mode::Help | Mode::QuitConfirm)
+        || (app.explorer_focused && !matches!(app.mode, Mode::Command | Mode::Search)) {
         return queue!(out, Hide);
     }
 
@@ -1263,7 +1285,8 @@ fn place_cursor<W: Write>(
         } else {
             &app.search_input
         };
-        let x = (prefix_width + UnicodeWidthStr::width(input.as_str()))
+        let typed = if app.mode == Mode::Command { &input[..app.command_cursor()] } else { input.as_str() };
+        let x = (prefix_width + UnicodeWidthStr::width(typed))
             .min(terminal_width.saturating_sub(1) as usize) as u16;
 
         return queue!(out, MoveTo(x, terminal_height - 2), Show);
