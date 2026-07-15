@@ -198,6 +198,10 @@ Change this with `:set startup=<view>` (persisted to your config):
 - `empty` — open a single blank buffer
 - `dashboard` — show the recent-project welcome screen
 
+Opening a target directly follows the same idea: `caret <folder>` opens with
+the file tree shown, while `caret <file>` opens the document with the tree
+hidden. Toggle the tree at any time with `:tree`.
+
 Open the welcome dashboard at any time with `:welcome`.
 
 ## Commands
