@@ -5,9 +5,11 @@ use std::{
     time::SystemTime,
 };
 
-use crate::document::{self, FileFormat, LineEnding};
+use crate::document::{self, FileFormat, FinalNewline, LineEnding};
 use ropey::Rope;
 use unicode_width::UnicodeWidthChar;
+
+const DEFAULT_HISTORY_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Cursor {
@@ -15,13 +17,57 @@ pub struct Cursor {
     pub column: usize,
 }
 
-#[derive(Clone)]
-struct Snapshot {
-    buffer: Rope,
+/// Cursor, selection, and multi-cursor positions captured on each side of an
+/// undo transaction so undo and redo restore exactly what the user saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CursorState {
     cursor: Cursor,
     selection_anchor: Option<Cursor>,
     secondary_cursors: Vec<SecondaryCursor>,
-    dirty: bool,
+}
+
+/// One buffer mutation: `removed` was replaced by `inserted` at char index
+/// `at`. History stores only the changed text, so its cost scales with edit
+/// size instead of document size.
+#[derive(Debug, Clone)]
+struct EditOp {
+    at: usize,
+    removed: String,
+    inserted: String,
+}
+
+/// A group of operations undone and redone as a single step.
+#[derive(Debug, Clone)]
+struct Transaction {
+    ops: Vec<EditOp>,
+    before: CursorState,
+    after: CursorState,
+    dirty_before: bool,
+    dirty_after: bool,
+}
+
+/// Per-buffer editing preferences copied onto newly opened tabs.
+#[derive(Debug, Clone, Copy)]
+pub struct EditorOptions {
+    pub show_line_numbers: bool,
+    pub tab_width: usize,
+    pub auto_indent: bool,
+    pub trim_on_save: bool,
+    pub final_newline: FinalNewline,
+    pub history_limit: usize,
+}
+
+impl Default for EditorOptions {
+    fn default() -> Self {
+        Self {
+            show_line_numbers: true,
+            tab_width: 4,
+            auto_indent: true,
+            trim_on_save: false,
+            final_newline: FinalNewline::Preserve,
+            history_limit: DEFAULT_HISTORY_LIMIT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,14 +87,18 @@ pub struct Editor {
     pub dirty: bool,
     pub show_line_numbers: bool,
     pub tab_width: usize,
+    pub auto_indent: bool,
+    pub trim_on_save: bool,
+    pub final_newline: FinalNewline,
     disk_modified: Option<SystemTime>,
     disk_len: Option<u64>,
     external_change_pending: bool,
     format: FileFormat,
     folded_ranges: BTreeMap<usize, usize>,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
-    undo_group_active: bool,
+    undo: Vec<Transaction>,
+    redo: Vec<Transaction>,
+    open_transaction: Option<Transaction>,
+    history_limit: usize,
     preferred_column: Option<usize>,
 }
 
@@ -67,6 +117,9 @@ impl Editor {
                 dirty: false,
                 show_line_numbers: true,
                 tab_width: 4,
+                auto_indent: true,
+                trim_on_save: false,
+                final_newline: FinalNewline::Preserve,
                 disk_modified: None,
                 disk_len: None,
                 external_change_pending: false,
@@ -78,7 +131,8 @@ impl Editor {
                 folded_ranges: BTreeMap::new(),
                 undo: Vec::new(),
                 redo: Vec::new(),
-                undo_group_active: false,
+                open_transaction: None,
+                history_limit: DEFAULT_HISTORY_LIMIT,
                 preferred_column: None,
             }),
             None => Ok(Self::blank()),
@@ -97,6 +151,9 @@ impl Editor {
             dirty: false,
             show_line_numbers: true,
             tab_width: 4,
+            auto_indent: true,
+            trim_on_save: false,
+            final_newline: FinalNewline::Preserve,
             disk_modified: None,
             disk_len: None,
             external_change_pending: false,
@@ -108,7 +165,8 @@ impl Editor {
             folded_ranges: BTreeMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
-            undo_group_active: false,
+            open_transaction: None,
+            history_limit: DEFAULT_HISTORY_LIMIT,
             preferred_column: None,
         }
     }
@@ -126,6 +184,9 @@ impl Editor {
             dirty: false,
             show_line_numbers: true,
             tab_width: 4,
+            auto_indent: true,
+            trim_on_save: false,
+            final_newline: FinalNewline::Preserve,
             disk_modified: fs::metadata(path)
                 .and_then(|metadata| metadata.modified())
                 .ok(),
@@ -135,7 +196,8 @@ impl Editor {
             folded_ranges: BTreeMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
-            undo_group_active: false,
+            open_transaction: None,
+            history_limit: DEFAULT_HISTORY_LIMIT,
             preferred_column: None,
         })
     }
@@ -157,6 +219,22 @@ impl Editor {
                 fs::create_dir_all(parent)?;
             }
         }
+
+        // Saving applies the configured cleanups as ordinary undoable edits
+        // before the bytes leave the buffer.
+        if self.trim_on_save {
+            self.trim_trailing_whitespace();
+        }
+        match self.final_newline {
+            FinalNewline::Preserve => {}
+            FinalNewline::Always => {
+                self.ensure_final_newline();
+            }
+            FinalNewline::Strip => {
+                self.strip_final_newline();
+            }
+        }
+        self.finish_undo_group();
 
         let mut bytes = Vec::new();
         if self.format.utf8_bom {
@@ -219,17 +297,41 @@ impl Editor {
             return Ok(());
         };
         let replacement = Self::from_file(&path)?;
-        let show_line_numbers = self.show_line_numbers;
-        let tab_width = self.tab_width;
+        let options = self.options();
         *self = replacement;
-        self.show_line_numbers = show_line_numbers;
-        self.tab_width = tab_width;
+        self.apply_options(options);
         Ok(())
     }
 
+    pub fn options(&self) -> EditorOptions {
+        EditorOptions {
+            show_line_numbers: self.show_line_numbers,
+            tab_width: self.tab_width,
+            auto_indent: self.auto_indent,
+            trim_on_save: self.trim_on_save,
+            final_newline: self.final_newline,
+            history_limit: self.history_limit,
+        }
+    }
+
+    pub fn apply_options(&mut self, options: EditorOptions) {
+        self.show_line_numbers = options.show_line_numbers;
+        self.tab_width = options.tab_width.clamp(1, 16);
+        self.auto_indent = options.auto_indent;
+        self.trim_on_save = options.trim_on_save;
+        self.final_newline = options.final_newline;
+        self.set_history_limit(options.history_limit);
+    }
+
+    pub fn set_history_limit(&mut self, limit: usize) {
+        self.history_limit = limit.clamp(10, 100_000);
+    }
+
+    /// Forces an undo boundary: whatever edits follow become one new step.
     pub fn checkpoint(&mut self) {
-        self.push_undo_snapshot();
-        self.undo_group_active = true;
+        self.commit_open_transaction();
+        self.open_transaction = Some(self.new_transaction());
+        self.redo.clear();
     }
 
     /// Starts an undo group unless one is already active.  Consecutive typing
@@ -237,75 +339,184 @@ impl Editor {
     /// a mode change ends the group.
     fn begin_undo_group(&mut self) {
         self.folded_ranges.clear();
-        if !self.undo_group_active {
-            self.push_undo_snapshot();
-            self.undo_group_active = true;
+        if self.open_transaction.is_none() {
+            self.open_transaction = Some(self.new_transaction());
+            self.redo.clear();
         }
     }
 
     pub fn finish_undo_group(&mut self) {
-        self.undo_group_active = false;
+        self.commit_open_transaction();
     }
 
-    fn push_undo_snapshot(&mut self) {
-        self.undo.push(Snapshot {
-            buffer: self.buffer.clone(),
+    fn new_transaction(&self) -> Transaction {
+        let state = self.cursor_state();
+        Transaction {
+            ops: Vec::new(),
+            before: state.clone(),
+            after: state,
+            dirty_before: self.dirty,
+            dirty_after: self.dirty,
+        }
+    }
+
+    fn cursor_state(&self) -> CursorState {
+        CursorState {
             cursor: self.cursor,
             selection_anchor: self.selection_anchor,
             secondary_cursors: self.secondary_cursors.clone(),
-            dirty: self.dirty,
-        });
-
-        const HISTORY_LIMIT: usize = 200;
-        if self.undo.len() > HISTORY_LIMIT {
-            self.undo.remove(0);
         }
+    }
 
-        self.redo.clear();
+    fn restore_cursor_state(&mut self, state: &CursorState) {
+        self.cursor = state.cursor;
+        self.selection_anchor = state.selection_anchor;
+        self.secondary_cursors = state.secondary_cursors.clone();
+    }
+
+    /// Closes the active undo group.  Groups that made no edits are dropped
+    /// so undo never lands on an invisible step.
+    fn commit_open_transaction(&mut self) {
+        let Some(mut transaction) = self.open_transaction.take() else {
+            return;
+        };
+        if transaction.ops.is_empty() {
+            return;
+        }
+        transaction.after = self.cursor_state();
+        transaction.dirty_after = self.dirty;
+        self.undo.push(transaction);
+        let limit = self.history_limit.max(1);
+        if self.undo.len() > limit {
+            let excess = self.undo.len() - limit;
+            self.undo.drain(..excess);
+        }
+    }
+
+    /// Records and applies one buffer mutation inside the open undo group.
+    /// Every buffer change must go through here so history can replay it.
+    fn edit(&mut self, at: usize, removed_chars: usize, inserted: &str) {
+        if self.open_transaction.is_none() {
+            self.begin_undo_group();
+        }
+        let at = at.min(self.buffer.len_chars());
+        let end = at
+            .saturating_add(removed_chars)
+            .min(self.buffer.len_chars());
+        let removed = if end > at {
+            let text = self.buffer.slice(at..end).to_string();
+            self.buffer.remove(at..end);
+            text
+        } else {
+            String::new()
+        };
+        if !inserted.is_empty() {
+            self.buffer.insert(at, inserted);
+        }
+        if removed.is_empty() && inserted.is_empty() {
+            return;
+        }
+        self.dirty = true;
+        if let Some(transaction) = self.open_transaction.as_mut() {
+            if let Some(last) = transaction.ops.last_mut() {
+                // Coalesce a typing run into one operation.
+                if removed.is_empty()
+                    && !inserted.is_empty()
+                    && last.removed.is_empty()
+                    && last.at + last.inserted.chars().count() == at
+                {
+                    last.inserted.push_str(inserted);
+                    return;
+                }
+                // Coalesce a backspace run the same way.
+                if inserted.is_empty()
+                    && !removed.is_empty()
+                    && last.inserted.is_empty()
+                    && at + removed.chars().count() == last.at
+                {
+                    last.at = at;
+                    last.removed = format!("{removed}{}", last.removed);
+                    return;
+                }
+            }
+            transaction.ops.push(EditOp {
+                at,
+                removed,
+                inserted: inserted.to_string(),
+            });
+        }
+    }
+
+    /// Replaces the whole buffer while recording only the changed region, so
+    /// line-based operations stay cheap in history even in large documents.
+    fn replace_buffer_text(&mut self, text: &str) {
+        let old = self.buffer.to_string();
+        if old == text {
+            return;
+        }
+        let old_chars: Vec<char> = old.chars().collect();
+        let new_chars: Vec<char> = text.chars().collect();
+        let mut prefix = 0;
+        while prefix < old_chars.len()
+            && prefix < new_chars.len()
+            && old_chars[prefix] == new_chars[prefix]
+        {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while suffix < old_chars.len() - prefix
+            && suffix < new_chars.len() - prefix
+            && old_chars[old_chars.len() - 1 - suffix] == new_chars[new_chars.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        let removed = old_chars.len() - prefix - suffix;
+        let inserted: String = new_chars[prefix..new_chars.len() - suffix].iter().collect();
+        self.edit(prefix, removed, &inserted);
     }
 
     pub fn undo(&mut self) -> bool {
-        self.finish_undo_group();
-        let Some(snapshot) = self.undo.pop() else {
+        self.commit_open_transaction();
+        let Some(transaction) = self.undo.pop() else {
             return false;
         };
 
-        self.redo.push(Snapshot {
-            buffer: self.buffer.clone(),
-            cursor: self.cursor,
-            selection_anchor: self.selection_anchor,
-            secondary_cursors: self.secondary_cursors.clone(),
-            dirty: self.dirty,
-        });
+        for op in transaction.ops.iter().rev() {
+            let inserted_chars = op.inserted.chars().count();
+            if inserted_chars > 0 {
+                self.buffer.remove(op.at..op.at + inserted_chars);
+            }
+            if !op.removed.is_empty() {
+                self.buffer.insert(op.at, &op.removed);
+            }
+        }
 
-        self.buffer = snapshot.buffer;
-        self.cursor = snapshot.cursor;
-        self.selection_anchor = snapshot.selection_anchor;
-        self.secondary_cursors = snapshot.secondary_cursors;
-        self.dirty = snapshot.dirty;
+        self.restore_cursor_state(&transaction.before);
+        self.dirty = transaction.dirty_before;
+        self.redo.push(transaction);
         self.clamp_cursor();
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        self.finish_undo_group();
-        let Some(snapshot) = self.redo.pop() else {
+        self.commit_open_transaction();
+        let Some(transaction) = self.redo.pop() else {
             return false;
         };
 
-        self.undo.push(Snapshot {
-            buffer: self.buffer.clone(),
-            cursor: self.cursor,
-            selection_anchor: self.selection_anchor,
-            secondary_cursors: self.secondary_cursors.clone(),
-            dirty: self.dirty,
-        });
+        for op in &transaction.ops {
+            let removed_chars = op.removed.chars().count();
+            if removed_chars > 0 {
+                self.buffer.remove(op.at..op.at + removed_chars);
+            }
+            if !op.inserted.is_empty() {
+                self.buffer.insert(op.at, &op.inserted);
+            }
+        }
 
-        self.buffer = snapshot.buffer;
-        self.cursor = snapshot.cursor;
-        self.selection_anchor = snapshot.selection_anchor;
-        self.secondary_cursors = snapshot.secondary_cursors;
-        self.dirty = snapshot.dirty;
+        self.restore_cursor_state(&transaction.after);
+        self.dirty = transaction.dirty_after;
+        self.undo.push(transaction);
         self.clamp_cursor();
         true
     }
@@ -319,10 +530,10 @@ impl Editor {
     }
 
     pub fn replace_text(&mut self, text: &str) {
-        self.finish_undo_group();
-        self.push_undo_snapshot();
-        self.buffer = Rope::from_str(text);
-        self.dirty = true;
+        self.commit_open_transaction();
+        self.begin_undo_group();
+        self.replace_buffer_text(text);
+        self.commit_open_transaction();
         self.clamp_cursor();
     }
 
@@ -506,10 +717,9 @@ impl Editor {
         let (start, end) = self.selection_range()?;
         self.begin_undo_group();
         let text = self.buffer.slice(start..end).to_string();
-        self.buffer.remove(start..end);
+        self.edit(start, end - start, "");
         self.set_cursor_from_char_index(start);
         self.selection_anchor = None;
-        self.dirty = true;
         Some(text)
     }
 
@@ -594,16 +804,44 @@ impl Editor {
         self.delete_selection();
         let index = self.current_char_index();
 
+        let mut encoded = [0u8; 4];
+        self.edit(index, 0, character.encode_utf8(&mut encoded));
+
         if character == '\n' {
-            self.buffer.insert_char(index, '\n');
             self.cursor.line += 1;
             self.cursor.column = 0;
         } else {
-            self.buffer.insert_char(index, character);
             self.cursor.column += 1;
         }
 
-        self.dirty = true;
+        self.preferred_column = None;
+    }
+
+    /// Inserts a line break, copying the current line's leading whitespace to
+    /// the new line when auto-indent is enabled.
+    pub fn insert_newline(&mut self) {
+        self.begin_undo_group();
+        if !self.secondary_cursors.is_empty() {
+            self.replace_at_cursors("\n");
+            return;
+        }
+        self.delete_selection();
+
+        if !self.auto_indent {
+            self.insert_char('\n');
+            return;
+        }
+
+        let indent: String = self
+            .line_text(self.cursor.line)
+            .chars()
+            .take(self.cursor.column)
+            .take_while(|character| *character == ' ' || *character == '\t')
+            .collect();
+        let index = self.current_char_index();
+        self.edit(index, 0, &format!("\n{indent}"));
+        self.cursor.line += 1;
+        self.cursor.column = indent.chars().count();
         self.preferred_column = None;
     }
 
@@ -611,11 +849,11 @@ impl Editor {
         self.begin_undo_group();
         if let Some((start, end)) = self.selection_range() {
             if self.secondary_cursors.is_empty() {
-                self.buffer.insert_char(end, closing);
-                self.buffer.insert_char(start, opening);
+                let mut encoded = [0u8; 4];
+                self.edit(end, 0, closing.encode_utf8(&mut encoded));
+                self.edit(start, 0, opening.encode_utf8(&mut encoded));
                 self.set_cursor_from_char_index(end + 2);
                 self.selection_anchor = None;
-                self.dirty = true;
                 self.preferred_column = None;
                 return;
             }
@@ -624,9 +862,8 @@ impl Editor {
         if self.secondary_cursors.is_empty() {
             let index = self.current_char_index();
             self.delete_selection();
-            self.buffer.insert(index, &format!("{opening}{closing}"));
+            self.edit(index, 0, &format!("{opening}{closing}"));
             self.set_cursor_from_char_index(index + 1);
-            self.dirty = true;
             self.preferred_column = None;
         } else {
             self.replace_at_cursors(&format!("{opening}{closing}"));
@@ -674,8 +911,7 @@ impl Editor {
             let (start, end) = range.unwrap_or((index, index));
             let start = (start as isize + offset) as usize;
             let end = (end as isize + offset) as usize;
-            self.buffer.remove(start..end);
-            self.buffer.insert(start, replacement);
+            self.edit(start, end - start, replacement);
             let next = start + replacement_len;
             if is_primary {
                 primary_index = next;
@@ -726,6 +962,9 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) -> bool {
+        if !self.secondary_cursors.is_empty() {
+            return self.delete_at_all_cursors(true);
+        }
         if self.delete_selection().is_some() {
             return true;
         }
@@ -738,7 +977,7 @@ impl Editor {
         self.begin_undo_group();
 
         if self.cursor.column > 0 {
-            self.buffer.remove(index - 1..index);
+            self.edit(index - 1, 1, "");
             self.cursor.column -= 1;
         } else {
             let previous_line = self.cursor.line - 1;
@@ -752,14 +991,128 @@ impl Editor {
                 start = index - 2;
             }
 
-            self.buffer.remove(start..index);
+            self.edit(start, index - start, "");
             self.cursor.line = previous_line;
             self.cursor.column = previous_length;
         }
 
-        self.dirty = true;
         self.preferred_column = None;
         true
+    }
+
+    /// Backspace that removes a full indentation level when the cursor sits
+    /// inside leading spaces; otherwise behaves like `backspace_pair`.
+    pub fn smart_backspace(&mut self) -> bool {
+        if self.secondary_cursors.is_empty()
+            && self.selection_range().is_none()
+            && self.cursor.column > 0
+        {
+            let before: String = self
+                .line_text(self.cursor.line)
+                .chars()
+                .take(self.cursor.column)
+                .collect();
+            if !before.is_empty() && before.chars().all(|character| character == ' ') {
+                let width = self.tab_width.max(1);
+                let target = (before.chars().count() - 1) / width * width;
+                let remove = before.chars().count() - target;
+                if remove > 1 {
+                    self.begin_undo_group();
+                    let index = self.current_char_index();
+                    self.edit(index - remove, remove, "");
+                    self.cursor.column -= remove;
+                    self.preferred_column = None;
+                    return true;
+                }
+            }
+        }
+        self.backspace_pair()
+    }
+
+    /// Applies backspace (or forward delete) at the primary and every
+    /// secondary cursor as one undoable step.
+    fn delete_at_all_cursors(&mut self, backspace: bool) -> bool {
+        self.begin_undo_group();
+        let primary = (self.current_char_index(), self.selection_range());
+        let mut targets = self
+            .secondary_cursors
+            .iter()
+            .map(|cursor| {
+                let index = self.buffer.line_to_char(cursor.cursor.line) + cursor.cursor.column;
+                let range = Self::cursor_selection_range(
+                    &self.buffer,
+                    cursor.cursor,
+                    cursor.selection_anchor,
+                );
+                (false, index, range)
+            })
+            .collect::<Vec<_>>();
+        targets.push((true, primary.0, primary.1));
+        targets.sort_by_key(|(_, index, range)| range.map(|(start, _)| start).unwrap_or(*index));
+
+        let mut offset: isize = 0;
+        let mut any = false;
+        let mut primary_index = primary.0;
+        let mut secondary_indices = Vec::new();
+        for (is_primary, index, range) in targets {
+            let index = (index as isize + offset).max(0) as usize;
+            let (start, end) = match range {
+                Some((start, end)) => (
+                    (start as isize + offset).max(0) as usize,
+                    (end as isize + offset).max(0) as usize,
+                ),
+                None if backspace => {
+                    if index == 0 {
+                        (index, index)
+                    } else if index >= 2
+                        && self.buffer.char(index - 1) == '\n'
+                        && self.buffer.char(index - 2) == '\r'
+                    {
+                        (index - 2, index)
+                    } else {
+                        (index - 1, index)
+                    }
+                }
+                None => {
+                    if index >= self.buffer.len_chars() {
+                        (index, index)
+                    } else if self.buffer.char(index) == '\r'
+                        && index + 1 < self.buffer.len_chars()
+                        && self.buffer.char(index + 1) == '\n'
+                    {
+                        (index, index + 2)
+                    } else {
+                        (index, index + 1)
+                    }
+                }
+            };
+            if start < end {
+                self.edit(start, end - start, "");
+                any = true;
+            }
+            if is_primary {
+                primary_index = start;
+            } else {
+                secondary_indices.push(start);
+            }
+            offset -= (end - start) as isize;
+        }
+
+        self.set_cursor_from_char_index(primary_index);
+        self.selection_anchor = None;
+        secondary_indices.sort_unstable();
+        secondary_indices.dedup();
+        let primary_landing = self.current_char_index();
+        self.secondary_cursors = secondary_indices
+            .into_iter()
+            .filter(|index| *index != primary_landing)
+            .map(|index| SecondaryCursor {
+                cursor: self.cursor_from_char_index(index),
+                selection_anchor: None,
+            })
+            .collect();
+        self.preferred_column = None;
+        any
     }
 
     pub fn backspace_pair(&mut self) -> bool {
@@ -772,9 +1125,8 @@ impl Editor {
             && matching_close(self.buffer.char(index - 1)) == Some(self.buffer.char(index))
         {
             self.begin_undo_group();
-            self.buffer.remove(index - 1..index + 1);
+            self.edit(index - 1, 2, "");
             self.set_cursor_from_char_index(index - 1);
-            self.dirty = true;
             self.preferred_column = None;
             return true;
         }
@@ -782,6 +1134,9 @@ impl Editor {
     }
 
     pub fn delete_at_cursor(&mut self) -> bool {
+        if !self.secondary_cursors.is_empty() {
+            return self.delete_at_all_cursors(false);
+        }
         if self.delete_selection().is_some() {
             return true;
         }
@@ -799,12 +1154,11 @@ impl Editor {
             && index + 1 < self.buffer.len_chars()
             && self.buffer.char(index + 1) == '\n'
         {
-            self.buffer.remove(index..index + 2);
+            self.edit(index, 2, "");
         } else {
-            self.buffer.remove(index..index + 1);
+            self.edit(index, 1, "");
         }
 
-        self.dirty = true;
         self.clamp_cursor();
         true
     }
@@ -826,9 +1180,9 @@ impl Editor {
         };
 
         if start < end {
-            self.buffer.remove(start..end);
+            self.edit(start, end - start, "");
         } else if self.buffer.len_chars() > 0 {
-            self.buffer.remove(start.saturating_sub(1)..start);
+            self.edit(start.saturating_sub(1), 1, "");
         }
 
         self.cursor.line = self.cursor.line.min(self.line_count().saturating_sub(1));
@@ -836,7 +1190,6 @@ impl Editor {
             .cursor
             .column
             .min(self.line_len_chars(self.cursor.line));
-        self.dirty = true;
         self.preferred_column = None;
         Some(removed)
     }
@@ -861,10 +1214,9 @@ impl Editor {
             line_text.insert(0, '\n');
         }
 
-        self.buffer.insert(insertion, &line_text);
+        self.edit(insertion, 0, &line_text);
         self.cursor.line = (self.cursor.line + 1).min(self.line_count().saturating_sub(1));
         self.cursor.column = 0;
-        self.dirty = true;
         self.preferred_column = None;
     }
 
@@ -932,17 +1284,16 @@ impl Editor {
             }
             right_start += 1;
         }
-        self.buffer.remove(newline_start..line_end + right_start);
+        self.edit(newline_start, line_end + right_start - newline_start, "");
         if !left.is_empty()
             && right.chars().nth(right_start).is_some()
             && !left.ends_with(char::is_whitespace)
         {
-            self.buffer.insert_char(newline_start, ' ');
+            self.edit(newline_start, 0, " ");
         }
         self.cursor.column = self.cursor.column.min(self.line_len_chars(line));
         self.selection_anchor = None;
         self.secondary_cursors.clear();
-        self.dirty = true;
         self.preferred_column = None;
         true
     }
@@ -968,6 +1319,149 @@ impl Editor {
         self.dirty = true;
         self.preferred_column = None;
         end - start + 1
+    }
+
+    /// Removes spaces and tabs from the ends of all lines.  Returns how many
+    /// lines changed.
+    pub fn trim_trailing_whitespace(&mut self) -> usize {
+        let mut lines = self.logical_lines();
+        let mut changed = 0usize;
+        for line in &mut lines {
+            let clean = line.trim_end_matches([' ', '\t']);
+            if clean.len() != line.len() {
+                *line = clean.to_string();
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            return 0;
+        }
+        self.begin_undo_group();
+        let trailing = self.has_trailing_newline();
+        self.replace_logical_lines(&lines, trailing);
+        self.clamp_cursor();
+        self.preferred_column = None;
+        changed
+    }
+
+    /// Splits the current line at the cursor, leaving the cursor in place.
+    pub fn split_line(&mut self) -> bool {
+        self.begin_undo_group();
+        self.delete_selection();
+        let index = self.current_char_index();
+        let cursor = self.cursor;
+        self.edit(index, 0, "\n");
+        self.cursor = cursor;
+        self.preferred_column = None;
+        true
+    }
+
+    /// Appends a final newline when the buffer does not end with one.
+    pub fn ensure_final_newline(&mut self) -> bool {
+        if self.buffer.len_chars() == 0 || self.has_trailing_newline() {
+            return false;
+        }
+        self.begin_undo_group();
+        let ending = self.line_ending();
+        let length = self.buffer.len_chars();
+        self.edit(length, 0, ending);
+        true
+    }
+
+    /// Removes the final newline when the buffer ends with one.
+    pub fn strip_final_newline(&mut self) -> bool {
+        if !self.has_trailing_newline() {
+            return false;
+        }
+        self.begin_undo_group();
+        let length = self.buffer.len_chars();
+        let start = if length >= 2 && self.buffer.char(length - 2) == '\r' {
+            length - 2
+        } else {
+            length - 1
+        };
+        self.edit(start, length - start, "");
+        self.clamp_cursor();
+        true
+    }
+
+    /// Adds a cursor on the line above or below the primary cursor, keeping
+    /// the current column where the target line is long enough.
+    pub fn add_cursor_line(&mut self, below: bool) -> bool {
+        let target_line = if below {
+            let next = self.cursor.line + 1;
+            if next >= self.line_count() {
+                return false;
+            }
+            next
+        } else {
+            let Some(previous) = self.cursor.line.checked_sub(1) else {
+                return false;
+            };
+            previous
+        };
+        let target = Cursor {
+            line: target_line,
+            column: self.cursor.column.min(self.line_len_chars(target_line)),
+        };
+        if self
+            .secondary_cursors
+            .iter()
+            .any(|existing| existing.cursor == target)
+        {
+            return false;
+        }
+        self.finish_undo_group();
+        self.secondary_cursors.push(SecondaryCursor {
+            cursor: self.cursor,
+            selection_anchor: self.selection_anchor,
+        });
+        self.cursor = target;
+        self.selection_anchor = None;
+        true
+    }
+
+    /// Extends `select_next_occurrence` to every remaining match.  Returns
+    /// the resulting number of selections.
+    pub fn select_all_occurrences(&mut self) -> usize {
+        while self.select_next_occurrence() {}
+        self.selection_ranges().len()
+    }
+
+    /// Builds a rectangular (column) selection between `origin` and the
+    /// primary cursor: one selection per line, clamped to each line's length.
+    pub fn column_select(&mut self, origin: Cursor) {
+        let target = self.cursor;
+        let (top, bottom) = if origin.line <= target.line {
+            (origin.line, target.line)
+        } else {
+            (target.line, origin.line)
+        };
+        self.secondary_cursors.clear();
+        for line in top..=bottom {
+            if line == target.line {
+                continue;
+            }
+            let length = self.line_len_chars(line);
+            let anchor = Cursor {
+                line,
+                column: origin.column.min(length),
+            };
+            let cursor = Cursor {
+                line,
+                column: target.column.min(length),
+            };
+            self.secondary_cursors.push(SecondaryCursor {
+                cursor,
+                selection_anchor: (anchor != cursor).then_some(anchor),
+            });
+        }
+        let length = self.line_len_chars(target.line);
+        let anchor = Cursor {
+            line: target.line,
+            column: origin.column.min(length),
+        };
+        self.selection_anchor = (anchor != target).then_some(anchor);
     }
 
     pub fn indent_selected_lines(&mut self) -> usize {
@@ -1090,27 +1584,41 @@ impl Editor {
 
     pub fn open_line_below(&mut self) {
         self.begin_undo_group();
-        let insertion = if self.cursor.line + 1 < self.line_count() {
-            self.buffer.line_to_char(self.cursor.line + 1)
+        let indent = if self.auto_indent {
+            self.line_indent(self.cursor.line)
         } else {
-            self.buffer.len_chars()
+            String::new()
         };
-
-        self.buffer.insert_char(insertion, '\n');
+        if self.cursor.line + 1 < self.line_count() {
+            let insertion = self.buffer.line_to_char(self.cursor.line + 1);
+            self.edit(insertion, 0, &format!("{indent}\n"));
+        } else {
+            let insertion = self.buffer.len_chars();
+            self.edit(insertion, 0, &format!("\n{indent}"));
+        }
         self.cursor.line += 1;
-
-        self.cursor.column = 0;
-        self.dirty = true;
+        self.cursor.column = indent.chars().count();
         self.preferred_column = None;
     }
 
     pub fn open_line_above(&mut self) {
         self.begin_undo_group();
+        let indent = if self.auto_indent {
+            self.line_indent(self.cursor.line)
+        } else {
+            String::new()
+        };
         let insertion = self.buffer.line_to_char(self.cursor.line);
-        self.buffer.insert_char(insertion, '\n');
-        self.cursor.column = 0;
-        self.dirty = true;
+        self.edit(insertion, 0, &format!("{indent}\n"));
+        self.cursor.column = indent.chars().count();
         self.preferred_column = None;
+    }
+
+    fn line_indent(&self, line: usize) -> String {
+        self.line_text(line)
+            .chars()
+            .take_while(|character| *character == ' ' || *character == '\t')
+            .collect()
     }
 
     pub fn move_left(&mut self) {
@@ -1561,7 +2069,7 @@ impl Editor {
         if trailing_newline {
             text.push_str(ending);
         }
-        self.buffer = Rope::from_str(&text);
+        self.replace_buffer_text(&text);
     }
 }
 
@@ -1825,5 +2333,237 @@ mod tests {
         let editor = Editor::from_file(&path).unwrap();
         fs::remove_file(&path).unwrap();
         assert!(editor.changed_on_disk());
+    }
+
+    #[test]
+    fn newline_copies_the_current_indentation() {
+        let mut editor = Editor::blank();
+        editor.insert_text("    let x = 1;");
+        editor.finish_undo_group();
+
+        editor.insert_newline();
+        assert_eq!(editor.text(), "    let x = 1;\n    ");
+        assert_eq!(editor.cursor, Cursor { line: 1, column: 4 });
+
+        editor.auto_indent = false;
+        editor.insert_newline();
+        assert_eq!(editor.text(), "    let x = 1;\n    \n");
+        assert_eq!(editor.cursor, Cursor { line: 2, column: 0 });
+    }
+
+    #[test]
+    fn open_line_below_and_above_keep_indentation() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("  first\n  second");
+        editor.cursor = Cursor { line: 0, column: 3 };
+
+        editor.open_line_below();
+        assert_eq!(editor.text(), "  first\n  \n  second");
+        assert_eq!(editor.cursor, Cursor { line: 1, column: 2 });
+
+        editor.open_line_above();
+        assert_eq!(editor.text(), "  first\n  \n  \n  second");
+        assert_eq!(editor.cursor, Cursor { line: 1, column: 2 });
+    }
+
+    #[test]
+    fn smart_backspace_removes_one_indent_level() {
+        let mut editor = Editor::blank();
+        editor.insert_text("        x");
+        editor.cursor = Cursor { line: 0, column: 8 };
+        editor.finish_undo_group();
+
+        assert!(editor.smart_backspace());
+        assert_eq!(editor.text(), "    x");
+        assert_eq!(editor.cursor.column, 4);
+
+        // Outside leading whitespace it deletes a single character.
+        editor.cursor = Cursor { line: 0, column: 5 };
+        assert!(editor.smart_backspace());
+        assert_eq!(editor.text(), "    ");
+    }
+
+    #[test]
+    fn trim_trailing_whitespace_reports_changed_lines() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("one  \ntwo\nthree\t\n");
+        assert_eq!(editor.trim_trailing_whitespace(), 2);
+        assert_eq!(editor.text(), "one\ntwo\nthree\n");
+        assert_eq!(editor.trim_trailing_whitespace(), 0);
+
+        assert!(editor.undo());
+        assert_eq!(editor.text(), "one  \ntwo\nthree\t\n");
+    }
+
+    #[test]
+    fn split_line_keeps_the_cursor_in_place() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("hello world");
+        editor.cursor = Cursor { line: 0, column: 5 };
+
+        assert!(editor.split_line());
+        assert_eq!(editor.text(), "hello\n world");
+        assert_eq!(editor.cursor, Cursor { line: 0, column: 5 });
+    }
+
+    #[test]
+    fn final_newline_policies_apply_on_save() {
+        let path = std::env::temp_dir().join(format!(
+            "caret-final-newline-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+
+        let mut editor = Editor::blank();
+        editor.path = Some(path.clone());
+        editor.insert_text("no newline");
+        editor.final_newline = FinalNewline::Always;
+        editor.save().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "no newline\n");
+
+        editor.final_newline = FinalNewline::Strip;
+        editor.insert_text("!");
+        editor.save().unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().ends_with('\n'));
+
+        editor.trim_on_save = true;
+        editor.final_newline = FinalNewline::Preserve;
+        editor.move_line_end();
+        editor.insert_text("   ");
+        editor.save().unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().ends_with(' '));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn backspace_and_delete_apply_at_every_cursor() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("ax\nbx\ncx");
+        editor.cursor = Cursor { line: 0, column: 2 };
+        assert!(editor.add_cursor_line(true));
+        assert!(editor.add_cursor_line(true));
+        assert_eq!(editor.secondary_cursors.len(), 2);
+
+        assert!(editor.backspace());
+        assert_eq!(editor.text(), "a\nb\nc");
+        assert_eq!(editor.secondary_cursors.len(), 2);
+
+        assert!(editor.undo());
+        assert_eq!(editor.text(), "ax\nbx\ncx");
+        assert_eq!(editor.secondary_cursors.len(), 2);
+
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("ax\nbx\ncx");
+        editor.cursor = Cursor { line: 0, column: 0 };
+        assert!(editor.add_cursor_line(true));
+        assert!(editor.add_cursor_line(true));
+        assert!(editor.delete_at_cursor());
+        assert_eq!(editor.text(), "x\nx\nx");
+    }
+
+    #[test]
+    fn column_select_builds_per_line_selections() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("alpha\nbeta\ngamma");
+        editor.cursor = Cursor { line: 0, column: 1 };
+
+        let origin = editor.cursor;
+        editor.move_down();
+        editor.move_right();
+        editor.move_down();
+        editor.column_select(origin);
+
+        assert_eq!(editor.selection_ranges().len(), 3);
+        editor.insert_char('_');
+        assert_eq!(editor.text(), "a_pha\nb_ta\ng_mma");
+    }
+
+    #[test]
+    fn select_all_occurrences_replaces_every_match() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("one two one one");
+        editor.set_cursor_from_char_index(0);
+
+        assert_eq!(editor.select_all_occurrences(), 3);
+        editor.insert_char('X');
+        assert_eq!(editor.text(), "X two X X");
+    }
+
+    #[test]
+    fn undo_restores_selection_and_multi_cursor_state() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("alpha beta alpha");
+        editor.set_cursor_from_char_index(0);
+
+        assert!(editor.select_next_occurrence());
+        assert_eq!(editor.selection_ranges().len(), 2);
+
+        editor.insert_char('z');
+        assert_eq!(editor.text(), "z beta z");
+
+        assert!(editor.undo());
+        assert_eq!(editor.text(), "alpha beta alpha");
+        assert_eq!(editor.selection_ranges().len(), 2);
+        assert_eq!(editor.selected_text().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn history_stores_operations_not_document_snapshots() {
+        let mut editor = Editor::blank();
+        let big = "x".repeat(50_000);
+        editor.insert_text(&big);
+        editor.finish_undo_group();
+
+        editor.insert_char('!');
+        editor.finish_undo_group();
+
+        // The second transaction recorded only the single inserted character.
+        let last = editor.undo.last().expect("second transaction");
+        assert_eq!(last.ops.len(), 1);
+        assert_eq!(last.ops[0].inserted, "!");
+        assert!(last.ops[0].removed.is_empty());
+
+        assert!(editor.undo());
+        assert_eq!(editor.len_chars(), 50_000);
+        assert!(editor.redo());
+        assert_eq!(editor.len_chars(), 50_001);
+    }
+
+    #[test]
+    fn history_limit_is_configurable_and_enforced() {
+        let mut editor = Editor::blank();
+        editor.set_history_limit(10);
+        for _ in 0..25 {
+            editor.insert_char('a');
+            editor.finish_undo_group();
+        }
+        assert_eq!(editor.undo.len(), 10);
+
+        let mut undone = 0;
+        while editor.undo() {
+            undone += 1;
+        }
+        assert_eq!(undone, 10);
+        assert_eq!(editor.text(), "a".repeat(15));
+    }
+
+    #[test]
+    fn undo_restores_the_dirty_flag() {
+        let path = std::env::temp_dir().join(format!(
+            "caret-undo-dirty-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::write(&path, "clean").unwrap();
+        let mut editor = Editor::from_file(&path).unwrap();
+        assert!(!editor.dirty);
+
+        editor.insert_char('!');
+        assert!(editor.dirty);
+        assert!(editor.undo());
+        assert!(!editor.dirty);
+        assert!(editor.redo());
+        assert!(editor.dirty);
+        let _ = fs::remove_file(path);
     }
 }

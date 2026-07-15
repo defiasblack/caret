@@ -17,7 +17,8 @@ use serde_json::{json, Value};
 
 use crate::{
     config::{self, KeymapProfile, Settings, StartupView},
-    editor::Cursor,
+    document::FinalNewline,
+    editor::{Cursor, EditorOptions},
     lsp::{self, LspClient},
     plugin::{PluginContext, PluginRegistry, PluginResponse},
     project::ProjectTree,
@@ -265,6 +266,7 @@ pub struct App {
     replaying_macro: bool,
     yank: String,
     search_origin: Cursor,
+    column_select_origin: Option<Cursor>,
     back_history: Vec<NavigationLocation>,
     forward_history: Vec<NavigationLocation>,
     last_editor_click: Option<(Instant, Cursor)>,
@@ -311,6 +313,24 @@ pub struct App {
 }
 
 impl App {
+    fn editor_options(settings: &Settings) -> EditorOptions {
+        EditorOptions {
+            show_line_numbers: settings.show_line_numbers,
+            tab_width: settings.tab_width,
+            auto_indent: settings.auto_indent,
+            trim_on_save: settings.trim_trailing_whitespace_on_save,
+            final_newline: settings.final_newline,
+            history_limit: settings.undo_history_limit,
+        }
+    }
+
+    /// Reapplies editor-level settings to every open tab after `:set`.
+    fn apply_editor_settings(&mut self) {
+        let options = Self::editor_options(&self.settings);
+        self.editor
+            .for_each_editor(|editor| editor.apply_options(options));
+    }
+
     pub fn new(path: Option<&Path>) -> io::Result<Self> {
         let (settings, mut config_message) = config::load();
         let restored_session = if !cfg!(test)
@@ -373,8 +393,8 @@ impl App {
                 .unwrap_or(Tabs::new(editor_path.as_deref())?),
             None => Tabs::new(editor_path.as_deref())?,
         };
-        editor.show_line_numbers = settings.show_line_numbers;
-        editor.tab_width = settings.tab_width.clamp(1, 16);
+        let editor_options = Self::editor_options(&settings);
+        editor.for_each_editor(|editor| editor.apply_options(editor_options));
         editor.checkpoint();
 
         let mut project = ProjectTree::new(project_root)?;
@@ -457,6 +477,7 @@ impl App {
             replaying_macro: false,
             yank: String::new(),
             search_origin: Cursor::default(),
+            column_select_origin: None,
             back_history: Vec::new(),
             forward_history: Vec::new(),
             last_editor_click: None,
@@ -2047,6 +2068,23 @@ impl App {
                     self.message = "Command palette".to_string();
                     return true;
                 }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.add_cursor_line(false);
+                    return true;
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.add_cursor_line(true);
+                    return true;
+                }
+                KeyCode::Char('l' | 'L') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    let count = self.editor.select_all_occurrences();
+                    self.message = if count > 1 {
+                        format!("Selected {count} occurrences · type to replace them all")
+                    } else {
+                        "Select or place the cursor on a word first".to_string()
+                    };
+                    return true;
+                }
                 KeyCode::Char('f') => {
                     self.search_origin = self.editor.cursor;
                     self.search_input.clear();
@@ -2223,6 +2261,19 @@ impl App {
         }
 
         false
+    }
+
+    fn add_cursor_line(&mut self, below: bool) {
+        self.message = if self.editor.add_cursor_line(below) {
+            format!(
+                "{} cursor(s) · Esc returns to one",
+                self.editor.secondary_cursors.len() + 1
+            )
+        } else if below {
+            "No line below to add a cursor on".to_string()
+        } else {
+            "No line above to add a cursor on".to_string()
+        };
     }
 
     fn indent_selection(&mut self, outdent: bool) {
@@ -3076,6 +3127,9 @@ impl App {
     }
 
     fn handle_normal(&mut self, key: KeyEvent) {
+        if self.handle_column_select_key(key) {
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::SHIFT)
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && self.extend_selection(key.code)
@@ -3333,6 +3387,9 @@ impl App {
     }
 
     fn handle_insert(&mut self, key: KeyEvent) {
+        if self.handle_column_select_key(key) {
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::SHIFT)
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && self.extend_selection(key.code)
@@ -3396,9 +3453,9 @@ impl App {
                     self.message = "-- NORMAL --".to_string();
                 }
             }
-            KeyCode::Enter => self.editor.insert_char('\n'),
+            KeyCode::Enter => self.editor.insert_newline(),
             KeyCode::Backspace => {
-                self.editor.backspace_pair();
+                self.editor.smart_backspace();
             }
             KeyCode::Delete => {
                 self.editor.delete_at_cursor();
@@ -3454,6 +3511,37 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Alt-Shift-arrows grow a rectangular selection; any other key drops the
+    /// column anchor so the next rectangle starts fresh.
+    fn handle_column_select_key(&mut self, key: KeyEvent) -> bool {
+        let is_column_key = key.modifiers.contains(KeyModifiers::ALT)
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(
+                key.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+            );
+        if !is_column_key {
+            self.column_select_origin = None;
+            return false;
+        }
+
+        let origin = self.column_select_origin.unwrap_or(self.editor.cursor);
+        self.column_select_origin = Some(origin);
+        match key.code {
+            KeyCode::Up => self.editor.move_up(),
+            KeyCode::Down => self.editor.move_down(),
+            KeyCode::Left => self.editor.move_left(),
+            KeyCode::Right => self.editor.move_right(),
+            _ => return true,
+        }
+        self.editor.column_select(origin);
+        self.message = format!(
+            "Column select: {} cursor(s) · type to edit every line",
+            self.editor.secondary_cursors.len() + 1
+        );
+        true
     }
 
     fn extend_selection(&mut self, code: KeyCode) -> bool {
@@ -3743,12 +3831,24 @@ impl App {
             "actions",
             "diagnostics",
             "symbolrename",
+            "trim",
+            "splitline",
+            "selectoccurrences",
+            "addcursorabove",
+            "addcursorbelow",
             "set formatonsave",
             "set noformatonsave",
             "set reducedmotion",
             "set noreducedmotion",
             "set number",
             "set nonumber",
+            "set autoindent",
+            "set noautoindent",
+            "set trimonsave",
+            "set notrimonsave",
+            "set finalnewline=preserve",
+            "set finalnewline=always",
+            "set finalnewline=strip",
             "set startup=session",
             "set startup=folder",
             "set startup=empty",
@@ -4019,6 +4119,30 @@ impl App {
                 let count = self.editor.sort_selected_lines();
                 self.message = format!("Sorted {count} line(s)");
             }
+            "trim" | "trimwhitespace" => {
+                self.editor.checkpoint();
+                let count = self.editor.trim_trailing_whitespace();
+                self.message = if count == 0 {
+                    "No trailing whitespace found".to_string()
+                } else {
+                    format!("Trimmed trailing whitespace on {count} line(s)")
+                };
+            }
+            "splitline" => {
+                self.editor.checkpoint();
+                self.editor.split_line();
+                self.message = "Split line at cursor".to_string();
+            }
+            "selectoccurrences" | "selectallmatches" => {
+                let count = self.editor.select_all_occurrences();
+                self.message = if count > 1 {
+                    format!("Selected {count} occurrences · type to replace them all")
+                } else {
+                    "Select or place the cursor on a word first".to_string()
+                };
+            }
+            "addcursorabove" => self.add_cursor_line(false),
+            "addcursorbelow" => self.add_cursor_line(true),
             "indent" => self.indent_selection(false),
             "outdent" => self.indent_selection(true),
             "comment" | "togglecomment" => self.toggle_comments(),
@@ -4283,14 +4407,14 @@ impl App {
     fn execute_set(&mut self, argument: &str) {
         match argument {
             "number" | "nu" => {
-                self.editor.show_line_numbers = true;
                 self.settings.show_line_numbers = true;
+                self.apply_editor_settings();
                 self.persist_settings();
                 self.message = "Line numbers enabled".to_string();
             }
             "nonumber" | "nonu" => {
-                self.editor.show_line_numbers = false;
                 self.settings.show_line_numbers = false;
+                self.apply_editor_settings();
                 self.persist_settings();
                 self.message = "Line numbers disabled".to_string();
             }
@@ -4314,6 +4438,67 @@ impl App {
                 self.persist_settings();
                 self.message = "Reduced motion disabled".to_string();
             }
+            "autoindent" | "ai" => {
+                self.settings.auto_indent = true;
+                self.apply_editor_settings();
+                self.persist_settings();
+                self.message = "Auto-indent enabled".to_string();
+            }
+            "noautoindent" | "noai" => {
+                self.settings.auto_indent = false;
+                self.apply_editor_settings();
+                self.persist_settings();
+                self.message = "Auto-indent disabled".to_string();
+            }
+            "trimonsave" => {
+                self.settings.trim_trailing_whitespace_on_save = true;
+                self.apply_editor_settings();
+                self.persist_settings();
+                self.message = "Trailing whitespace is trimmed on save".to_string();
+            }
+            "notrimonsave" => {
+                self.settings.trim_trailing_whitespace_on_save = false;
+                self.apply_editor_settings();
+                self.persist_settings();
+                self.message = "Trailing whitespace is kept on save".to_string();
+            }
+            value if value.starts_with("finalnewline=") => {
+                let choice = value.split_once('=').map(|(_, value)| value);
+                let policy = match choice {
+                    Some("preserve") => Some(FinalNewline::Preserve),
+                    Some("always") => Some(FinalNewline::Always),
+                    Some("strip") => Some(FinalNewline::Strip),
+                    _ => None,
+                };
+                match policy {
+                    Some(policy) => {
+                        self.settings.final_newline = policy;
+                        self.apply_editor_settings();
+                        self.persist_settings();
+                        self.message = format!("Final newline on save: {}", policy.name());
+                    }
+                    None => {
+                        self.message =
+                            "Final newline must be preserve, always, or strip".to_string()
+                    }
+                }
+            }
+            value if value.starts_with("undolimit=") => {
+                let number = value
+                    .split_once('=')
+                    .and_then(|(_, value)| value.parse::<usize>().ok());
+                match number {
+                    Some(number @ 10..=100_000) => {
+                        self.settings.undo_history_limit = number;
+                        self.apply_editor_settings();
+                        self.persist_settings();
+                        self.message = format!("Undo history limit: {number} steps");
+                    }
+                    _ => {
+                        self.message = "Undo limit must be between 10 and 100000 steps".to_string()
+                    }
+                }
+            }
             value if value.starts_with("tabstop=") || value.starts_with("ts=") => {
                 let number = value
                     .split_once('=')
@@ -4321,8 +4506,8 @@ impl App {
 
                 match number {
                     Some(number @ 1..=16) => {
-                        self.editor.tab_width = number;
                         self.settings.tab_width = number;
+                        self.apply_editor_settings();
                         self.persist_settings();
                         self.message = format!("Tab width: {number}");
                     }

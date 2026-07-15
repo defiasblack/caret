@@ -3,6 +3,7 @@ use std::{fs, io, path::PathBuf};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::document::FinalNewline;
 use crate::theme::ThemeKind;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +66,10 @@ pub struct Settings {
     pub custom_theme: Option<String>,
     pub max_search_results: usize,
     pub format_on_save: bool,
+    pub auto_indent: bool,
+    pub trim_trailing_whitespace_on_save: bool,
+    pub final_newline: FinalNewline,
+    pub undo_history_limit: usize,
 }
 
 impl Default for Settings {
@@ -83,6 +88,10 @@ impl Default for Settings {
             custom_theme: None,
             max_search_results: 500,
             format_on_save: false,
+            auto_indent: true,
+            trim_trailing_whitespace_on_save: false,
+            final_newline: FinalNewline::Preserve,
+            undo_history_limit: 1_000,
         }
     }
 }

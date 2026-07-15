@@ -21,6 +21,29 @@ pub enum LineEnding {
     Crlf,
 }
 
+/// What happens to the last line's ending when a document is saved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FinalNewline {
+    /// Keep whatever the buffer already has (default).
+    #[default]
+    Preserve,
+    /// Append a final newline when the buffer does not end with one.
+    Always,
+    /// Remove the final newline when the buffer ends with one.
+    Strip,
+}
+
+impl FinalNewline {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::Always => "always",
+            Self::Strip => "strip",
+        }
+    }
+}
+
 pub fn read_text(path: &Path) -> io::Result<(String, FileFormat)> {
     let bytes = fs::read(path)?;
     if bytes.contains(&0) {

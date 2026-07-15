@@ -185,10 +185,9 @@ impl Tabs {
     }
 
     pub fn new_buffer(&mut self) {
-        let (show_line_numbers, tab_width) = self.active_settings();
+        let options = self.active_options();
         let mut editor = Editor::blank();
-        editor.show_line_numbers = show_line_numbers;
-        editor.tab_width = tab_width;
+        editor.apply_options(options);
         editor.checkpoint();
 
         let untitled_id = self.next_untitled_id;
@@ -201,11 +200,10 @@ impl Tabs {
     }
 
     pub fn new_named_buffer(&mut self, path: PathBuf) {
-        let (show_line_numbers, tab_width) = self.active_settings();
+        let options = self.active_options();
         let mut editor = Editor::blank();
         editor.path = Some(absolute_path(path));
-        editor.show_line_numbers = show_line_numbers;
-        editor.tab_width = tab_width;
+        editor.apply_options(options);
         editor.checkpoint();
 
         self.tabs.push(BufferTab {
@@ -229,10 +227,9 @@ impl Tabs {
             return Ok(OpenDisposition::Switched);
         }
 
-        let (show_line_numbers, tab_width) = self.active_settings();
+        let options = self.active_options();
         let mut editor = Editor::new(Some(&path))?;
-        editor.show_line_numbers = show_line_numbers;
-        editor.tab_width = tab_width;
+        editor.apply_options(options);
         editor.checkpoint();
 
         let replace_pristine_untitled = self.tabs.len() == 1
@@ -319,11 +316,18 @@ impl Tabs {
             .collect()
     }
 
-    fn active_settings(&self) -> (bool, usize) {
+    fn active_options(&self) -> crate::editor::EditorOptions {
         self.tabs
             .get(self.active)
-            .map(|tab| (tab.editor.show_line_numbers, tab.editor.tab_width))
-            .unwrap_or((true, 4))
+            .map(|tab| tab.editor.options())
+            .unwrap_or_default()
+    }
+
+    /// Applies a change (for example a settings update) to every open tab.
+    pub fn for_each_editor(&mut self, mut apply: impl FnMut(&mut Editor)) {
+        for tab in &mut self.tabs {
+            apply(&mut tab.editor);
+        }
     }
 
     pub fn titles_summary(&self) -> String {
