@@ -331,34 +331,42 @@ impl App {
         let plugins = PluginRegistry::load(&config::plugins_dir());
         let current_dir = std::env::current_dir()?;
 
-        let (editor_path, project_root, explorer_focused): (Option<PathBuf>, PathBuf, bool) =
-            match path {
-                Some(path) if path.is_dir() => (None, path.to_path_buf(), true),
-                Some(path) => {
-                    let file_path = if path.is_absolute() {
-                        path.to_path_buf()
-                    } else {
-                        current_dir.join(path)
-                    };
-                    let root = file_path
-                        .parent()
-                        .filter(|parent| !parent.as_os_str().is_empty())
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| current_dir.clone());
-                    (Some(file_path), root, false)
+        let (editor_path, project_root, explorer_focused, sidebar_visible): (
+            Option<PathBuf>,
+            PathBuf,
+            bool,
+            bool,
+        ) = match path {
+            // Opened on a folder: show and focus the file tree.
+            Some(path) if path.is_dir() => (None, path.to_path_buf(), true, true),
+            // Opened on a file: focus the document with the tree hidden.
+            Some(path) => {
+                let file_path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    current_dir.join(path)
+                };
+                let root = file_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| current_dir.clone());
+                (Some(file_path), root, false, false)
+            }
+            None => match restored_session.as_ref() {
+                // Sidebar visibility is restored from the saved session below.
+                Some(session) => (None, session.project_root.clone(), false, true),
+                None => {
+                    // No path: the startup setting decides. Folder/Session open the
+                    // tree focused; Dashboard keeps it available once dismissed;
+                    // Empty starts on a bare buffer with the tree hidden.
+                    let focus_tree =
+                        matches!(settings.startup, StartupView::Folder | StartupView::Session);
+                    let show_tree = settings.startup != StartupView::Empty;
+                    (None, current_dir, focus_tree, show_tree)
                 }
-                None => match restored_session.as_ref() {
-                    Some(session) => (None, session.project_root.clone(), false),
-                    // No session to restore: focus the file tree for the Folder
-                    // start-up (and the Session fallback). Empty and Dashboard
-                    // keep the untitled buffer focused instead.
-                    None => {
-                        let focus_tree =
-                            matches!(settings.startup, StartupView::Folder | StartupView::Session);
-                        (None, current_dir, focus_tree)
-                    }
-                },
-            };
+            },
+        };
 
         let mut editor = match restored_session.as_ref() {
             Some(session) => Tabs::from_session(&session.tabs, session.active_tab)?
@@ -370,6 +378,7 @@ impl App {
         editor.checkpoint();
 
         let mut project = ProjectTree::new(project_root)?;
+        project.visible = sidebar_visible;
         project.width = settings.tree_width.clamp(22, 80);
         project.show_hidden = settings.show_hidden_files;
         let _ = project.refresh();
@@ -5873,6 +5882,7 @@ mod tests {
         assert_ne!(app.mode, Mode::Dashboard);
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.explorer_focused);
+        assert!(app.project.visible);
     }
 
     #[test]
@@ -5965,6 +5975,19 @@ mod tests {
         let app = App::new(Some(&path)).expect("create app");
 
         assert!(!app.explorer_focused);
+        assert!(!app.project.visible);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_folder_startup_shows_and_focuses_the_tree() {
+        let dir = std::env::temp_dir().join(format!("caret-startup-dir-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create dir");
+
+        let app = App::new(Some(&dir)).expect("create app");
+
+        assert!(app.explorer_focused);
+        assert!(app.project.visible);
+        let _ = fs::remove_dir_all(dir);
     }
 }

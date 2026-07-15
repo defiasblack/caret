@@ -19,6 +19,7 @@
 ## Milestone 0.7 — Ergonomics
 
 - [x] Configurable startup view (`startup = session | folder | empty | dashboard`); the default now opens the current folder's file tree instead of always showing the welcome dashboard, which is reachable on demand via `:welcome`.
+- [x] Sidebar visibility follows the launch target: `caret <folder>` opens with the file tree shown, `caret <file>` opens with it hidden (`:tree` toggles).
 
 ## Known bugs
 
