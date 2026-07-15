@@ -1796,13 +1796,21 @@ fn draw_command_palette<W: Write>(
     }
     let suggestions = app.command_suggestions();
     let rows = suggestions.len().min(8);
+    let first_suggestion =
+        command_suggestion_window_start(suggestions.len(), app.command_suggestion_scroll, rows);
     let panel_width = 30usize.min(width.saturating_sub(2) as usize);
     let start_row = height.saturating_sub(2 + rows as u16);
-    for (index, command) in suggestions.into_iter().take(rows).enumerate() {
+    for (row, (index, command)) in suggestions
+        .into_iter()
+        .enumerate()
+        .skip(first_suggestion)
+        .take(rows)
+        .enumerate()
+    {
         let selected = index == app.command_suggestion;
         queue!(
             out,
-            MoveTo(1, start_row + index as u16),
+            MoveTo(1, start_row + row as u16),
             SetBackgroundColor(if selected {
                 app.theme.command_mode
             } else {
@@ -1819,6 +1827,14 @@ fn draw_command_palette<W: Write>(
     Ok(())
 }
 
+fn command_suggestion_window_start(total: usize, scroll: usize, rows: usize) -> usize {
+    if rows == 0 || total <= rows {
+        return 0;
+    }
+
+    scroll.min(total - rows)
+}
+
 pub fn command_suggestion_at(
     app: &App,
     width: u16,
@@ -1832,10 +1848,13 @@ pub fn command_suggestion_at(
     {
         return None;
     }
-    let rows = app.command_suggestions().len().min(8);
+    let suggestions = app.command_suggestions();
+    let rows = suggestions.len().min(8);
+    let first_suggestion =
+        command_suggestion_window_start(suggestions.len(), app.command_suggestion_scroll, rows);
     let start = height.saturating_sub(2 + rows as u16);
     if row >= start && row < start.saturating_add(rows as u16) {
-        Some((row - start) as usize)
+        Some(first_suggestion + (row - start) as usize)
     } else {
         None
     }
@@ -2527,5 +2546,24 @@ mod tests {
         let rendered = pad_or_truncate("a界b", 3);
         assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 3);
         assert!(rendered.starts_with("a界"));
+    }
+
+    #[test]
+    fn command_suggestion_window_clamps_to_the_available_results() {
+        assert_eq!(command_suggestion_window_start(10, 0, 8), 0);
+        assert_eq!(command_suggestion_window_start(10, 1, 8), 1);
+        assert_eq!(command_suggestion_window_start(10, 2, 8), 2);
+        assert_eq!(command_suggestion_window_start(10, 9, 8), 2);
+    }
+
+    #[test]
+    fn command_suggestion_hit_testing_tracks_the_scrolled_window() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::Command;
+        app.command_suggestion = 8;
+        app.command_suggestion_scroll = 1;
+
+        assert_eq!(command_suggestion_at(&app, 80, 24, 1, 14), Some(1));
+        assert_eq!(command_suggestion_at(&app, 80, 24, 1, 21), Some(8));
     }
 }
