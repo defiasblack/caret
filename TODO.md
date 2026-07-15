@@ -16,6 +16,10 @@
 - [ ] Run the documented forced-termination smoke tests on Windows, macOS, and Linux before release (`docs/SMOKE_TEST_0.6.md`)
 
 
+## Milestone 0.7 — Ergonomics
+
+- [x] Configurable startup view (`startup = session | folder | empty | dashboard`); the default now opens the current folder's file tree instead of always showing the welcome dashboard, which is reachable on demand via `:welcome`.
+
 ## Known bugs
 
 - C# `:def` returns no definition in Caret even though the same `csharp-ls`

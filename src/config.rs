@@ -34,6 +34,21 @@ impl KeymapProfile {
     }
 }
 
+/// What Caret shows when it launches without a file or directory argument.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartupView {
+    /// Reopen the previous session if one exists, otherwise fall back to `Folder`.
+    Session,
+    /// Open the current directory's file tree (default).
+    #[default]
+    Folder,
+    /// Open a single empty, unsaved buffer.
+    Empty,
+    /// Show the recent-projects welcome dashboard.
+    Dashboard,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -44,6 +59,7 @@ pub struct Settings {
     pub tree_width: usize,
     pub show_hidden_files: bool,
     pub restore_session: bool,
+    pub startup: StartupView,
     pub recent_projects: Vec<PathBuf>,
     pub reduced_motion: bool,
     pub custom_theme: Option<String>,
@@ -61,6 +77,7 @@ impl Default for Settings {
             tree_width: 40,
             show_hidden_files: false,
             restore_session: true,
+            startup: StartupView::Folder,
             recent_projects: Vec::new(),
             reduced_motion: false,
             custom_theme: None,
@@ -124,5 +141,19 @@ mod tests {
         let encoded = toml::to_string(&settings).expect("encode settings");
         let decoded: Settings = toml::from_str(&encoded).expect("decode settings");
         assert_eq!(decoded.keymap, KeymapProfile::Conventional);
+    }
+
+    #[test]
+    fn startup_defaults_to_folder_and_round_trips() {
+        let settings: Settings = toml::from_str("theme = 'nord'").expect("parse settings");
+        assert_eq!(settings.startup, StartupView::Folder);
+
+        let encoded = toml::to_string(&Settings {
+            startup: StartupView::Session,
+            ..Settings::default()
+        })
+        .expect("encode settings");
+        let decoded: Settings = toml::from_str(&encoded).expect("decode settings");
+        assert_eq!(decoded.startup, StartupView::Session);
     }
 }

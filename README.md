@@ -24,7 +24,7 @@ undo/redo.
 - Context-sensitive hotkey strip
 - Mouse-wheel scrolling
 - Commands for save, save-as, open, quit, goto-line, themes, and settings
-- Recent-project welcome dashboard, right-click context menus, and Git gutter markers
+- On-demand recent-project welcome dashboard (`:welcome`), right-click context menus, and Git gutter markers
 - Caret, Vim, and conventional keymap profiles
 - Persistent LSP/background status with reduced-motion support
 - Built-in persistent shell pane with live output and command history
@@ -188,6 +188,18 @@ read.
 | `Ctrl-D` | Select the next occurrence of the current word or selection |
 | `Delete` / `Backspace` | Delete selected text |
 
+## Startup
+
+Running `caret` with no arguments opens the current directory's file tree.
+Change this with `:set startup=<view>` (persisted to your config):
+
+- `folder` — open the current folder's file tree (default)
+- `session` — reopen your previous tabs, or fall back to the folder tree
+- `empty` — open a single blank buffer
+- `dashboard` — show the recent-project welcome screen
+
+Open the welcome dashboard at any time with `:welcome`.
+
 ## Commands
 
 | Command | Action |
@@ -217,6 +229,8 @@ read.
 | `:set treewidth=40` | Change sidebar width |
 | `:set number` / `:set nonumber` | Toggle line numbers |
 | `:set tabstop=4` | Change tab width |
+| `:set startup=folder` | Set the launch view: `session`, `folder`, `empty`, or `dashboard` |
+| `:welcome` | Open the recent-project dashboard |
 | `:theme oxide` / `:theme mono` | Change theme |
 | `:doctor` / `:copydiagnostics` | View or copy the support diagnostic report |
 | `:recover N` / `:recovercompare N` / `:discardrecovery` | Restore, compare, or discard crash-recovery snapshots |

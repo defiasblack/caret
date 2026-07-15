@@ -33,7 +33,8 @@ for richer control roles.
 
 For each release, verify the following without using a mouse:
 
-1. Launch `caret`, select a recent project, open Help, and return to the dashboard.
+1. Launch `caret`, run `:welcome` to open the dashboard, select a recent project,
+   open Help, and return to the dashboard.
 2. Move between the file tree and editor with `Ctrl-E`; open and close tabs.
 3. Open the command palette with `Ctrl-Shift-P`, filter it, and run a command.
 4. Open `:themes` and `:keymaps`; select and cancel with arrows, Enter, and Esc.

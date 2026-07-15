@@ -16,7 +16,7 @@ use crossterm::{
 use serde_json::{json, Value};
 
 use crate::{
-    config::{self, KeymapProfile, Settings},
+    config::{self, KeymapProfile, Settings, StartupView},
     editor::Cursor,
     lsp::{self, LspClient},
     plugin::{PluginContext, PluginRegistry, PluginResponse},
@@ -313,7 +313,11 @@ pub struct App {
 impl App {
     pub fn new(path: Option<&Path>) -> io::Result<Self> {
         let (settings, mut config_message) = config::load();
-        let restored_session = if !cfg!(test) && settings.restore_session && path.is_none() {
+        let restored_session = if !cfg!(test)
+            && settings.restore_session
+            && settings.startup == StartupView::Session
+            && path.is_none()
+        {
             match crate::session::load() {
                 Ok(session) => session,
                 Err(error) => {
@@ -343,11 +347,17 @@ impl App {
                         .unwrap_or_else(|| current_dir.clone());
                     (Some(file_path), root, false)
                 }
-                None => restored_session
-                    .as_ref()
-                    .map_or((None, current_dir, false), |session| {
-                        (None, session.project_root.clone(), false)
-                    }),
+                None => match restored_session.as_ref() {
+                    Some(session) => (None, session.project_root.clone(), false),
+                    // No session to restore: focus the file tree for the Folder
+                    // start-up (and the Session fallback). Empty and Dashboard
+                    // keep the untitled buffer focused instead.
+                    None => {
+                        let focus_tree =
+                            matches!(settings.startup, StartupView::Folder | StartupView::Session);
+                        (None, current_dir, focus_tree)
+                    }
+                },
             };
 
         let mut editor = match restored_session.as_ref() {
@@ -364,7 +374,7 @@ impl App {
         project.show_hidden = settings.show_hidden_files;
         let _ = project.refresh();
         project.refresh_git_status();
-        let show_dashboard = path.is_none();
+        let show_dashboard = path.is_none() && settings.startup == StartupView::Dashboard;
         let mode = if show_dashboard {
             Mode::Dashboard
         } else if explorer_focused || settings.keymap == KeymapProfile::Vim {
@@ -3730,12 +3740,17 @@ impl App {
             "set noreducedmotion",
             "set number",
             "set nonumber",
+            "set startup=session",
+            "set startup=folder",
+            "set startup=empty",
+            "set startup=dashboard",
             "set",
             "theme",
             "themes",
             "keymap",
             "keymaps",
             "help",
+            "welcome",
         ];
         let query = self.command_input.trim().to_ascii_lowercase();
         let mut commands = COMMANDS
@@ -4057,6 +4072,13 @@ impl App {
                     self.message = "The active tab has no file path".to_string();
                 }
             }
+            "welcome" | "dashboard" => {
+                self.mode = Mode::Dashboard;
+                self.dashboard_selected = 0;
+                self.dashboard_hover = None;
+                self.message =
+                    "Welcome · choose a recent project or open the current folder".to_string();
+            }
             "set" => self.execute_set(&argument),
             "theme" => self.execute_theme(&argument),
             "themes" | "themegallery" => self.open_theme_gallery(),
@@ -4313,9 +4335,33 @@ impl App {
                     _ => self.message = "Tree width must be between 22 and 80".to_string(),
                 }
             }
+            value if value.starts_with("startup=") => {
+                let choice = value.split_once('=').map(|(_, value)| value);
+                let view = match choice {
+                    Some("session") => Some(StartupView::Session),
+                    Some("folder") => Some(StartupView::Folder),
+                    Some("empty") => Some(StartupView::Empty),
+                    Some("dashboard") => Some(StartupView::Dashboard),
+                    _ => None,
+                };
+                match view {
+                    Some(view) => {
+                        self.settings.startup = view;
+                        self.persist_settings();
+                        self.message = format!(
+                            "Startup view: {} (applies on next launch)",
+                            choice.unwrap_or_default()
+                        );
+                    }
+                    None => {
+                        self.message =
+                            "Startup must be session, folder, empty, or dashboard".to_string()
+                    }
+                }
+            }
             _ => {
                 self.message =
-                    "Try :set number, :set formatonsave, :set reducedmotion, or :set tabstop=4"
+                    "Try :set number, :set startup=folder, :set formatonsave, or :set tabstop=4"
                         .to_string()
             }
         }
@@ -5690,6 +5736,7 @@ mod tests {
     #[test]
     fn records_and_replays_a_macro() {
         let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
         app.mode = Mode::Normal;
 
         for key in [
@@ -5723,6 +5770,7 @@ mod tests {
     #[test]
     fn conventional_profile_never_turns_printable_input_into_normal_commands() {
         let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
         app.settings.keymap = KeymapProfile::Conventional;
         app.mode = Mode::Normal;
 
@@ -5809,12 +5857,29 @@ mod tests {
     #[test]
     fn help_returns_to_the_recent_project_dashboard() {
         let mut app = App::new(None).expect("create app");
+        app.execute_command("welcome");
         assert_eq!(app.mode, Mode::Dashboard);
 
         app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Help);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
+        assert_eq!(app.mode, Mode::Dashboard);
+    }
+
+    #[test]
+    fn default_startup_opens_the_file_tree_not_the_dashboard() {
+        let app = App::new(None).expect("create app");
+        assert_ne!(app.mode, Mode::Dashboard);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.explorer_focused);
+    }
+
+    #[test]
+    fn welcome_command_opens_the_dashboard_on_demand() {
+        let mut app = App::new(None).expect("create app");
+        assert_ne!(app.mode, Mode::Dashboard);
+        app.execute_command("welcome");
         assert_eq!(app.mode, Mode::Dashboard);
     }
 
