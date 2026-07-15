@@ -238,6 +238,8 @@ pub struct App {
     pub should_quit: bool,
     pub command_input: String,
     pub command_suggestion: usize,
+    pub command_suggestion_scroll: usize,
+    command_suggestion_hover_lock_until: Option<Instant>,
     command_selection: Option<(usize, usize)>,
     command_cursor: usize,
     command_anchor: Option<usize>,
@@ -399,6 +401,8 @@ impl App {
             should_quit: false,
             command_input: String::new(),
             command_suggestion: 0,
+            command_suggestion_scroll: 0,
+            command_suggestion_hover_lock_until: None,
             command_selection: None,
             command_cursor: 0,
             command_anchor: None,
@@ -613,6 +617,25 @@ impl App {
                 true
             }
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                if self.mode == Mode::Command {
+                    if let Ok((width, height)) = terminal::size() {
+                        if let Some(index) = crate::ui::command_suggestion_at(
+                            self,
+                            width,
+                            height,
+                            mouse.column,
+                            mouse.row,
+                        ) {
+                            if self.command_suggestion_hover_is_locked() {
+                                return false;
+                            }
+                            if self.command_suggestion != index {
+                                self.command_suggestion = index;
+                                return true;
+                            }
+                        }
+                    }
+                }
                 if self.lsp_panel.is_some() {
                     if let Ok((width, height)) = terminal::size() {
                         if let Some(index) = crate::ui::lsp_panel_item_at(
@@ -755,6 +778,24 @@ impl App {
         };
 
         if width < 44 || height < 8 {
+            return;
+        }
+
+        if self.mode == Mode::Command
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+            && crate::ui::command_suggestion_at(self, width, height, mouse.column, mouse.row)
+                .is_some()
+        {
+            self.move_command_suggestion(if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                -1
+            } else {
+                1
+            });
+            self.command_suggestion_hover_lock_until =
+                Some(Instant::now() + Duration::from_millis(500));
             return;
         }
 
@@ -1084,6 +1125,7 @@ impl App {
         self.command_anchor = None;
         self.command_selection = None;
         self.command_suggestion = 0;
+        self.command_suggestion_scroll = 0;
         self.mode = Mode::Command;
         self.message = message.to_string();
     }
@@ -1798,6 +1840,7 @@ impl App {
             self.command_anchor = None;
             self.command_selection = None;
             self.command_suggestion = 0;
+            self.command_suggestion_scroll = 0;
             self.mode = Mode::Command;
             self.message = "Command palette".to_string();
             return;
@@ -1980,6 +2023,7 @@ impl App {
                     self.command_anchor = None;
                     self.command_selection = None;
                     self.command_suggestion = 0;
+                    self.command_suggestion_scroll = 0;
                     self.mode = Mode::Command;
                     self.message = "Command palette".to_string();
                     return true;
@@ -2345,7 +2389,7 @@ impl App {
         self.command_selection = None;
         self.command_anchor = None;
         self.command_suggestion = 0;
-        self.command_suggestion = 0;
+        self.command_suggestion_scroll = 0;
         self.mode = Mode::Command;
         self.message = "Type a new name, then press Enter".to_string();
     }
@@ -2975,6 +3019,7 @@ impl App {
             KeyCode::Char('n') => {
                 self.command_input = "newfile ".to_string();
                 self.command_suggestion = 0;
+                self.command_suggestion_scroll = 0;
                 self.mode = Mode::Command;
             }
             KeyCode::Delete => self.delete_selected_project_entry(false),
@@ -3508,6 +3553,7 @@ impl App {
                     self.command_cursor = start;
                 }
                 self.command_suggestion = 0;
+                self.command_suggestion_scroll = 0;
             }
             KeyCode::Delete => {
                 if self.command_selection.is_some() {
@@ -3517,6 +3563,8 @@ impl App {
                     self.command_input
                         .replace_range(self.command_cursor..end, "");
                 }
+                self.command_suggestion = 0;
+                self.command_suggestion_scroll = 0;
             }
             KeyCode::Home => {
                 self.command_cursor = 0;
@@ -3534,10 +3582,11 @@ impl App {
             KeyCode::Right => {
                 self.move_command_cursor(true, key.modifiers.contains(KeyModifiers::SHIFT))
             }
-            KeyCode::Up => self.command_suggestion = self.command_suggestion.saturating_sub(1),
+            KeyCode::Up => {
+                self.move_command_suggestion(-1);
+            }
             KeyCode::Down => {
-                self.command_suggestion = (self.command_suggestion + 1)
-                    .min(self.command_suggestions().len().saturating_sub(1))
+                self.move_command_suggestion(1);
             }
             KeyCode::Char(character)
                 if !key
@@ -3548,8 +3597,46 @@ impl App {
                 self.command_input.insert(self.command_cursor, character);
                 self.command_cursor += character.len_utf8();
                 self.command_suggestion = 0;
+                self.command_suggestion_scroll = 0;
             }
             _ => {}
+        }
+    }
+
+    fn move_command_suggestion(&mut self, delta: isize) {
+        let last = self.command_suggestions().len().saturating_sub(1);
+        self.command_suggestion = if delta.is_negative() {
+            self.command_suggestion.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.command_suggestion
+                .saturating_add(delta as usize)
+                .min(last)
+        };
+        self.ensure_command_suggestion_visible();
+    }
+
+    fn command_suggestion_hover_is_locked(&self) -> bool {
+        self.command_suggestion_hover_lock_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn ensure_command_suggestion_visible(&mut self) {
+        const VISIBLE_ROWS: usize = 8;
+
+        let total = self.command_suggestions().len();
+        if total == 0 {
+            self.command_suggestion = 0;
+            self.command_suggestion_scroll = 0;
+            return;
+        }
+
+        self.command_suggestion = self.command_suggestion.min(total - 1);
+        let rows = total.min(VISIBLE_ROWS);
+        self.command_suggestion_scroll = self.command_suggestion_scroll.min(total - rows);
+        if self.command_suggestion < self.command_suggestion_scroll {
+            self.command_suggestion_scroll = self.command_suggestion;
+        } else if self.command_suggestion >= self.command_suggestion_scroll + rows {
+            self.command_suggestion_scroll = self.command_suggestion + 1 - rows;
         }
     }
 
@@ -5662,6 +5749,29 @@ mod tests {
         ));
 
         assert_eq!(app.mode, Mode::Command);
+    }
+
+    #[test]
+    fn command_suggestion_scrolls_when_keyboard_selection_reaches_the_edge() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::Command;
+
+        for _ in 0..9 {
+            app.handle_command_input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+
+        assert_eq!(app.command_suggestion, 9);
+        assert_eq!(app.command_suggestion_scroll, 2);
+    }
+
+    #[test]
+    fn command_suggestion_hover_lock_expires() {
+        let mut app = App::new(None).expect("create app");
+        app.command_suggestion_hover_lock_until = Some(Instant::now() + Duration::from_secs(1));
+        assert!(app.command_suggestion_hover_is_locked());
+
+        app.command_suggestion_hover_lock_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!app.command_suggestion_hover_is_locked());
     }
 
     #[test]
