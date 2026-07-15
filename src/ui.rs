@@ -811,7 +811,6 @@ fn draw_editor<W: Write>(
     gutter_width: usize,
 ) -> io::Result<()> {
     let language = Language::from_path(app.editor.path.as_deref());
-    let search_query = app.active_search_query();
     let fold_ranges = syntax::fold_ranges(&app.editor.text(), language);
 
     for screen_row in 0..rows {
@@ -886,7 +885,7 @@ fn draw_editor<W: Write>(
 
         let line = app.editor.line_text(line_index);
         let colors = syntax::highlight_line(&line, language, &app.theme);
-        let search_hits = search_hit_map(&line, search_query);
+        let search_hits = app.search_line_hits(&line);
         let text_width = editor_width.saturating_sub(gutter_width as u16) as usize;
         let line_start = app.editor.buffer_line_to_char(line_index);
         let selections = app.editor.selection_ranges();
@@ -1863,7 +1862,7 @@ pub fn command_suggestion_at(
 fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
     let (prompt, background, foreground) = match app.mode {
         Mode::Search => (
-            format!("/{}", app.search_input),
+            app.search_panel_text(),
             app.theme.prompt_bar,
             app.theme.prompt_text,
         ),
@@ -2116,9 +2115,13 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
         ],
         (Mode::Search, _) => &[
             ("Enter", "Accept"),
-            ("Esc", "Cancel"),
-            ("Alt-←", "Back"),
-            ("Alt-→", "Forward"),
+            ("Tab", "Replace field"),
+            ("F3", "Next"),
+            ("Alt-Enter", "Replace"),
+            ("Alt-A", "Replace all"),
+            ("Alt-C/W/R", "Case/Word/Regex"),
+            ("↑↓", "History"),
+            ("Esc", "Close"),
         ],
         (Mode::Command, _) => &[
             ("Enter", "Run"),
@@ -2419,19 +2422,17 @@ fn place_cursor<W: Write>(
         return queue!(out, Hide);
     }
 
-    if app.mode == Mode::Command || app.mode == Mode::Search {
-        let prefix_width = 1usize;
-        let input = if app.mode == Mode::Command {
-            &app.command_input
-        } else {
-            &app.search_input
-        };
-        let typed = if app.mode == Mode::Command {
-            &input[..app.command_cursor()]
-        } else {
-            input.as_str()
-        };
-        let x = (prefix_width + UnicodeWidthStr::width(typed))
+    if app.mode == Mode::Command {
+        let typed = &app.command_input[..app.command_cursor()];
+        let x = (1 + UnicodeWidthStr::width(typed)).min(terminal_width.saturating_sub(1) as usize)
+            as u16;
+
+        return queue!(out, MoveTo(x, terminal_height - 2), Show);
+    }
+
+    if app.mode == Mode::Search {
+        let (prefix, typed) = app.search_cursor_offset();
+        let x = (UnicodeWidthStr::width(prefix.as_str()) + UnicodeWidthStr::width(typed.as_str()))
             .min(terminal_width.saturating_sub(1) as usize) as u16;
 
         return queue!(out, MoveTo(x, terminal_height - 2), Show);
@@ -2458,27 +2459,6 @@ fn place_cursor<W: Write>(
 
     let y = content_top + screen_row as u16;
     queue!(out, MoveTo(x as u16, y), Show)
-}
-
-fn search_hit_map(line: &str, query: &str) -> Vec<bool> {
-    let char_count = line.chars().count();
-    let mut hits = vec![false; char_count];
-
-    if query.is_empty() {
-        return hits;
-    }
-
-    for (byte_start, matched) in line.match_indices(query) {
-        let start = line[..byte_start].chars().count();
-        let length = matched.chars().count();
-        let end = (start + length).min(hits.len());
-
-        for hit in &mut hits[start..end] {
-            *hit = true;
-        }
-    }
-
-    hits
 }
 
 fn fit_bar(left: &str, right: &str, width: usize) -> String {

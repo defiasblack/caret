@@ -8,6 +8,7 @@ mod lsp;
 mod plugin;
 mod project;
 mod recovery;
+mod search;
 mod session;
 mod syntax;
 mod tabs;

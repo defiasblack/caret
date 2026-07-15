@@ -46,6 +46,18 @@ struct Transaction {
     dirty_after: bool,
 }
 
+/// What `replace_current_match` did, so the caller can report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceOutcome {
+    /// The selected match was replaced; `delta` is the signed change in
+    /// buffer length, in chars.
+    Replaced { delta: isize },
+    /// Nothing eligible was selected, so the next match was selected instead.
+    SelectedNext,
+    /// The query has no matches.
+    NoMatches,
+}
+
 /// Per-buffer editing preferences copied onto newly opened tabs.
 #[derive(Debug, Clone, Copy)]
 pub struct EditorOptions {
@@ -1840,42 +1852,131 @@ impl Editor {
         self.preferred_column = None;
     }
 
-    pub fn find_next(&mut self, query: &str, forward: bool) -> bool {
-        if query.is_empty() {
-            return false;
-        }
-
+    /// Char ranges of every match, optionally restricted to a char range.
+    pub fn search_match_ranges(
+        &self,
+        search: &crate::search::CompiledSearch,
+        within: Option<(usize, usize)>,
+    ) -> Vec<(usize, usize)> {
         let text = self.buffer.to_string();
-        let mut matches = Vec::new();
-
-        for (byte_index, _) in text.match_indices(query) {
-            let char_index = text[..byte_index].chars().count();
-            matches.push(char_index);
+        let mut ranges = crate::search::byte_to_char_ranges(&text, &search.find_byte_ranges(&text));
+        if let Some((start, end)) = within {
+            ranges.retain(|(match_start, match_end)| *match_start >= start && *match_end <= end);
         }
+        ranges
+    }
 
+    /// Selects the next (or previous) match relative to the cursor, wrapping
+    /// around the ends of the buffer.  Returns false when nothing matches.
+    pub fn find_next_match(
+        &mut self,
+        search: &crate::search::CompiledSearch,
+        forward: bool,
+        within: Option<(usize, usize)>,
+    ) -> bool {
+        let matches = self.search_match_ranges(search, within);
         if matches.is_empty() {
             return false;
         }
 
+        let selection = self.selection_range();
         let current = self.current_char_index();
-
         let target = if forward {
+            let reference = selection.map(|(_, end)| end).unwrap_or(current);
             matches
                 .iter()
                 .copied()
-                .find(|index| *index > current)
+                .find(|(start, _)| *start >= reference)
                 .unwrap_or(matches[0])
         } else {
+            let reference = selection.map(|(start, _)| start).unwrap_or(current);
             matches
                 .iter()
                 .copied()
                 .rev()
-                .find(|index| *index < current)
+                .find(|(start, _)| *start < reference)
                 .unwrap_or(*matches.last().unwrap())
         };
 
-        self.set_cursor_from_char_index(target);
+        self.secondary_cursors.clear();
+        self.set_cursor_from_char_index(target.1);
+        self.selection_anchor = Some(self.cursor_from_char_index(target.0));
         true
+    }
+
+    /// Replaces the selected match and reports the change in char length; if
+    /// no match is selected yet, selects the next one instead.
+    pub fn replace_current_match(
+        &mut self,
+        search: &crate::search::CompiledSearch,
+        replacement: &str,
+        within: Option<(usize, usize)>,
+    ) -> ReplaceOutcome {
+        let matches = self.search_match_ranges(search, within);
+        if matches.is_empty() {
+            return ReplaceOutcome::NoMatches;
+        }
+        let Some((start, end)) = self
+            .selection_range()
+            .filter(|range| matches.contains(range))
+        else {
+            self.find_next_match(search, true, within);
+            return ReplaceOutcome::SelectedNext;
+        };
+
+        let text = self.buffer.to_string();
+        let byte_start = crate::search::char_to_byte_index(&text, start);
+        let byte_end = crate::search::char_to_byte_index(&text, end);
+        let replacement_text = search.expand_replacement(&text, byte_start, byte_end, replacement);
+
+        self.begin_undo_group();
+        self.edit(start, end - start, &replacement_text);
+        let replacement_chars = replacement_text.chars().count();
+        self.set_cursor_from_char_index(start + replacement_chars);
+        self.selection_anchor = None;
+        self.finish_undo_group();
+
+        ReplaceOutcome::Replaced {
+            delta: replacement_chars as isize - (end - start) as isize,
+        }
+    }
+
+    /// Replaces every match (optionally within a char range) as one undoable
+    /// step.  Returns the number of replacements.
+    pub fn replace_all_matches(
+        &mut self,
+        search: &crate::search::CompiledSearch,
+        replacement: &str,
+        within: Option<(usize, usize)>,
+    ) -> usize {
+        let text = self.buffer.to_string();
+        let mut byte_ranges = search.find_byte_ranges(&text);
+        if let Some((start, end)) = within {
+            let byte_start = crate::search::char_to_byte_index(&text, start);
+            let byte_end = crate::search::char_to_byte_index(&text, end);
+            byte_ranges.retain(|(match_start, match_end)| {
+                *match_start >= byte_start && *match_end <= byte_end
+            });
+        }
+        if byte_ranges.is_empty() {
+            return 0;
+        }
+
+        let mut new_text = String::with_capacity(text.len());
+        let mut copied = 0usize;
+        for (start, end) in &byte_ranges {
+            new_text.push_str(&text[copied..*start]);
+            new_text.push_str(&search.expand_replacement(&text, *start, *end, replacement));
+            copied = *end;
+        }
+        new_text.push_str(&text[copied..]);
+
+        self.begin_undo_group();
+        self.clear_selection();
+        self.replace_buffer_text(&new_text);
+        self.finish_undo_group();
+        self.clamp_cursor();
+        byte_ranges.len()
     }
 
     pub fn cursor_display_column(&self) -> usize {
@@ -2545,6 +2646,88 @@ mod tests {
         }
         assert_eq!(undone, 10);
         assert_eq!(editor.text(), "a".repeat(15));
+    }
+
+    fn compiled(
+        pattern: &str,
+        options: crate::search::SearchOptions,
+    ) -> crate::search::CompiledSearch {
+        crate::search::CompiledSearch::compile(pattern, options).expect("compile search")
+    }
+
+    #[test]
+    fn find_next_match_selects_and_wraps() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("alpha\nbeta\nALPHA");
+        let search = compiled("alpha", crate::search::SearchOptions::default());
+
+        assert!(editor.find_next_match(&search, true, None));
+        assert_eq!(editor.selected_text().as_deref(), Some("alpha"));
+
+        assert!(editor.find_next_match(&search, true, None));
+        assert_eq!(editor.selected_text().as_deref(), Some("ALPHA"));
+
+        // Wraps back to the first match.
+        assert!(editor.find_next_match(&search, true, None));
+        assert_eq!(editor.cursor.line, 0);
+    }
+
+    #[test]
+    fn replace_current_match_selects_then_replaces() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("one two one");
+        let search = compiled("one", crate::search::SearchOptions::default());
+
+        assert_eq!(
+            editor.replace_current_match(&search, "1", None),
+            ReplaceOutcome::SelectedNext
+        );
+        assert_eq!(
+            editor.replace_current_match(&search, "1", None),
+            ReplaceOutcome::Replaced { delta: -2 }
+        );
+        assert_eq!(editor.text(), "1 two one");
+    }
+
+    #[test]
+    fn replace_all_supports_regex_captures_and_selection_scope() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("a=1\nb=2\nc=3");
+        let search = compiled(
+            r"(\w)=(\d)",
+            crate::search::SearchOptions {
+                use_regex: true,
+                ..Default::default()
+            },
+        );
+
+        // Restrict to the middle line only (chars 4..7).
+        assert_eq!(
+            editor.replace_all_matches(&search, "$2=$1", Some((4, 7))),
+            1
+        );
+        assert_eq!(editor.text(), "a=1\n2=b\nc=3");
+
+        assert_eq!(editor.replace_all_matches(&search, "$2=$1", None), 2);
+        assert_eq!(editor.text(), "1=a\n2=b\n3=c");
+
+        // The whole replace-all is one undo step.
+        assert!(editor.undo());
+        assert_eq!(editor.text(), "a=1\n2=b\nc=3");
+    }
+
+    #[test]
+    fn whole_word_search_skips_partial_matches() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("cat category cat");
+        let search = compiled(
+            "cat",
+            crate::search::SearchOptions {
+                whole_word: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(editor.search_match_ranges(&search, None).len(), 2);
     }
 
     #[test]

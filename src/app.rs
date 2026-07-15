@@ -18,10 +18,11 @@ use serde_json::{json, Value};
 use crate::{
     config::{self, KeymapProfile, Settings, StartupView},
     document::FinalNewline,
-    editor::{Cursor, EditorOptions},
+    editor::{Cursor, EditorOptions, ReplaceOutcome},
     lsp::{self, LspClient},
     plugin::{PluginContext, PluginRegistry, PluginResponse},
     project::ProjectTree,
+    search::{CompiledSearch, SearchOptions},
     syntax::Language,
     tabs::{OpenDisposition, Tabs},
     terminal::TerminalPane,
@@ -246,6 +247,15 @@ pub struct App {
     command_anchor: Option<usize>,
     pub search_input: String,
     pub last_search: String,
+    pub search_replace_input: String,
+    pub search_focus_replace: bool,
+    pub search_options: SearchOptions,
+    search_scope: Option<(usize, usize)>,
+    search_scoped: bool,
+    pub search_error: Option<String>,
+    active_search: Option<CompiledSearch>,
+    search_history: Vec<String>,
+    search_history_index: Option<usize>,
     pub message: String,
     pub theme_kind: ThemeKind,
     pub theme: Theme,
@@ -447,6 +457,15 @@ impl App {
             command_anchor: None,
             search_input: String::new(),
             last_search: String::new(),
+            search_replace_input: String::new(),
+            search_focus_replace: false,
+            search_options: SearchOptions::default(),
+            search_scope: None,
+            search_scoped: false,
+            search_error: None,
+            active_search: None,
+            search_history: Vec::new(),
+            search_history_index: None,
             message: config_message.unwrap_or_else(|| {
                 if show_dashboard {
                     return "Welcome to Caret · choose a recent project or open the current folder"
@@ -1432,11 +1451,85 @@ impl App {
         );
     }
 
-    pub fn active_search_query(&self) -> &str {
-        if self.mode == Mode::Search {
-            &self.search_input
+    /// Per-char match flags for one line, used to paint search highlights.
+    pub fn search_line_hits(&self, line: &str) -> Vec<bool> {
+        let char_count = line.chars().count();
+        let mut hits = vec![false; char_count];
+        let Some(search) = self.active_search.as_ref() else {
+            return hits;
+        };
+        for (byte_start, byte_end) in search.find_byte_ranges(line) {
+            let start = line[..byte_start].chars().count();
+            let length = line[byte_start..byte_end].chars().count();
+            let end = (start + length).min(char_count);
+            for hit in &mut hits[start..end] {
+                *hit = true;
+            }
+        }
+        hits
+    }
+
+    /// The single-line find/replace panel shown in place of the prompt bar.
+    pub fn search_panel_text(&self) -> String {
+        let mut flags = String::new();
+        if self.search_options.case_sensitive {
+            flags.push_str("  Aa");
+        }
+        if self.search_options.whole_word {
+            flags.push_str("  Word");
+        }
+        if self.search_options.use_regex {
+            flags.push_str("  .*");
+        }
+        if self.search_scoped && self.search_scope.is_some() {
+            flags.push_str("  InSel");
+        }
+
+        let status = if let Some(error) = &self.search_error {
+            error.clone()
+        } else if self.search_input.is_empty() {
+            "type to search".to_string()
         } else {
-            &self.last_search
+            let matches = self.active_search.as_ref().map_or(0, |search| {
+                self.editor
+                    .search_match_ranges(search, self.effective_search_scope())
+                    .len()
+            });
+            let current = self
+                .active_search
+                .as_ref()
+                .zip(self.editor.selection_range())
+                .and_then(|(search, range)| {
+                    self.editor
+                        .search_match_ranges(search, self.effective_search_scope())
+                        .iter()
+                        .position(|candidate| *candidate == range)
+                })
+                .map(|index| index + 1);
+            match (matches, current) {
+                (0, _) => "no matches".to_string(),
+                (total, Some(index)) => format!("{index}/{total}"),
+                (total, None) => format!("{total} match(es)"),
+            }
+        };
+
+        format!(
+            " FIND {}  REPLACE {}  · {status}{flags}",
+            self.search_input, self.search_replace_input
+        )
+    }
+
+    /// Where the terminal cursor sits inside the search panel row.
+    pub fn search_cursor_offset(&self) -> (String, String) {
+        let before_query = " FIND ".to_string();
+        let between = "  REPLACE ".to_string();
+        if self.search_focus_replace {
+            (
+                format!("{before_query}{}{between}", self.search_input),
+                self.search_replace_input.clone(),
+            )
+        } else {
+            (before_query, self.search_input.clone())
         }
     }
 
@@ -2086,9 +2179,11 @@ impl App {
                     return true;
                 }
                 KeyCode::Char('f') => {
-                    self.search_origin = self.editor.cursor;
-                    self.search_input.clear();
-                    self.mode = Mode::Search;
+                    self.open_search_panel(false);
+                    return true;
+                }
+                KeyCode::Char('h') if !self.explorer_focused => {
+                    self.open_search_panel(true);
                     return true;
                 }
                 KeyCode::Char('z') => {
@@ -3350,11 +3445,7 @@ impl App {
                     self.message = "Nothing to undo".to_string();
                 }
             }
-            KeyCode::Char('/') => {
-                self.search_origin = self.editor.cursor;
-                self.search_input.clear();
-                self.mode = Mode::Search;
-            }
+            KeyCode::Char('/') => self.open_search_panel(false),
             KeyCode::Char('n') => self.repeat_search(true),
             KeyCode::Char('N') => self.repeat_search(false),
             KeyCode::Char('%') => {
@@ -3583,55 +3674,281 @@ impl App {
         true
     }
 
+    /// Opens the find/replace panel.  A multi-line selection scopes the
+    /// search to that selection; a short selection seeds the query.
+    fn open_search_panel(&mut self, focus_replace: bool) {
+        self.search_origin = self.editor.cursor;
+        self.search_focus_replace = focus_replace;
+        self.search_history_index = None;
+        self.search_input.clear();
+        self.search_scope = None;
+        self.search_scoped = false;
+        if let Some(range) = self.editor.selection_range() {
+            let selected = self.editor.selected_text().unwrap_or_default();
+            if selected.contains('\n') {
+                self.search_scope = Some(range);
+                self.search_scoped = true;
+            } else if !selected.is_empty() && selected != self.last_search {
+                // Seed the query from a deliberate selection, but not from
+                // the still-selected result of the previous search.
+                self.search_input = selected;
+            }
+        }
+        self.editor.clear_selection();
+        self.mode = Mode::Search;
+        self.message = "Find · Tab replace field · Alt-C/W/R options · F3 next · Alt-A replace all"
+            .to_string();
+        self.recompile_search();
+        self.preview_search();
+    }
+
     fn handle_search(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('c' | 'C') => {
+                    self.search_options.case_sensitive = !self.search_options.case_sensitive;
+                    self.recompile_search();
+                    self.preview_search();
+                }
+                KeyCode::Char('w' | 'W') => {
+                    self.search_options.whole_word = !self.search_options.whole_word;
+                    self.recompile_search();
+                    self.preview_search();
+                }
+                KeyCode::Char('r' | 'R') => {
+                    self.search_options.use_regex = !self.search_options.use_regex;
+                    self.recompile_search();
+                    self.preview_search();
+                }
+                KeyCode::Char('s' | 'S') => {
+                    if self.search_scope.is_some() {
+                        self.search_scoped = !self.search_scoped;
+                        self.preview_search();
+                    } else {
+                        self.message =
+                            "Select several lines before opening search to scope it".to_string();
+                    }
+                }
+                KeyCode::Enter => self.search_replace_current(),
+                KeyCode::Char('a' | 'A') => self.search_replace_all(),
+                KeyCode::Char('n' | 'N') => self.search_step(true),
+                KeyCode::Char('p' | 'P') => self.search_step(false),
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
+                self.editor.clear_selection();
                 self.editor.cursor = self.search_origin;
                 self.mode = self.preferred_editor_mode();
-                self.message = "Search cancelled".to_string();
+                self.message = "Search closed".to_string();
             }
             KeyCode::Enter => {
                 if self.search_input.is_empty() {
                     self.message = "Empty search".to_string();
                 } else {
                     self.last_search = self.search_input.clone();
+                    self.push_search_history();
                     self.message = format!("Search: {}", self.last_search);
                 }
                 self.mode = self.preferred_editor_mode();
             }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.search_focus_replace = !self.search_focus_replace;
+            }
+            KeyCode::F(3) => self.search_step(!key.modifiers.contains(KeyModifiers::SHIFT)),
+            KeyCode::Up => self.recall_search_history(true),
+            KeyCode::Down => self.recall_search_history(false),
             KeyCode::Backspace => {
-                self.search_input.pop();
-                self.preview_search();
+                if self.search_focus_replace {
+                    self.search_replace_input.pop();
+                } else {
+                    self.search_input.pop();
+                    self.search_history_index = None;
+                    self.recompile_search();
+                    self.preview_search();
+                }
             }
             KeyCode::Char(character)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.search_input.push(character);
-                self.preview_search();
+                if self.search_focus_replace {
+                    self.search_replace_input.push(character);
+                } else {
+                    self.search_input.push(character);
+                    self.search_history_index = None;
+                    self.recompile_search();
+                    self.preview_search();
+                }
             }
             _ => {}
         }
     }
 
-    fn preview_search(&mut self) {
-        self.editor.cursor = self.search_origin;
-
+    fn recompile_search(&mut self) {
         if self.search_input.is_empty() {
+            self.active_search = None;
+            self.search_error = None;
             return;
         }
+        match CompiledSearch::compile(&self.search_input, self.search_options) {
+            Ok(search) => {
+                self.active_search = Some(search);
+                self.search_error = None;
+            }
+            Err(error) => {
+                self.active_search = None;
+                self.search_error = Some(error);
+            }
+        }
+    }
 
-        if !self.editor.find_next(&self.search_input, true) {
+    fn effective_search_scope(&self) -> Option<(usize, usize)> {
+        if self.search_scoped {
+            self.search_scope
+        } else {
+            None
+        }
+    }
+
+    fn preview_search(&mut self) {
+        self.editor.clear_selection();
+        self.editor.cursor = self.search_origin;
+        let Some(search) = self.active_search.clone() else {
+            return;
+        };
+        let scope = self.effective_search_scope();
+        self.editor.find_next_match(&search, true, scope);
+    }
+
+    fn search_step(&mut self, forward: bool) {
+        let Some(search) = self.active_search.clone() else {
+            self.message = self
+                .search_error
+                .clone()
+                .unwrap_or_else(|| "Type a search first".to_string());
+            return;
+        };
+        let scope = self.effective_search_scope();
+        if !self.editor.find_next_match(&search, forward, scope) {
             self.message = format!("No match: {}", self.search_input);
         }
     }
 
+    fn search_replace_current(&mut self) {
+        let Some(search) = self.active_search.clone() else {
+            self.message = self
+                .search_error
+                .clone()
+                .unwrap_or_else(|| "Type a search first".to_string());
+            return;
+        };
+        let replacement = self.search_replace_input.clone();
+        let scope = self.effective_search_scope();
+        self.editor.checkpoint();
+        match self
+            .editor
+            .replace_current_match(&search, &replacement, scope)
+        {
+            ReplaceOutcome::Replaced { delta } => {
+                if let Some((_, end)) = self.search_scope.as_mut() {
+                    *end = end.saturating_add_signed(delta);
+                }
+                let scope = self.effective_search_scope();
+                self.editor.find_next_match(&search, true, scope);
+                self.message = "Replaced 1 occurrence".to_string();
+            }
+            ReplaceOutcome::SelectedNext => {
+                self.message = "Selected the next match · Alt-Enter again replaces it".to_string();
+            }
+            ReplaceOutcome::NoMatches => {
+                self.message = format!("No match: {}", self.search_input);
+            }
+        }
+    }
+
+    fn search_replace_all(&mut self) {
+        let Some(search) = self.active_search.clone() else {
+            self.message = self
+                .search_error
+                .clone()
+                .unwrap_or_else(|| "Type a search first".to_string());
+            return;
+        };
+        let replacement = self.search_replace_input.clone();
+        let scope = self.effective_search_scope();
+        self.editor.checkpoint();
+        let count = self
+            .editor
+            .replace_all_matches(&search, &replacement, scope);
+        if count == 0 {
+            self.message = format!("No match: {}", self.search_input);
+            return;
+        }
+        self.last_search = self.search_input.clone();
+        self.push_search_history();
+        self.mode = self.preferred_editor_mode();
+        self.message = format!("Replaced {count} occurrence(s) · Ctrl-Z undoes");
+    }
+
+    fn push_search_history(&mut self) {
+        let query = self.search_input.clone();
+        if query.is_empty() {
+            return;
+        }
+        self.search_history.retain(|entry| *entry != query);
+        self.search_history.insert(0, query);
+        self.search_history.truncate(50);
+        self.search_history_index = None;
+    }
+
+    fn recall_search_history(&mut self, older: bool) {
+        if self.search_focus_replace || self.search_history.is_empty() {
+            return;
+        }
+        let next_index = match (self.search_history_index, older) {
+            (None, true) => Some(0),
+            (None, false) => None,
+            (Some(index), true) => Some((index + 1).min(self.search_history.len() - 1)),
+            (Some(0), false) => None,
+            (Some(index), false) => Some(index - 1),
+        };
+        self.search_history_index = next_index;
+        if let Some(index) = next_index {
+            self.search_input = self.search_history[index].clone();
+        } else {
+            self.search_input.clear();
+        }
+        self.recompile_search();
+        self.preview_search();
+    }
+
     fn repeat_search(&mut self, forward: bool) {
-        if self.last_search.is_empty() {
-            self.message = "No previous search".to_string();
-        } else if !self.editor.find_next(&self.last_search, forward) {
-            self.message = format!("No match: {}", self.last_search);
+        let search = match self.active_search.clone() {
+            Some(search) => search,
+            None => {
+                if self.last_search.is_empty() {
+                    self.message = "No previous search".to_string();
+                    return;
+                }
+                match CompiledSearch::compile(&self.last_search, self.search_options) {
+                    Ok(search) => {
+                        self.active_search = Some(search.clone());
+                        search
+                    }
+                    Err(error) => {
+                        self.message = error;
+                        return;
+                    }
+                }
+            }
+        };
+        if !self.editor.find_next_match(&search, forward, None) {
+            self.message = format!("No match: {}", search.pattern);
         }
     }
 
@@ -3831,6 +4148,8 @@ impl App {
             "actions",
             "diagnostics",
             "symbolrename",
+            "find",
+            "replace",
             "trim",
             "splitline",
             "selectoccurrences",
@@ -4118,6 +4437,22 @@ impl App {
                 self.editor.checkpoint();
                 let count = self.editor.sort_selected_lines();
                 self.message = format!("Sorted {count} line(s)");
+            }
+            "find" | "search" => {
+                self.open_search_panel(false);
+                if !argument.is_empty() {
+                    self.search_input = argument.clone();
+                    self.recompile_search();
+                    self.preview_search();
+                }
+            }
+            "replace" | "findreplace" => {
+                self.open_search_panel(true);
+                if !argument.is_empty() {
+                    self.search_input = argument.clone();
+                    self.recompile_search();
+                    self.preview_search();
+                }
             }
             "trim" | "trimwhitespace" => {
                 self.editor.checkpoint();
@@ -5925,6 +6260,106 @@ mod tests {
 
     fn key(character: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for character in text.chars() {
+            app.handle_key(key(character));
+        }
+    }
+
+    #[test]
+    fn search_panel_replaces_all_occurrences_as_one_undo_step() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.mode = Mode::Insert;
+        app.editor.insert_text("foo bar foo");
+        app.editor.finish_undo_group();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Search);
+        type_text(&mut app, "foo");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_text(&mut app, "baz");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+
+        assert_eq!(app.editor.text(), "baz bar baz");
+        assert!(app.message.contains("Replaced 2"), "{}", app.message);
+        assert!(app.editor.undo());
+        assert_eq!(app.editor.text(), "foo bar foo");
+    }
+
+    #[test]
+    fn search_options_narrow_matches_case_then_whole_word() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.mode = Mode::Insert;
+        app.editor.insert_text("Cat cat concat");
+        app.editor.finish_undo_group();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        type_text(&mut app, "cat");
+        assert!(
+            app.search_panel_text().contains("1/3"),
+            "{}",
+            app.search_panel_text()
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
+        assert!(
+            app.search_panel_text().contains("1/2"),
+            "{}",
+            app.search_panel_text()
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT));
+        assert!(
+            app.search_panel_text().contains("1/1"),
+            "{}",
+            app.search_panel_text()
+        );
+        assert_eq!(app.editor.selected_text().as_deref(), Some("cat"));
+    }
+
+    #[test]
+    fn search_history_recalls_previous_queries() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.mode = Mode::Insert;
+        app.editor.insert_text("alpha beta");
+        app.editor.finish_undo_group();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        type_text(&mut app, "alpha");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        type_text(&mut app, "beta");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(app.search_input.is_empty());
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "beta");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "alpha");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "beta");
+    }
+
+    #[test]
+    fn invalid_regex_shows_an_error_instead_of_crashing() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.mode = Mode::Insert;
+        app.editor.insert_text("(text)");
+        app.editor.finish_undo_group();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        type_text(&mut app, "(unclosed");
+        assert!(app.search_error.is_some());
+        assert!(app.search_panel_text().contains("Regex error"));
     }
 
     #[test]
