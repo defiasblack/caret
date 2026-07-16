@@ -19,6 +19,7 @@ use crate::{
     config::{self, KeymapProfile, Settings, StartupView},
     document::FinalNewline,
     editor::{Cursor, EditorOptions, ReplaceOutcome},
+    keys::{Action as KeyAction, KeyBindings},
     lsp::{self, LspClient},
     plugin::{PluginContext, PluginRegistry, PluginResponse},
     project::ProjectTree,
@@ -36,6 +37,7 @@ pub enum Mode {
     Search,
     ProjectSearch,
     FilePicker,
+    KeyBrowser,
     Command,
     Help,
     QuitConfirm,
@@ -77,6 +79,7 @@ impl Mode {
             Self::Search => "SEARCH",
             Self::ProjectSearch => "PROJECT FIND",
             Self::FilePicker => "OPEN FILE",
+            Self::KeyBrowser => "KEYS",
             Self::Command => "COMMAND",
             Self::Help => "HELP",
             Self::QuitConfirm => "QUIT?",
@@ -304,6 +307,9 @@ pub struct App {
     pub project_search: ProjectSearchState,
     pub file_picker: FilePickerState,
     tree_filter_active: bool,
+    keys: KeyBindings,
+    pub key_browser_input: String,
+    pub key_browser_scroll: usize,
     pub message: String,
     pub theme_kind: ThemeKind,
     pub theme: Theme,
@@ -391,6 +397,10 @@ impl App {
 
     pub fn new(path: Option<&Path>) -> io::Result<Self> {
         let (settings, mut config_message) = config::load();
+        let keys = KeyBindings::from_custom(&settings.custom_keys);
+        if !keys.warnings.is_empty() {
+            config_message = Some(keys.warnings.join(" · "));
+        }
         let restored_session = if !cfg!(test)
             && settings.restore_session
             && settings.startup == StartupView::Session
@@ -517,6 +527,9 @@ impl App {
             project_search: ProjectSearchState::default(),
             file_picker: FilePickerState::default(),
             tree_filter_active: false,
+            keys,
+            key_browser_input: String::new(),
+            key_browser_scroll: 0,
             message: config_message.unwrap_or_else(|| {
                 if show_dashboard {
                     return "Welcome to Caret · choose a recent project or open the current folder"
@@ -1999,6 +2012,10 @@ impl App {
             self.handle_file_picker(key);
             return;
         }
+        if self.mode == Mode::KeyBrowser {
+            self.handle_key_browser(key);
+            return;
+        }
         if self.mode == Mode::ContextMenu {
             match key.code {
                 KeyCode::Esc => self.close_context_menu(),
@@ -2083,6 +2100,7 @@ impl App {
             | Mode::ReloadConfirm
             | Mode::ProjectSearch
             | Mode::FilePicker
+            | Mode::KeyBrowser
             | Mode::GitDiff
             | Mode::GitHistory
             | Mode::ThemeGallery
@@ -2216,231 +2234,274 @@ impl App {
         }
     }
 
+    /// Global shortcuts resolve through the user-configurable binding
+    /// registry first, so every action here can be rebound with :bind.
     fn handle_global_shortcut(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char(' ') | KeyCode::Null => {
-                    self.request_lsp_position("textDocument/completion");
-                    return true;
-                }
-                KeyCode::Char('.') => {
-                    self.request_lsp_position("textDocument/codeAction");
-                    return true;
-                }
-                KeyCode::Char('p' | 'P') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.command_input.clear();
-                    self.command_cursor = 0;
-                    self.command_anchor = None;
-                    self.command_selection = None;
-                    self.command_suggestion = 0;
-                    self.command_suggestion_scroll = 0;
-                    self.mode = Mode::Command;
-                    self.message = "Command palette".to_string();
-                    return true;
-                }
-                KeyCode::Char('p') => {
-                    self.open_file_picker();
-                    return true;
-                }
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.add_cursor_line(false);
-                    return true;
-                }
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.add_cursor_line(true);
-                    return true;
-                }
-                KeyCode::Char('l' | 'L') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    let count = self.editor.select_all_occurrences();
-                    self.message = if count > 1 {
-                        format!("Selected {count} occurrences · type to replace them all")
-                    } else {
-                        "Select or place the cursor on a word first".to_string()
-                    };
-                    return true;
-                }
-                KeyCode::Char('f' | 'F') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.open_project_search();
-                    return true;
-                }
-                KeyCode::Char('f') => {
-                    self.open_search_panel(false);
-                    return true;
-                }
-                KeyCode::Char('h') if !self.explorer_focused => {
-                    self.open_search_panel(true);
-                    return true;
-                }
-                KeyCode::Char('z') => {
-                    self.message = if self.editor.undo() {
-                        "Undone"
-                    } else {
-                        "Nothing to undo"
-                    }
-                    .to_string();
-                    return true;
-                }
-                KeyCode::Char('y') => {
-                    self.message = if self.editor.redo() {
-                        "Redone"
-                    } else {
-                        "Nothing to redo"
-                    }
-                    .to_string();
-                    return true;
-                }
-                KeyCode::Char('\\') => {
-                    if let Some(mut views) = self.split_views {
-                        self.sync_focused_view();
-                        views.secondary_active = !views.secondary_active;
-                        self.split_views = Some(views);
-                        self.activate_focused_view();
-                    }
-                    return true;
-                }
-                KeyCode::Char('a') => {
-                    self.editor.clear_selection();
-                    self.editor.move_file_start();
-                    self.editor.begin_selection();
-                    self.editor.move_file_end();
-                    self.message = "Selected all".to_string();
-                    return true;
-                }
-                KeyCode::Char('c') => {
-                    self.copy_selection_to_clipboard();
-                    return true;
-                }
-                KeyCode::Char('x') => {
-                    if let Some(text) = self.editor.selected_text() {
-                        self.editor.checkpoint();
-                        self.yank = text;
-                        self.editor.delete_selection();
-                        self.message =
-                            copy_message(crate::clipboard::copy(&self.yank), "Cut selection");
-                    } else {
-                        self.message = "Select text to cut".to_string();
-                    }
-                    return true;
-                }
-                KeyCode::Char('v') => {
-                    let clipboard_text = arboard::Clipboard::new()
-                        .and_then(|mut clipboard| clipboard.get_text())
-                        .ok();
-                    let text = clipboard_text.as_deref().unwrap_or(&self.yank);
-                    if text.is_empty() {
-                        self.message = "Clipboard is empty".to_string();
-                    } else {
-                        self.editor.checkpoint();
-                        self.editor.insert_text(text);
-                        self.message = "Pasted".to_string();
-                    }
-                    return true;
-                }
-                KeyCode::Tab => {
-                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        self.previous_tab();
-                    } else {
-                        self.next_tab();
-                    }
-                    return true;
-                }
-                KeyCode::BackTab | KeyCode::PageUp => {
-                    self.previous_tab();
-                    return true;
-                }
-                KeyCode::PageDown => {
-                    self.next_tab();
-                    return true;
-                }
-                KeyCode::Char('t') => {
-                    self.new_tab(None);
-                    return true;
-                }
-                KeyCode::Char('w') => {
-                    self.close_active_tab(false);
-                    return true;
-                }
-                KeyCode::Char('b') => {
-                    self.toggle_file_tree();
-                    return true;
-                }
-                KeyCode::Char('o') => {
-                    self.project.visible = true;
-                    self.sidebar_view = if self.sidebar_view == SidebarView::Outline {
-                        SidebarView::Files
-                    } else {
-                        SidebarView::Outline
-                    };
-                    self.explorer_focused = true;
-                    self.mode = Mode::Normal;
-                    self.message = match self.sidebar_view {
-                        SidebarView::Outline => "SYMBOLS · Enter jumps · Ctrl-E returns to editor",
-                        SidebarView::Files => "FILES · Enter opens · Ctrl-E returns to editor",
-                    }
-                    .to_string();
-                    return true;
-                }
-                KeyCode::Char('/') => {
-                    self.toggle_comments();
-                    return true;
-                }
-                KeyCode::Char('e') => {
-                    if !self.project.visible {
-                        self.project.visible = true;
-                        self.explorer_focused = true;
-                    } else {
-                        self.explorer_focused = !self.explorer_focused;
-                    }
-                    if self.explorer_focused {
-                        self.mode = Mode::Normal;
-                        self.message = "FILES · Enter opens · Ctrl-E returns to editor".to_string();
-                    } else {
-                        self.mode = self.preferred_editor_mode();
-                        self.message = "Editor focused".to_string();
-                    }
-                    return true;
-                }
-                _ => {}
-            }
-        }
-
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            match key.code {
-                KeyCode::Left => {
-                    self.go_back();
-                    return true;
-                }
-                KeyCode::Right => {
-                    self.go_forward();
-                    return true;
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.next_tab();
-                    return true;
-                }
-                KeyCode::Char('p') | KeyCode::Char('P') => {
-                    self.previous_tab();
-                    return true;
-                }
-                KeyCode::Char(character @ '1'..='9') => {
-                    let index = character.to_digit(10).unwrap_or(1) as usize - 1;
-                    self.select_tab_with_history(index);
-                    return true;
-                }
-                _ => {}
-            }
-        }
-
-        if key.code == KeyCode::F(12) {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                self.request_lsp_position("textDocument/references");
-            } else {
-                self.request_lsp_position("textDocument/definition");
-            }
+        if let Some(action) = self.keys.action_for(key) {
+            self.run_action(action);
             return true;
         }
 
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            if let KeyCode::Char(character @ '1'..='9') = key.code {
+                let index = character.to_digit(10).unwrap_or(1) as usize - 1;
+                self.select_tab_with_history(index);
+                return true;
+            }
+        }
+
         false
+    }
+
+    fn run_action(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::Save => self.save(),
+            KeyAction::Quit => self.request_quit(false),
+            KeyAction::Find => self.open_search_panel(false),
+            KeyAction::Replace => self.open_search_panel(true),
+            KeyAction::ProjectSearch => self.open_project_search(),
+            KeyAction::OpenFile => self.open_file_picker(),
+            KeyAction::Palette => self.open_command_palette(),
+            KeyAction::Complete => self.request_lsp_position("textDocument/completion"),
+            KeyAction::CodeActions => self.request_lsp_position("textDocument/codeAction"),
+            KeyAction::Undo => {
+                self.message = if self.editor.undo() {
+                    "Undone"
+                } else {
+                    "Nothing to undo"
+                }
+                .to_string();
+            }
+            KeyAction::Redo => {
+                self.message = if self.editor.redo() {
+                    "Redone"
+                } else {
+                    "Nothing to redo"
+                }
+                .to_string();
+            }
+            KeyAction::SelectAll => {
+                self.editor.clear_selection();
+                self.editor.move_file_start();
+                self.editor.begin_selection();
+                self.editor.move_file_end();
+                self.message = "Selected all".to_string();
+            }
+            KeyAction::Copy => self.copy_selection_to_clipboard(),
+            KeyAction::Cut => {
+                if let Some(text) = self.editor.selected_text() {
+                    self.editor.checkpoint();
+                    self.yank = text;
+                    self.editor.delete_selection();
+                    self.message =
+                        copy_message(crate::clipboard::copy(&self.yank), "Cut selection");
+                } else {
+                    self.message = "Select text to cut".to_string();
+                }
+            }
+            KeyAction::Paste => {
+                let clipboard_text = arboard::Clipboard::new()
+                    .and_then(|mut clipboard| clipboard.get_text())
+                    .ok();
+                let text = clipboard_text.as_deref().unwrap_or(&self.yank);
+                if text.is_empty() {
+                    self.message = "Clipboard is empty".to_string();
+                } else {
+                    self.editor.checkpoint();
+                    self.editor.insert_text(text);
+                    self.message = "Pasted".to_string();
+                }
+            }
+            KeyAction::NextTab => self.next_tab(),
+            KeyAction::PrevTab => self.previous_tab(),
+            KeyAction::NewTab => self.new_tab(None),
+            KeyAction::CloseTab => self.close_active_tab(false),
+            KeyAction::ToggleTree => self.toggle_file_tree(),
+            KeyAction::ToggleOutline => {
+                self.project.visible = true;
+                self.sidebar_view = if self.sidebar_view == SidebarView::Outline {
+                    SidebarView::Files
+                } else {
+                    SidebarView::Outline
+                };
+                self.explorer_focused = true;
+                self.mode = Mode::Normal;
+                self.message = match self.sidebar_view {
+                    SidebarView::Outline => "SYMBOLS · Enter jumps · Ctrl-E returns to editor",
+                    SidebarView::Files => "FILES · Enter opens · Ctrl-E returns to editor",
+                }
+                .to_string();
+            }
+            KeyAction::FocusTree => {
+                if !self.project.visible {
+                    self.project.visible = true;
+                    self.explorer_focused = true;
+                } else {
+                    self.explorer_focused = !self.explorer_focused;
+                }
+                if self.explorer_focused {
+                    self.mode = Mode::Normal;
+                    self.message = "FILES · Enter opens · Ctrl-E returns to editor".to_string();
+                } else {
+                    self.mode = self.preferred_editor_mode();
+                    self.message = "Editor focused".to_string();
+                }
+            }
+            KeyAction::ToggleComment => self.toggle_comments(),
+            KeyAction::AddCursorAbove => self.add_cursor_line(false),
+            KeyAction::AddCursorBelow => self.add_cursor_line(true),
+            KeyAction::SelectOccurrences => {
+                let count = self.editor.select_all_occurrences();
+                self.message = if count > 1 {
+                    format!("Selected {count} occurrences · type to replace them all")
+                } else {
+                    "Select or place the cursor on a word first".to_string()
+                };
+            }
+            KeyAction::Back => self.go_back(),
+            KeyAction::Forward => self.go_forward(),
+            KeyAction::Definition => self.request_lsp_position("textDocument/definition"),
+            KeyAction::References => self.request_lsp_position("textDocument/references"),
+            KeyAction::SwitchSplit => {
+                if let Some(mut views) = self.split_views {
+                    self.sync_focused_view();
+                    views.secondary_active = !views.secondary_active;
+                    self.split_views = Some(views);
+                    self.activate_focused_view();
+                }
+            }
+        }
+    }
+
+    fn open_key_browser(&mut self) {
+        self.key_browser_input.clear();
+        self.key_browser_scroll = 0;
+        self.mode = Mode::KeyBrowser;
+        self.message = "Key bindings · type to search · :bind <action> <keys> rebinds".to_string();
+    }
+
+    fn handle_key_browser(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.mode = self.preferred_editor_mode();
+                self.message.clear();
+            }
+            KeyCode::Up => self.key_browser_scroll = self.key_browser_scroll.saturating_sub(1),
+            KeyCode::Down => {
+                self.key_browser_scroll = (self.key_browser_scroll + 1)
+                    .min(self.keybinding_rows().len().saturating_sub(1))
+            }
+            KeyCode::PageUp => self.key_browser_scroll = self.key_browser_scroll.saturating_sub(10),
+            KeyCode::PageDown => {
+                self.key_browser_scroll = (self.key_browser_scroll + 10)
+                    .min(self.keybinding_rows().len().saturating_sub(1))
+            }
+            KeyCode::Home => self.key_browser_scroll = 0,
+            KeyCode::Backspace => {
+                self.key_browser_input.pop();
+                self.key_browser_scroll = 0;
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.key_browser_input.push(character);
+                self.key_browser_scroll = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Rows for the searchable keybinding browser: every rebindable action
+    /// with its current chord, then the fixed keys of the active profile.
+    pub fn keybinding_rows(&self) -> Vec<(String, String, String)> {
+        let query = self.key_browser_input.to_lowercase();
+        let mut rows = Vec::new();
+        for action in KeyAction::ALL {
+            let chord = self.keys.chord_for(action);
+            let chord_text = chord
+                .map(|chord| chord.display())
+                .unwrap_or_else(|| "unbound".to_string());
+            let mut note = String::new();
+            if self.keys.is_custom(action) {
+                note.push_str("custom · ");
+            }
+            if let Some(warning) = chord.as_ref().and_then(crate::keys::chord_warning) {
+                note.push_str("⚠ ");
+                note.push_str(warning);
+            } else {
+                note.push_str(action.id());
+            }
+            rows.push((chord_text, action.description().to_string(), note));
+        }
+        for (chord, description) in crate::keys::fixed_keys(self.keymap_profile()) {
+            rows.push((
+                chord.to_string(),
+                description.to_string(),
+                format!("{} profile", self.keymap_profile().name()),
+            ));
+        }
+        if query.is_empty() {
+            return rows;
+        }
+        rows.into_iter()
+            .filter(|(chord, description, note)| {
+                chord.to_lowercase().contains(&query)
+                    || description.to_lowercase().contains(&query)
+                    || note.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    fn rebuild_keys(&mut self) {
+        self.keys = KeyBindings::from_custom(&self.settings.custom_keys);
+    }
+
+    fn execute_bind(&mut self, action_id: &str, chord_text: &str) {
+        let Some(action) = KeyAction::from_id(action_id) else {
+            self.message = format!("Unknown action: {action_id} — see :keybindings for the list");
+            return;
+        };
+        if chord_text.eq_ignore_ascii_case("default") {
+            self.settings.custom_keys.remove(action.id());
+            self.rebuild_keys();
+            self.persist_settings();
+            self.message = format!(
+                "{} reset to {}",
+                action.id(),
+                self.keys
+                    .chord_for(action)
+                    .map(|chord| chord.display())
+                    .unwrap_or_else(|| "unbound".to_string())
+            );
+            return;
+        }
+        match self.keys.validate(action, chord_text) {
+            Ok(chord) => {
+                self.settings
+                    .custom_keys
+                    .insert(action.id().to_string(), chord_text.to_string());
+                self.rebuild_keys();
+                self.persist_settings();
+                let warning = crate::keys::chord_warning(&chord)
+                    .map(|warning| format!(" · warning: {warning}"))
+                    .unwrap_or_default();
+                self.message = format!("{} → {}{}", action.id(), chord.display(), warning);
+            }
+            Err(error) => self.message = error,
+        }
+    }
+
+    fn open_command_palette(&mut self) {
+        self.command_input.clear();
+        self.command_cursor = 0;
+        self.command_anchor = None;
+        self.command_selection = None;
+        self.command_suggestion = 0;
+        self.command_suggestion_scroll = 0;
+        self.mode = Mode::Command;
+        self.message = "Command palette".to_string();
     }
 
     fn add_cursor_line(&mut self, below: bool) {
@@ -3150,12 +3211,9 @@ impl App {
     }
 
     fn handle_explorer(&mut self, key: KeyEvent) {
+        // Ctrl shortcuts were already offered to the global registry; swallow
+        // the rest so plain-letter tree bindings never fire with Ctrl held.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('s') => self.save(),
-                KeyCode::Char('q') => self.request_quit(false),
-                _ => {}
-            }
             return;
         }
 
@@ -3387,8 +3445,6 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('s') => self.save(),
-                KeyCode::Char('q') => self.request_quit(false),
                 KeyCode::Char('r') => {
                     if self.editor.redo() {
                         self.message = "Redone".to_string();
@@ -3624,8 +3680,6 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('s') => self.save(),
-                KeyCode::Char('q') => self.request_quit(false),
                 KeyCode::Char('d') => {
                     if self.editor.select_next_occurrence() {
                         self.message = format!(
@@ -4780,6 +4834,10 @@ impl App {
             "themes",
             "keymap",
             "keymaps",
+            "keybindings",
+            "bind",
+            "unbind",
+            "bindreset",
             "help",
             "welcome",
         ];
@@ -5165,6 +5223,30 @@ impl App {
             "themes" | "themegallery" => self.open_theme_gallery(),
             "keymap" => self.execute_keymap(&argument),
             "keymaps" | "keymapgallery" => self.open_keymap_gallery(),
+            "keybindings" | "binds" | "shortcuts" => self.open_key_browser(),
+            "bind" => {
+                let mut values = argument.split_whitespace();
+                match (values.next(), values.next()) {
+                    (Some(action_id), Some(chord_text)) => self.execute_bind(action_id, chord_text),
+                    _ => self.message =
+                        "Usage: :bind <action> <keys>, e.g. :bind find ctrl+g — see :keybindings"
+                            .to_string(),
+                }
+            }
+            "unbind" => {
+                if argument.is_empty() {
+                    self.message = "Usage: :unbind <action> restores its default".to_string();
+                } else {
+                    self.execute_bind(argument.trim(), "default");
+                }
+            }
+            "bindreset" => {
+                let count = self.settings.custom_keys.len();
+                self.settings.custom_keys.clear();
+                self.rebuild_keys();
+                self.persist_settings();
+                self.message = format!("Reset {count} custom binding(s) to the defaults");
+            }
             "plugins" => {
                 let errors = self.plugins.errors().len();
                 self.message = if errors == 0 {
@@ -7083,6 +7165,48 @@ mod tests {
             .as_ref()
             .is_some_and(|path| path.ends_with("target_file.rs")));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn custom_bindings_rebind_global_shortcuts() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.mode = Mode::Insert;
+
+        app.execute_command("bind find ctrl+g");
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Search);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // The old chord no longer opens search after the rebind.
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_ne!(app.mode, Mode::Search);
+
+        // Conflicts are rejected and name the other action.
+        app.execute_command("bind replace ctrl+g");
+        assert!(app.message.contains("find"), "{}", app.message);
+
+        // Reset restores the default chord.
+        app.execute_command("bind find default");
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Search);
+    }
+
+    #[test]
+    fn keybinding_browser_lists_and_searches_bindings() {
+        let mut app = App::new(None).expect("create app");
+        app.execute_command("keybindings");
+        assert_eq!(app.mode, Mode::KeyBrowser);
+
+        let all = app.keybinding_rows().len();
+        assert!(all > 30, "expected a full catalog, got {all}");
+
+        type_text(&mut app, "undo");
+        let filtered = app.keybinding_rows();
+        assert!(filtered.len() < all);
+        assert!(filtered
+            .iter()
+            .any(|(_, description, _)| description.contains("Undo")));
     }
 
     #[test]

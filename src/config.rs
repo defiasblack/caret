@@ -71,6 +71,8 @@ pub struct Settings {
     pub trim_trailing_whitespace_on_save: bool,
     pub final_newline: FinalNewline,
     pub undo_history_limit: usize,
+    /// Custom key bindings: action id → chord, e.g. `find = "ctrl+g"`.
+    pub custom_keys: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -94,6 +96,7 @@ impl Default for Settings {
             trim_trailing_whitespace_on_save: false,
             final_newline: FinalNewline::Preserve,
             undo_history_limit: 1_000,
+            custom_keys: std::collections::BTreeMap::new(),
         }
     }
 }

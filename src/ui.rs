@@ -233,6 +233,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if app.mode == Mode::FilePicker {
         draw_file_picker(out, app, width, height)?;
     }
+    if app.mode == Mode::KeyBrowser {
+        draw_key_browser(out, app, width, height)?;
+    }
     if app.mode == Mode::GitDiff {
         draw_git_diff(out, app, width, height)?;
     }
@@ -1062,6 +1065,7 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Normal => app.theme.normal_mode,
             Mode::Insert => app.theme.insert_mode,
             Mode::Search | Mode::ProjectSearch | Mode::FilePicker => app.theme.search_mode,
+            Mode::KeyBrowser => app.theme.command_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
@@ -1269,6 +1273,86 @@ fn draw_git_history<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -
             Print(pad_or_truncate(&label, panel_width))
         )?;
     }
+    Ok(())
+}
+
+fn draw_key_browser<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
+    let panel_width = (width as usize).saturating_sub(6).min(96);
+    let panel_height = (height as usize).saturating_sub(4);
+    if panel_width < 30 || panel_height < 6 {
+        return Ok(());
+    }
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = 1u16;
+    let list_rows = panel_height.saturating_sub(3);
+
+    for row in 0..panel_height {
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print(pad_or_truncate(
+            &format!(
+                "KEY BINDINGS · {} profile · search: {}▏",
+                app.keymap_profile().name(),
+                app.key_browser_input
+            ),
+            panel_width.saturating_sub(4)
+        )),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    let rows = app.keybinding_rows();
+    let scroll = app.key_browser_scroll.min(rows.len().saturating_sub(1));
+    let chord_width = 18usize;
+    let description_width = (panel_width.saturating_sub(4 + chord_width + 2)) / 2;
+    for row_index in 0..list_rows {
+        let Some((chord, description, note)) = rows.get(scroll + row_index) else {
+            break;
+        };
+        let row_y = y + 1 + row_index as u16;
+        let text = format!(
+            "{}  {}  {note}",
+            pad_or_truncate(chord, chord_width),
+            pad_or_truncate(description, description_width),
+        );
+        queue!(
+            out,
+            MoveTo(x + 2, row_y),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(if note.contains('⚠') {
+                app.theme.gutter_current
+            } else if note.starts_with("custom") {
+                app.theme.success
+            } else {
+                app.theme.overlay_text
+            }),
+            Print(pad_or_truncate(&text, panel_width.saturating_sub(4)))
+        )?;
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y + panel_height as u16 - 1),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(
+            &format!(
+                "{} binding(s) · :bind <action> <keys> rebinds · :bind <action> default resets · :bindreset resets all · Esc closes",
+                rows.len()
+            ),
+            panel_width.saturating_sub(4)
+        ))
+    )?;
     Ok(())
 }
 
@@ -2286,6 +2370,7 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Normal => app.theme.normal_mode,
             Mode::Insert => app.theme.insert_mode,
             Mode::Search | Mode::ProjectSearch | Mode::FilePicker => app.theme.search_mode,
+            Mode::KeyBrowser => app.theme.command_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
@@ -2472,6 +2557,12 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Type", "Filter"),
             ("↑↓", "Select"),
             ("Enter", "Open"),
+            ("Esc", "Close"),
+        ],
+        (Mode::KeyBrowser, _) => &[
+            ("Type", "Search"),
+            ("↑↓", "Scroll"),
+            (":bind", "Rebind"),
             ("Esc", "Close"),
         ],
         (Mode::Command, _) => &[
@@ -2762,6 +2853,7 @@ fn place_cursor<W: Write>(
         Mode::Help
             | Mode::ProjectSearch
             | Mode::FilePicker
+            | Mode::KeyBrowser
             | Mode::QuitConfirm
             | Mode::ReloadConfirm
             | Mode::GitDiff
