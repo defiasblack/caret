@@ -35,6 +35,7 @@ pub enum Mode {
     Insert,
     Search,
     ProjectSearch,
+    FilePicker,
     Command,
     Help,
     QuitConfirm,
@@ -75,6 +76,7 @@ impl Mode {
             Self::Insert => "INSERT",
             Self::Search => "SEARCH",
             Self::ProjectSearch => "PROJECT FIND",
+            Self::FilePicker => "OPEN FILE",
             Self::Command => "COMMAND",
             Self::Help => "HELP",
             Self::QuitConfirm => "QUIT?",
@@ -231,6 +233,27 @@ pub struct ContextMenu {
     pub actions: Vec<ContextAction>,
 }
 
+/// One row in the fuzzy file picker.
+#[derive(Debug, Clone)]
+pub struct PickerMatch {
+    pub file_index: usize,
+    /// Char positions inside the path that matched the query.
+    pub positions: Vec<usize>,
+    pub recent: bool,
+}
+
+/// State for the Ctrl-P fuzzy file picker.
+#[derive(Debug, Clone, Default)]
+pub struct FilePickerState {
+    pub input: String,
+    /// Project-relative paths of every candidate file.
+    pub files: Vec<String>,
+    pub matches: Vec<PickerMatch>,
+    pub selected: usize,
+    pub scroll: usize,
+    pub truncated: bool,
+}
+
 /// State for the project-wide search and replace panel.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectSearchState {
@@ -279,6 +302,8 @@ pub struct App {
     search_history: Vec<String>,
     search_history_index: Option<usize>,
     pub project_search: ProjectSearchState,
+    pub file_picker: FilePickerState,
+    tree_filter_active: bool,
     pub message: String,
     pub theme_kind: ThemeKind,
     pub theme: Theme,
@@ -490,6 +515,8 @@ impl App {
             search_history: Vec::new(),
             search_history_index: None,
             project_search: ProjectSearchState::default(),
+            file_picker: FilePickerState::default(),
+            tree_filter_active: false,
             message: config_message.unwrap_or_else(|| {
                 if show_dashboard {
                     return "Welcome to Caret · choose a recent project or open the current folder"
@@ -1968,6 +1995,10 @@ impl App {
             self.handle_project_search(key);
             return;
         }
+        if self.mode == Mode::FilePicker {
+            self.handle_file_picker(key);
+            return;
+        }
         if self.mode == Mode::ContextMenu {
             match key.code {
                 KeyCode::Esc => self.close_context_menu(),
@@ -2051,6 +2082,7 @@ impl App {
             Mode::QuitConfirm
             | Mode::ReloadConfirm
             | Mode::ProjectSearch
+            | Mode::FilePicker
             | Mode::GitDiff
             | Mode::GitHistory
             | Mode::ThemeGallery
@@ -2204,6 +2236,10 @@ impl App {
                     self.command_suggestion_scroll = 0;
                     self.mode = Mode::Command;
                     self.message = "Command palette".to_string();
+                    return true;
+                }
+                KeyCode::Char('p') => {
+                    self.open_file_picker();
                     return true;
                 }
                 KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
@@ -2668,14 +2704,14 @@ impl App {
     }
 
     fn delete_selected_project_entry(&mut self, force: bool) {
-        if !force {
-            self.message = "Deletion is permanent; use :delete!".to_string();
-            return;
-        }
         let Some(path) = self.selected_project_path() else {
             self.message = "Select a file or folder first".to_string();
             return;
         };
+        if !force {
+            self.message = format!("Delete {} permanently? :delete! confirms", path.display());
+            return;
+        }
         let result = if path.is_dir() {
             fs::remove_dir_all(&path)
         } else {
@@ -3097,6 +3133,7 @@ impl App {
             self.editor.len(),
             self.editor.active_title()
         );
+        self.remember_recent_file();
         self.refresh_git_line_changes();
         self.sync_lsp_active_file();
     }
@@ -3161,15 +3198,63 @@ impl App {
             return;
         }
 
+        // Typing mode for the tree filter: characters narrow the file list.
+        if self.tree_filter_active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.tree_filter_active = false;
+                    let _ = self.project.set_filter(String::new());
+                    self.message = "Filter cleared".to_string();
+                }
+                KeyCode::Enter => {
+                    if self.project.filter.is_empty() {
+                        self.tree_filter_active = false;
+                        self.message = "Filter closed".to_string();
+                    } else if self.project.entries.is_empty() {
+                        self.message = format!("No files match {}", self.project.filter);
+                    } else {
+                        self.tree_filter_active = false;
+                        self.activate_project_entry();
+                    }
+                }
+                KeyCode::Up => self.project.move_up(),
+                KeyCode::Down => self.project.move_down(),
+                KeyCode::Backspace => {
+                    let mut filter = self.project.filter.clone();
+                    filter.pop();
+                    let _ = self.project.set_filter(filter);
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let filter = format!("{}{character}", self.project.filter);
+                    let _ = self.project.set_filter(filter);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::F(1) | KeyCode::Char('?') => {
                 self.explorer_focused = false;
                 self.open_help();
             }
+            KeyCode::Esc if !self.project.filter.is_empty() => {
+                let _ = self.project.set_filter(String::new());
+                self.message = "Filter cleared".to_string();
+            }
             KeyCode::Esc => {
                 self.explorer_focused = false;
                 self.mode = self.preferred_editor_mode();
                 self.message = "Editor focused".to_string();
+            }
+            KeyCode::Char('/') | KeyCode::Char('f') => {
+                self.tree_filter_active = true;
+                self.message =
+                    "Filter files · type to narrow · Enter opens · Esc clears".to_string();
             }
             KeyCode::Up | KeyCode::Char('k') => self.project.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.project.move_down(),
@@ -3254,6 +3339,7 @@ impl App {
                         self.mode = self.preferred_editor_mode();
                         self.pending_key = None;
                         self.search_origin = self.editor.cursor;
+                        self.remember_recent_file();
                         self.message = match disposition {
                             OpenDisposition::Opened => {
                                 format!("Opened {} in a new tab", path.display())
@@ -4001,6 +4087,206 @@ impl App {
         }
     }
 
+    /// Opens the Ctrl-P fuzzy file picker over every non-ignored project
+    /// file.  Recently opened files rank first.
+    fn open_file_picker(&mut self) {
+        const MAX_PICKER_FILES: usize = 20_000;
+        let mut files = Vec::new();
+        let mut truncated = false;
+        let walker = ignore::WalkBuilder::new(&self.project.root)
+            .sort_by_file_path(std::cmp::Ord::cmp)
+            .require_git(false)
+            .hidden(!self.project.show_hidden)
+            .build();
+        for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                continue;
+            }
+            if files.len() >= MAX_PICKER_FILES {
+                truncated = true;
+                break;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&self.project.root)
+                .unwrap_or(entry.path());
+            files.push(relative.display().to_string());
+        }
+        self.file_picker = FilePickerState {
+            files,
+            truncated,
+            ..FilePickerState::default()
+        };
+        self.mode = Mode::FilePicker;
+        self.message = "Open file · type to filter · Enter opens · Esc closes".to_string();
+        self.refresh_file_picker();
+    }
+
+    fn refresh_file_picker(&mut self) {
+        const MAX_PICKER_MATCHES: usize = 300;
+        let recent: Vec<String> = self
+            .settings
+            .recent_files
+            .iter()
+            .filter_map(|path| path.strip_prefix(&self.project.root).ok())
+            .map(|relative| relative.display().to_string())
+            .collect();
+
+        let state = &mut self.file_picker;
+        state.matches.clear();
+        state.selected = 0;
+        state.scroll = 0;
+
+        if state.input.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            for name in &recent {
+                if let Some(index) = state.files.iter().position(|file| file == name) {
+                    if seen.insert(index) {
+                        state.matches.push(PickerMatch {
+                            file_index: index,
+                            positions: Vec::new(),
+                            recent: true,
+                        });
+                    }
+                }
+            }
+            for index in 0..state.files.len() {
+                if state.matches.len() >= MAX_PICKER_MATCHES {
+                    break;
+                }
+                if !seen.contains(&index) {
+                    state.matches.push(PickerMatch {
+                        file_index: index,
+                        positions: Vec::new(),
+                        recent: false,
+                    });
+                }
+            }
+            return;
+        }
+
+        let mut scored: Vec<(i32, PickerMatch)> = state
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                crate::fuzzy::match_score(file, &state.input).map(|(score, positions)| {
+                    let is_recent = recent.iter().any(|name| name == file);
+                    (
+                        score + if is_recent { 10 } else { 0 },
+                        PickerMatch {
+                            file_index: index,
+                            positions,
+                            recent: is_recent,
+                        },
+                    )
+                })
+            })
+            .collect();
+        scored.sort_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| {
+                state.files[left.1.file_index]
+                    .len()
+                    .cmp(&state.files[right.1.file_index].len())
+            })
+        });
+        state.matches = scored
+            .into_iter()
+            .take(MAX_PICKER_MATCHES)
+            .map(|(_, matched)| matched)
+            .collect();
+    }
+
+    fn handle_file_picker(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = self.preferred_editor_mode();
+                self.message = "File picker closed".to_string();
+            }
+            KeyCode::Enter => self.open_selected_picker_file(),
+            KeyCode::Up => {
+                self.file_picker.selected = self.file_picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.file_picker.selected = (self.file_picker.selected + 1)
+                    .min(self.file_picker.matches.len().saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                self.file_picker.selected = self.file_picker.selected.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                self.file_picker.selected = (self.file_picker.selected + 10)
+                    .min(self.file_picker.matches.len().saturating_sub(1));
+            }
+            KeyCode::Home => self.file_picker.selected = 0,
+            KeyCode::End => {
+                self.file_picker.selected = self.file_picker.matches.len().saturating_sub(1)
+            }
+            KeyCode::Backspace => {
+                self.file_picker.input.pop();
+                self.refresh_file_picker();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.file_picker.input.push(character);
+                self.refresh_file_picker();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_selected_picker_file(&mut self) {
+        let Some(matched) = self
+            .file_picker
+            .matches
+            .get(self.file_picker.selected)
+            .cloned()
+        else {
+            self.message = "No file selected".to_string();
+            return;
+        };
+        let path = self
+            .project
+            .root
+            .join(&self.file_picker.files[matched.file_index]);
+        let before = self.current_location();
+        match self.editor.open_or_switch(&path) {
+            Ok(disposition) => {
+                self.commit_navigation(before);
+                self.explorer_focused = false;
+                self.mode = self.preferred_editor_mode();
+                self.search_origin = self.editor.cursor;
+                self.remember_recent_file();
+                self.message = match disposition {
+                    OpenDisposition::Opened => format!("Opened {}", path.display()),
+                    OpenDisposition::Switched => format!("Switched to {}", path.display()),
+                };
+                self.refresh_git_line_changes();
+            }
+            Err(error) => self.message = format!("Open failed: {error}"),
+        }
+    }
+
+    /// Records the active file at the top of the recently-opened list.
+    fn remember_recent_file(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let canonical = path.canonicalize().unwrap_or(path);
+        if self.settings.recent_files.first() == Some(&canonical) {
+            return;
+        }
+        self.settings
+            .recent_files
+            .retain(|existing| existing != &canonical);
+        self.settings.recent_files.insert(0, canonical);
+        self.settings.recent_files.truncate(30);
+        self.persist_settings();
+    }
+
     /// Opens the project-wide search panel, seeding the query from a short
     /// selection.  Previous results stay visible when reopened.
     fn open_project_search(&mut self) {
@@ -4166,6 +4452,7 @@ impl App {
                 self.explorer_focused = false;
                 self.mode = self.preferred_editor_mode();
                 self.after_tab_switch();
+                self.remember_recent_file();
                 self.message = format!("{}:{}", found.path.display(), found.line + 1);
             }
             Err(error) => self.message = format!("Open failed: {error}"),
@@ -4463,6 +4750,7 @@ impl App {
             "symbolrename",
             "find",
             "replace",
+            "files",
             "projectsearch",
             "grep",
             "trim",
@@ -4597,6 +4885,7 @@ impl App {
                                 self.explorer_focused = false;
                                 self.mode = self.preferred_editor_mode();
                                 self.search_origin = self.editor.cursor;
+                                self.remember_recent_file();
                                 self.message = match disposition {
                                     OpenDisposition::Opened => {
                                         format!("Opened {} in a new tab", path.display())
@@ -4769,6 +5058,7 @@ impl App {
                     self.preview_search();
                 }
             }
+            "files" | "openfile" => self.open_file_picker(),
             "projectsearch" | "grep" | "findall" => {
                 if !argument.is_empty() {
                     self.project_search.query = argument.clone();
@@ -6211,6 +6501,10 @@ impl App {
     }
 
     fn persist_settings(&mut self) {
+        // Tests must never overwrite the user's real configuration file.
+        if cfg!(test) {
+            return;
+        }
         if let Err(error) = config::save(&self.settings) {
             self.message = format!("Could not save settings: {error}");
         }
@@ -6735,6 +7029,59 @@ mod tests {
             .path
             .as_ref()
             .is_some_and(|path| path.ends_with("notes.txt")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fuzzy_file_picker_filters_and_opens_files() {
+        let root = std::env::temp_dir().join(format!("caret-app-picker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("src/helper.rs"), "fn helper() {}").unwrap();
+        std::fs::write(root.join("readme.md"), "docs").unwrap();
+
+        let mut app = App::new(None).expect("create app");
+        app.project.set_root(root.clone()).expect("set root");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::FilePicker);
+        assert_eq!(app.file_picker.files.len(), 3);
+
+        type_text(&mut app, "mainrs");
+        assert_eq!(app.file_picker.matches.len(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_ne!(app.mode, Mode::FilePicker);
+        assert!(app
+            .editor
+            .path
+            .as_ref()
+            .is_some_and(|path| path.ends_with("main.rs")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tree_filter_narrows_the_project_tree_and_opens_a_match() {
+        let root = std::env::temp_dir().join(format!("caret-app-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/target_file.rs"), "code").unwrap();
+        std::fs::write(root.join("other.md"), "text").unwrap();
+
+        let mut app = App::new(None).expect("create app");
+        app.project.set_root(root.clone()).expect("set root");
+        app.explorer_focused = true;
+        app.mode = Mode::Normal;
+
+        app.handle_key(key('/'));
+        type_text(&mut app, "target");
+        assert_eq!(app.project.entries.len(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app
+            .editor
+            .path
+            .as_ref()
+            .is_some_and(|path| path.ends_with("target_file.rs")));
         let _ = std::fs::remove_dir_all(root);
     }
 

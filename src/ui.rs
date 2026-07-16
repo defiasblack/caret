@@ -230,6 +230,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if app.mode == Mode::ProjectSearch {
         draw_project_search(out, app, width, height)?;
     }
+    if app.mode == Mode::FilePicker {
+        draw_file_picker(out, app, width, height)?;
+    }
     if app.mode == Mode::GitDiff {
         draw_git_diff(out, app, width, height)?;
     }
@@ -574,11 +577,17 @@ fn draw_project_tree<W: Write>(
             } else {
                 ""
             };
+            let filter_marker = if app.project.filter.is_empty() {
+                String::new()
+            } else {
+                format!(" · filter: {}", app.project.filter)
+            };
             let root = format!(
-                " PROJECT ▾ {} · {} items{}",
+                " PROJECT ▾ {} · {} items{}{}",
                 app.project.root_name(),
                 app.project.entries.len(),
-                hidden_marker
+                hidden_marker,
+                filter_marker
             );
             queue!(
                 out,
@@ -635,7 +644,12 @@ fn draw_project_tree<W: Write>(
         };
         let indent = "│  ".repeat(entry.depth);
         let branch = "├─";
-        let suffix = if entry.is_dir { "/" } else { "" };
+        let suffix = match (entry.is_dir, entry.is_symlink) {
+            (true, true) => "/@",
+            (true, false) => "/",
+            (false, true) => "@",
+            (false, false) => "",
+        };
         let kind = if entry.is_dir { "DIR" } else { "   " };
         let label = format!(
             " {indent}{branch}{icon} {git} {kind} {}{suffix}",
@@ -1047,7 +1061,7 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         match app.mode {
             Mode::Normal => app.theme.normal_mode,
             Mode::Insert => app.theme.insert_mode,
-            Mode::Search | Mode::ProjectSearch => app.theme.search_mode,
+            Mode::Search | Mode::ProjectSearch | Mode::FilePicker => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
@@ -1255,6 +1269,127 @@ fn draw_git_history<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -
             Print(pad_or_truncate(&label, panel_width))
         )?;
     }
+    Ok(())
+}
+
+fn draw_file_picker<W: Write>(
+    out: &mut W,
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let panel_width = 72usize.min(width.saturating_sub(4) as usize);
+    let panel_height = (height as usize).saturating_sub(6).clamp(6, 24);
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = 2u16;
+    let list_rows = panel_height.saturating_sub(3);
+
+    let state = &mut app.file_picker;
+    state.selected = state.selected.min(state.matches.len().saturating_sub(1));
+    if state.selected < state.scroll {
+        state.scroll = state.selected;
+    } else if list_rows > 0 && state.selected >= state.scroll + list_rows {
+        state.scroll = state.selected + 1 - list_rows;
+    }
+
+    for row in 0..panel_height {
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
+    }
+
+    let state = &app.file_picker;
+    queue!(
+        out,
+        MoveTo(x + 2, y),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print(pad_or_truncate(
+            &format!(" OPEN FILE  {}▏", state.input),
+            panel_width.saturating_sub(4)
+        )),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    for row in 0..list_rows {
+        let index = state.scroll + row;
+        let Some(matched) = state.matches.get(index) else {
+            break;
+        };
+        let selected = index == state.selected;
+        let name = &state.files[matched.file_index];
+        let marker = if matched.recent { "★" } else { " " };
+        let row_y = y + 1 + row as u16;
+        let available = panel_width.saturating_sub(4);
+        let (row_background, row_foreground) = if selected {
+            (app.theme.command_mode, app.theme.background)
+        } else {
+            (app.theme.overlay, app.theme.overlay_text)
+        };
+        queue!(
+            out,
+            MoveTo(x + 2, row_y),
+            SetBackgroundColor(row_background),
+            SetForegroundColor(row_foreground),
+            Print(pad_or_truncate(&format!("{marker} {name}"), available))
+        )?;
+
+        // Emphasize the matched characters when they fit on screen.
+        if !selected {
+            let name_chars: Vec<char> = name.chars().collect();
+            for position in &matched.positions {
+                let offset: usize = 2 + name_chars[..*position]
+                    .iter()
+                    .map(|character| UnicodeWidthChar::width(*character).unwrap_or(0))
+                    .sum::<usize>();
+                let Some(character) = name_chars.get(*position) else {
+                    continue;
+                };
+                let character_width = UnicodeWidthChar::width(*character).unwrap_or(0);
+                if offset + character_width > available {
+                    continue;
+                }
+                queue!(
+                    out,
+                    MoveTo(x + 2 + offset as u16, row_y),
+                    SetForegroundColor(app.theme.search_foreground),
+                    SetBackgroundColor(app.theme.search_background),
+                    Print(character)
+                )?;
+            }
+        }
+    }
+
+    let status = if state.files.is_empty() {
+        "No files found in this project".to_string()
+    } else if state.matches.is_empty() {
+        format!("No files match {}", state.input)
+    } else {
+        format!(
+            "{} of {} file(s){} · ★ recent",
+            state.matches.len(),
+            state.files.len(),
+            if state.truncated {
+                " (list capped)"
+            } else {
+                ""
+            }
+        )
+    };
+    queue!(
+        out,
+        MoveTo(x + 2, y + panel_height as u16 - 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(
+            &format!("{status} · Enter opens · Esc closes"),
+            panel_width.saturating_sub(4)
+        ))
+    )?;
     Ok(())
 }
 
@@ -2150,7 +2285,7 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         match app.mode {
             Mode::Normal => app.theme.normal_mode,
             Mode::Insert => app.theme.insert_mode,
-            Mode::Search | Mode::ProjectSearch => app.theme.search_mode,
+            Mode::Search | Mode::ProjectSearch | Mode::FilePicker => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
@@ -2331,6 +2466,12 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Del", "Exclude"),
             ("Tab", "Replace field"),
             ("Alt-A", "Replace all"),
+            ("Esc", "Close"),
+        ],
+        (Mode::FilePicker, _) => &[
+            ("Type", "Filter"),
+            ("↑↓", "Select"),
+            ("Enter", "Open"),
             ("Esc", "Close"),
         ],
         (Mode::Command, _) => &[
@@ -2620,6 +2761,7 @@ fn place_cursor<W: Write>(
         app.mode,
         Mode::Help
             | Mode::ProjectSearch
+            | Mode::FilePicker
             | Mode::QuitConfirm
             | Mode::ReloadConfirm
             | Mode::GitDiff

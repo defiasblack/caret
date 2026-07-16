@@ -372,3 +372,75 @@ fn absolute_path(path: PathBuf) -> PathBuf {
             .unwrap_or(path)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("caret-tabs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reopening_the_same_file_switches_instead_of_duplicating() {
+        let dir = temp_dir("switch");
+        let file = dir.join("readme.md");
+        std::fs::write(&file, "hello").unwrap();
+
+        let mut tabs = Tabs::new(None).unwrap();
+        assert_eq!(tabs.open_or_switch(&file).unwrap(), OpenDisposition::Opened);
+        assert_eq!(
+            tabs.open_or_switch(&file).unwrap(),
+            OpenDisposition::Switched
+        );
+        assert_eq!(tabs.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// On case-insensitive filesystems (Windows), a differently-cased path
+    /// to the same file must reuse the existing tab.
+    #[cfg(windows)]
+    #[test]
+    fn case_insensitive_filesystems_reuse_the_tab_for_recased_paths() {
+        let dir = temp_dir("case-insensitive");
+        let file = dir.join("CaseFile.txt");
+        std::fs::write(&file, "content").unwrap();
+
+        let mut tabs = Tabs::new(None).unwrap();
+        assert_eq!(tabs.open_or_switch(&file).unwrap(), OpenDisposition::Opened);
+        let recased = dir.join("cASEfILE.TXT");
+        assert_eq!(
+            tabs.open_or_switch(&recased).unwrap(),
+            OpenDisposition::Switched
+        );
+        assert_eq!(tabs.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// On case-sensitive filesystems (Linux), differently-cased names are
+    /// different files and must open in separate tabs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn case_sensitive_filesystems_treat_recased_names_as_distinct() {
+        let dir = temp_dir("case-sensitive");
+        let lower = dir.join("case.txt");
+        let upper = dir.join("CASE.txt");
+        std::fs::write(&lower, "lower").unwrap();
+        std::fs::write(&upper, "upper").unwrap();
+
+        let mut tabs = Tabs::new(None).unwrap();
+        assert_eq!(
+            tabs.open_or_switch(&lower).unwrap(),
+            OpenDisposition::Opened
+        );
+        assert_eq!(
+            tabs.open_or_switch(&upper).unwrap(),
+            OpenDisposition::Opened
+        );
+        assert_eq!(tabs.len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

@@ -4,6 +4,7 @@ mod config;
 mod diagnostics;
 mod document;
 mod editor;
+mod fuzzy;
 mod lsp;
 mod plugin;
 mod project;
