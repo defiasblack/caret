@@ -227,6 +227,15 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if app.mode == Mode::Help {
         draw_help(out, app, width, height)?;
     }
+    if app.mode == Mode::ProjectSearch {
+        draw_project_search(out, app, width, height)?;
+    }
+    if app.mode == Mode::FilePicker {
+        draw_file_picker(out, app, width, height)?;
+    }
+    if app.mode == Mode::KeyBrowser {
+        draw_key_browser(out, app, width, height)?;
+    }
     if app.mode == Mode::GitDiff {
         draw_git_diff(out, app, width, height)?;
     }
@@ -571,11 +580,17 @@ fn draw_project_tree<W: Write>(
             } else {
                 ""
             };
+            let filter_marker = if app.project.filter.is_empty() {
+                String::new()
+            } else {
+                format!(" · filter: {}", app.project.filter)
+            };
             let root = format!(
-                " PROJECT ▾ {} · {} items{}",
+                " PROJECT ▾ {} · {} items{}{}",
                 app.project.root_name(),
                 app.project.entries.len(),
-                hidden_marker
+                hidden_marker,
+                filter_marker
             );
             queue!(
                 out,
@@ -632,7 +647,12 @@ fn draw_project_tree<W: Write>(
         };
         let indent = "│  ".repeat(entry.depth);
         let branch = "├─";
-        let suffix = if entry.is_dir { "/" } else { "" };
+        let suffix = match (entry.is_dir, entry.is_symlink) {
+            (true, true) => "/@",
+            (true, false) => "/",
+            (false, true) => "@",
+            (false, false) => "",
+        };
         let kind = if entry.is_dir { "DIR" } else { "   " };
         let label = format!(
             " {indent}{branch}{icon} {git} {kind} {}{suffix}",
@@ -811,7 +831,6 @@ fn draw_editor<W: Write>(
     gutter_width: usize,
 ) -> io::Result<()> {
     let language = Language::from_path(app.editor.path.as_deref());
-    let search_query = app.active_search_query();
     let fold_ranges = syntax::fold_ranges(&app.editor.text(), language);
 
     for screen_row in 0..rows {
@@ -886,7 +905,7 @@ fn draw_editor<W: Write>(
 
         let line = app.editor.line_text(line_index);
         let colors = syntax::highlight_line(&line, language, &app.theme);
-        let search_hits = search_hit_map(&line, search_query);
+        let search_hits = app.search_line_hits(&line);
         let text_width = editor_width.saturating_sub(gutter_width as u16) as usize;
         let line_start = app.editor.buffer_line_to_char(line_index);
         let selections = app.editor.selection_ranges();
@@ -1045,7 +1064,8 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         match app.mode {
             Mode::Normal => app.theme.normal_mode,
             Mode::Insert => app.theme.insert_mode,
-            Mode::Search => app.theme.search_mode,
+            Mode::Search | Mode::ProjectSearch | Mode::FilePicker => app.theme.search_mode,
+            Mode::KeyBrowser => app.theme.command_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
@@ -1254,6 +1274,406 @@ fn draw_git_history<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -
         )?;
     }
     Ok(())
+}
+
+fn draw_key_browser<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
+    let panel_width = (width as usize).saturating_sub(6).min(96);
+    let panel_height = (height as usize).saturating_sub(4);
+    if panel_width < 30 || panel_height < 6 {
+        return Ok(());
+    }
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = 1u16;
+    let list_rows = panel_height.saturating_sub(3);
+
+    for row in 0..panel_height {
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print(pad_or_truncate(
+            &format!(
+                "KEY BINDINGS · {} profile · search: {}▏",
+                app.keymap_profile().name(),
+                app.key_browser_input
+            ),
+            panel_width.saturating_sub(4)
+        )),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    let rows = app.keybinding_rows();
+    let scroll = app.key_browser_scroll.min(rows.len().saturating_sub(1));
+    let chord_width = 18usize;
+    let description_width = (panel_width.saturating_sub(4 + chord_width + 2)) / 2;
+    for row_index in 0..list_rows {
+        let Some((chord, description, note)) = rows.get(scroll + row_index) else {
+            break;
+        };
+        let row_y = y + 1 + row_index as u16;
+        let text = format!(
+            "{}  {}  {note}",
+            pad_or_truncate(chord, chord_width),
+            pad_or_truncate(description, description_width),
+        );
+        queue!(
+            out,
+            MoveTo(x + 2, row_y),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(if note.contains('⚠') {
+                app.theme.gutter_current
+            } else if note.starts_with("custom") {
+                app.theme.success
+            } else {
+                app.theme.overlay_text
+            }),
+            Print(pad_or_truncate(&text, panel_width.saturating_sub(4)))
+        )?;
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y + panel_height as u16 - 1),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(
+            &format!(
+                "{} binding(s) · :bind <action> <keys> rebinds · :bind <action> default resets · :bindreset resets all · Esc closes",
+                rows.len()
+            ),
+            panel_width.saturating_sub(4)
+        ))
+    )?;
+    Ok(())
+}
+
+fn draw_file_picker<W: Write>(
+    out: &mut W,
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let panel_width = 72usize.min(width.saturating_sub(4) as usize);
+    let panel_height = (height as usize).saturating_sub(6).clamp(6, 24);
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = 2u16;
+    let list_rows = panel_height.saturating_sub(3);
+
+    let state = &mut app.file_picker;
+    state.selected = state.selected.min(state.matches.len().saturating_sub(1));
+    if state.selected < state.scroll {
+        state.scroll = state.selected;
+    } else if list_rows > 0 && state.selected >= state.scroll + list_rows {
+        state.scroll = state.selected + 1 - list_rows;
+    }
+
+    for row in 0..panel_height {
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
+    }
+
+    let state = &app.file_picker;
+    queue!(
+        out,
+        MoveTo(x + 2, y),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print(pad_or_truncate(
+            &format!(" OPEN FILE  {}▏", state.input),
+            panel_width.saturating_sub(4)
+        )),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    for row in 0..list_rows {
+        let index = state.scroll + row;
+        let Some(matched) = state.matches.get(index) else {
+            break;
+        };
+        let selected = index == state.selected;
+        let name = &state.files[matched.file_index];
+        let marker = if matched.recent { "★" } else { " " };
+        let row_y = y + 1 + row as u16;
+        let available = panel_width.saturating_sub(4);
+        let (row_background, row_foreground) = if selected {
+            (app.theme.command_mode, app.theme.background)
+        } else {
+            (app.theme.overlay, app.theme.overlay_text)
+        };
+        queue!(
+            out,
+            MoveTo(x + 2, row_y),
+            SetBackgroundColor(row_background),
+            SetForegroundColor(row_foreground),
+            Print(pad_or_truncate(&format!("{marker} {name}"), available))
+        )?;
+
+        // Emphasize the matched characters when they fit on screen.
+        if !selected {
+            let name_chars: Vec<char> = name.chars().collect();
+            for position in &matched.positions {
+                let offset: usize = 2 + name_chars[..*position]
+                    .iter()
+                    .map(|character| UnicodeWidthChar::width(*character).unwrap_or(0))
+                    .sum::<usize>();
+                let Some(character) = name_chars.get(*position) else {
+                    continue;
+                };
+                let character_width = UnicodeWidthChar::width(*character).unwrap_or(0);
+                if offset + character_width > available {
+                    continue;
+                }
+                queue!(
+                    out,
+                    MoveTo(x + 2 + offset as u16, row_y),
+                    SetForegroundColor(app.theme.search_foreground),
+                    SetBackgroundColor(app.theme.search_background),
+                    Print(character)
+                )?;
+            }
+        }
+    }
+
+    let status = if state.files.is_empty() {
+        "No files found in this project".to_string()
+    } else if state.matches.is_empty() {
+        format!("No files match {}", state.input)
+    } else {
+        format!(
+            "{} of {} file(s){} · ★ recent",
+            state.matches.len(),
+            state.files.len(),
+            if state.truncated {
+                " (list capped)"
+            } else {
+                ""
+            }
+        )
+    };
+    queue!(
+        out,
+        MoveTo(x + 2, y + panel_height as u16 - 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(
+            &format!("{status} · Enter opens · Esc closes"),
+            panel_width.saturating_sub(4)
+        ))
+    )?;
+    Ok(())
+}
+
+/// Rows available for results inside the project-search panel.
+fn project_search_list_rows(height: u16) -> usize {
+    (height as usize).saturating_sub(3 + 5)
+}
+
+fn draw_project_search<W: Write>(
+    out: &mut W,
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let x = 2u16;
+    let panel_width = (width as usize).saturating_sub(4);
+    let y = 1u16;
+    let panel_height = (height as usize).saturating_sub(3);
+    if panel_width < 20 || panel_height < 6 {
+        return Ok(());
+    }
+    let list_rows = project_search_list_rows(height);
+
+    // Keep the selection visible.
+    let state = &mut app.project_search;
+    state.selected = state.selected.min(state.results.len().saturating_sub(1));
+    if state.selected < state.scroll {
+        state.scroll = state.selected;
+    } else if list_rows > 0 && state.selected >= state.scroll + list_rows {
+        state.scroll = state.selected + 1 - list_rows;
+    }
+
+    for row in 0..panel_height {
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print(pad_or_truncate(
+            &format!("PROJECT SEARCH · {}", app.project.root.display()),
+            panel_width.saturating_sub(4)
+        )),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    let mut flags = String::new();
+    if app.search_options.case_sensitive {
+        flags.push_str("  Aa");
+    }
+    if app.search_options.whole_word {
+        flags.push_str("  Word");
+    }
+    if app.search_options.use_regex {
+        flags.push_str("  .*");
+    }
+    let state = &app.project_search;
+    let query_caret = if state.focus_replace { " " } else { "▏" };
+    let replace_caret = if state.focus_replace { "▏" } else { " " };
+    queue!(
+        out,
+        MoveTo(x + 2, y + 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.overlay_text),
+        Print(pad_or_truncate(
+            &fit_bar(
+                &format!(" FIND     {}{query_caret}", state.query),
+                &flags,
+                panel_width.saturating_sub(4)
+            ),
+            panel_width.saturating_sub(4)
+        )),
+        MoveTo(x + 2, y + 2),
+        Print(pad_or_truncate(
+            &format!(" REPLACE  {}{replace_caret}", state.replacement),
+            panel_width.saturating_sub(4)
+        ))
+    )?;
+
+    let status = if let Some(error) = &state.error {
+        error.clone()
+    } else if state.ran_query.is_empty() {
+        "Type a query and press Enter to search the project".to_string()
+    } else {
+        let mut text = format!(
+            "{} match(es) in {} file(s)",
+            state.results.len(),
+            state.files_with_matches
+        );
+        if state.truncated {
+            text.push_str(" · result limit reached (see :set in config)");
+        }
+        if !state.excluded.is_empty() {
+            text.push_str(&format!(" · {} excluded", state.excluded.len()));
+        }
+        text
+    };
+    queue!(
+        out,
+        MoveTo(x + 2, y + 3),
+        SetForegroundColor(if state.error.is_some() {
+            app.theme.error
+        } else {
+            app.theme.muted
+        }),
+        Print(pad_or_truncate(&status, panel_width.saturating_sub(4)))
+    )?;
+
+    for row in 0..list_rows {
+        let index = state.scroll + row;
+        let Some(found) = state.results.get(index) else {
+            break;
+        };
+        let selected = index == state.selected;
+        let excluded = state.excluded.contains(&index);
+        let relative = found
+            .path
+            .strip_prefix(&app.project.root)
+            .unwrap_or(&found.path);
+        let marker = if excluded { "✗" } else { " " };
+        let prefix = format!("{marker} {}:{}: ", relative.display(), found.line + 1);
+
+        let row_y = y + 4 + row as u16;
+        let available = panel_width.saturating_sub(4);
+        let (row_background, row_foreground) = if selected {
+            (app.theme.command_mode, app.theme.background)
+        } else if excluded {
+            (app.theme.overlay, app.theme.muted)
+        } else {
+            (app.theme.overlay, app.theme.overlay_text)
+        };
+        queue!(
+            out,
+            MoveTo(x + 2, row_y),
+            SetBackgroundColor(row_background),
+            SetForegroundColor(row_foreground),
+            Print(pad_or_truncate(
+                &format!("{prefix}{}", found.line_text),
+                available
+            ))
+        )?;
+
+        // Repaint the matched fragment in the search highlight color when it
+        // is inside the visible width.
+        if !selected && !excluded {
+            let before_width = UnicodeWidthStr::width(&found.line_text[..found.byte_start]);
+            let match_text = &found.line_text[found.byte_start..found.byte_end];
+            let match_width = UnicodeWidthStr::width(match_text);
+            let offset = UnicodeWidthStr::width(prefix.as_str()) + before_width;
+            if offset + match_width <= available {
+                queue!(
+                    out,
+                    MoveTo(x + 2 + offset as u16, row_y),
+                    SetBackgroundColor(app.theme.search_background),
+                    SetForegroundColor(app.theme.search_foreground),
+                    Print(match_text)
+                )?;
+            }
+        }
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y + panel_height as u16 - 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(
+            "Enter search/open · ↑↓ select · Del exclude · Tab replace · Alt-C/W/R options · Alt-A replace all · Esc close",
+            panel_width.saturating_sub(4)
+        ))
+    )?;
+    Ok(())
+}
+
+/// Which result row (if any) sits at a screen position, for mouse clicks.
+pub fn project_search_result_at(
+    app: &App,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if app.mode != Mode::ProjectSearch || width < 24 {
+        return None;
+    }
+    let list_rows = project_search_list_rows(height);
+    let first_row = 5u16;
+    if row < first_row || (row - first_row) as usize >= list_rows || column < 2 {
+        return None;
+    }
+    let index = app.project_search.scroll + (row - first_row) as usize;
+    (index < app.project_search.results.len()).then_some(index)
 }
 
 fn draw_theme_gallery<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
@@ -1863,7 +2283,7 @@ pub fn command_suggestion_at(
 fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
     let (prompt, background, foreground) = match app.mode {
         Mode::Search => (
-            format!("/{}", app.search_input),
+            app.search_panel_text(),
             app.theme.prompt_bar,
             app.theme.prompt_text,
         ),
@@ -1949,7 +2369,8 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         match app.mode {
             Mode::Normal => app.theme.normal_mode,
             Mode::Insert => app.theme.insert_mode,
-            Mode::Search => app.theme.search_mode,
+            Mode::Search | Mode::ProjectSearch | Mode::FilePicker => app.theme.search_mode,
+            Mode::KeyBrowser => app.theme.command_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
@@ -2116,9 +2537,33 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
         ],
         (Mode::Search, _) => &[
             ("Enter", "Accept"),
-            ("Esc", "Cancel"),
-            ("Alt-←", "Back"),
-            ("Alt-→", "Forward"),
+            ("Tab", "Replace field"),
+            ("F3", "Next"),
+            ("Alt-Enter", "Replace"),
+            ("Alt-A", "Replace all"),
+            ("Alt-C/W/R", "Case/Word/Regex"),
+            ("↑↓", "History"),
+            ("Esc", "Close"),
+        ],
+        (Mode::ProjectSearch, _) => &[
+            ("Enter", "Search/Open"),
+            ("↑↓", "Select"),
+            ("Del", "Exclude"),
+            ("Tab", "Replace field"),
+            ("Alt-A", "Replace all"),
+            ("Esc", "Close"),
+        ],
+        (Mode::FilePicker, _) => &[
+            ("Type", "Filter"),
+            ("↑↓", "Select"),
+            ("Enter", "Open"),
+            ("Esc", "Close"),
+        ],
+        (Mode::KeyBrowser, _) => &[
+            ("Type", "Search"),
+            ("↑↓", "Scroll"),
+            (":bind", "Rebind"),
+            ("Esc", "Close"),
         ],
         (Mode::Command, _) => &[
             ("Enter", "Run"),
@@ -2406,6 +2851,9 @@ fn place_cursor<W: Write>(
     if matches!(
         app.mode,
         Mode::Help
+            | Mode::ProjectSearch
+            | Mode::FilePicker
+            | Mode::KeyBrowser
             | Mode::QuitConfirm
             | Mode::ReloadConfirm
             | Mode::GitDiff
@@ -2419,19 +2867,17 @@ fn place_cursor<W: Write>(
         return queue!(out, Hide);
     }
 
-    if app.mode == Mode::Command || app.mode == Mode::Search {
-        let prefix_width = 1usize;
-        let input = if app.mode == Mode::Command {
-            &app.command_input
-        } else {
-            &app.search_input
-        };
-        let typed = if app.mode == Mode::Command {
-            &input[..app.command_cursor()]
-        } else {
-            input.as_str()
-        };
-        let x = (prefix_width + UnicodeWidthStr::width(typed))
+    if app.mode == Mode::Command {
+        let typed = &app.command_input[..app.command_cursor()];
+        let x = (1 + UnicodeWidthStr::width(typed)).min(terminal_width.saturating_sub(1) as usize)
+            as u16;
+
+        return queue!(out, MoveTo(x, terminal_height - 2), Show);
+    }
+
+    if app.mode == Mode::Search {
+        let (prefix, typed) = app.search_cursor_offset();
+        let x = (UnicodeWidthStr::width(prefix.as_str()) + UnicodeWidthStr::width(typed.as_str()))
             .min(terminal_width.saturating_sub(1) as usize) as u16;
 
         return queue!(out, MoveTo(x, terminal_height - 2), Show);
@@ -2458,27 +2904,6 @@ fn place_cursor<W: Write>(
 
     let y = content_top + screen_row as u16;
     queue!(out, MoveTo(x as u16, y), Show)
-}
-
-fn search_hit_map(line: &str, query: &str) -> Vec<bool> {
-    let char_count = line.chars().count();
-    let mut hits = vec![false; char_count];
-
-    if query.is_empty() {
-        return hits;
-    }
-
-    for (byte_start, matched) in line.match_indices(query) {
-        let start = line[..byte_start].chars().count();
-        let length = matched.chars().count();
-        let end = (start + length).min(hits.len());
-
-        for hit in &mut hits[start..end] {
-            *hit = true;
-        }
-    }
-
-    hits
 }
 
 fn fit_bar(left: &str, right: &str, width: usize) -> String {

@@ -98,6 +98,7 @@ dependencies = [
  "directories",
  "ignore",
  "portable-pty",
+ "regex",
  "ropey",
  "serde",
  "serde_json",

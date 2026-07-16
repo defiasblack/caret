@@ -5,7 +5,11 @@ use std::{
     process::Command,
 };
 
+use ignore::gitignore::Gitignore;
+
 const MAX_EXPAND_ALL_DIRECTORIES: usize = 5_000;
+const MAX_FILTER_RESULTS: usize = 500;
+const MAX_TREE_DEPTH: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ProjectEntry {
@@ -13,6 +17,7 @@ pub struct ProjectEntry {
     pub name: String,
     pub depth: usize,
     pub is_dir: bool,
+    pub is_symlink: bool,
     pub expanded: bool,
     pub git_status: Option<GitStatus>,
 }
@@ -33,8 +38,11 @@ pub struct ProjectTree {
     pub scroll: usize,
     pub visible: bool,
     pub show_hidden: bool,
+    /// Substring filter over project-relative paths; empty shows the tree.
+    pub filter: String,
     pub width: usize,
     expanded: HashSet<PathBuf>,
+    ignore_rules: Option<Gitignore>,
 }
 
 impl ProjectTree {
@@ -44,12 +52,14 @@ impl ProjectTree {
         expanded.insert(root.clone());
 
         let mut tree = Self {
+            ignore_rules: load_ignore_rules(&root),
             root,
             entries: Vec::new(),
             selected: 0,
             scroll: 0,
             visible: true,
             show_hidden: false,
+            filter: String::new(),
             width: 40,
             expanded,
         };
@@ -71,16 +81,26 @@ impl ProjectTree {
     }
 
     pub fn refresh(&mut self) -> io::Result<()> {
+        self.ignore_rules = load_ignore_rules(&self.root);
         let selected_path = self.selected_entry().map(|entry| entry.path.clone());
         let mut entries = Vec::new();
 
-        collect_entries(
-            &self.root,
-            0,
-            &self.expanded,
-            self.show_hidden,
-            &mut entries,
-        )?;
+        let view = TreeView {
+            show_hidden: self.show_hidden,
+            ignore_rules: self.ignore_rules.as_ref(),
+        };
+        if self.filter.trim().is_empty() {
+            collect_entries(&self.root, 0, &self.expanded, view, &mut entries)?;
+        } else {
+            collect_filtered_entries(
+                &self.root,
+                &self.root,
+                &self.filter.to_lowercase(),
+                view,
+                0,
+                &mut entries,
+            );
+        }
 
         self.entries = entries;
 
@@ -141,6 +161,16 @@ impl ProjectTree {
         self.root = root.clone();
         self.expanded.clear();
         self.expanded.insert(root);
+        self.selected = 0;
+        self.scroll = 0;
+        self.filter.clear();
+        self.refresh()
+    }
+
+    /// Filters the tree to files whose project-relative path contains
+    /// `filter` (case-insensitive).  An empty filter restores the tree.
+    pub fn set_filter(&mut self, filter: String) -> io::Result<()> {
+        self.filter = filter;
         self.selected = 0;
         self.scroll = 0;
         self.refresh()
@@ -213,7 +243,11 @@ impl ProjectTree {
 
         let mut added = usize::from(self.expanded.insert(entry.path.clone()));
 
-        for child in readable_children(&entry.path, self.show_hidden)? {
+        let view = TreeView {
+            show_hidden: self.show_hidden,
+            ignore_rules: self.ignore_rules.as_ref(),
+        };
+        for child in readable_children(&entry.path, view)? {
             if child.is_dir && self.expanded.insert(child.path) {
                 added += 1;
             }
@@ -266,9 +300,13 @@ impl ProjectTree {
 
     pub fn expand_all(&mut self) -> io::Result<usize> {
         let mut directories = Vec::new();
+        let view = TreeView {
+            show_hidden: self.show_hidden,
+            ignore_rules: self.ignore_rules.as_ref(),
+        };
         collect_directory_paths(
             &self.root,
-            self.show_hidden,
+            view,
             &mut directories,
             MAX_EXPAND_ALL_DIRECTORIES,
         )?;
@@ -349,6 +387,38 @@ struct ChildEntry {
     path: PathBuf,
     name: String,
     is_dir: bool,
+    is_symlink: bool,
+}
+
+/// Visibility rules shared by every tree walk.
+#[derive(Clone, Copy)]
+struct TreeView<'rules> {
+    show_hidden: bool,
+    ignore_rules: Option<&'rules Gitignore>,
+}
+
+impl TreeView<'_> {
+    fn shows(&self, path: &Path, name: &str, is_dir: bool) -> bool {
+        if self.show_hidden {
+            return true;
+        }
+        if name.starts_with('.') {
+            return false;
+        }
+        !self
+            .ignore_rules
+            .is_some_and(|rules| rules.matched(path, is_dir).is_ignore())
+    }
+}
+
+fn load_ignore_rules(root: &Path) -> Option<Gitignore> {
+    let file = root.join(".gitignore");
+    if !file.is_file() {
+        return None;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    builder.add(&file);
+    builder.build().ok()
 }
 
 fn normalize_root(root: PathBuf) -> io::Result<PathBuf> {
@@ -375,7 +445,7 @@ fn normalize_root(root: PathBuf) -> io::Result<PathBuf> {
     Ok(fs::canonicalize(&absolute).unwrap_or(absolute))
 }
 
-fn readable_children(directory: &Path, show_hidden: bool) -> io::Result<Vec<ChildEntry>> {
+fn readable_children(directory: &Path, view: TreeView) -> io::Result<Vec<ChildEntry>> {
     let mut children = Vec::new();
 
     for child in fs::read_dir(directory)? {
@@ -384,18 +454,27 @@ fn readable_children(directory: &Path, show_hidden: bool) -> io::Result<Vec<Chil
         };
 
         let name = child.file_name().to_string_lossy().to_string();
-        if !show_hidden && name.starts_with('.') {
-            continue;
-        }
-
         let Ok(file_type) = child.file_type() else {
             continue;
         };
+        let is_symlink = file_type.is_symlink();
+        // A symlink's own file type never says "directory"; follow it once so
+        // linked folders still expand like folders.
+        let is_dir = file_type.is_dir()
+            || (is_symlink
+                && fs::metadata(child.path())
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false));
+
+        if !view.shows(&child.path(), &name, is_dir) {
+            continue;
+        }
 
         children.push(ChildEntry {
             path: child.path(),
             name,
-            is_dir: file_type.is_dir(),
+            is_dir,
+            is_symlink,
         });
     }
 
@@ -414,10 +493,13 @@ fn collect_entries(
     directory: &Path,
     depth: usize,
     expanded: &HashSet<PathBuf>,
-    show_hidden: bool,
+    view: TreeView,
     output: &mut Vec<ProjectEntry>,
 ) -> io::Result<()> {
-    let children = match readable_children(directory, show_hidden) {
+    if depth > MAX_TREE_DEPTH {
+        return Ok(());
+    }
+    let children = match readable_children(directory, view) {
         Ok(children) => children,
         Err(error) if depth > 0 => {
             let _ = error;
@@ -433,21 +515,69 @@ fn collect_entries(
             name: child.name,
             depth,
             is_dir: child.is_dir,
+            is_symlink: child.is_symlink,
             expanded: is_expanded,
             git_status: None,
         });
 
         if is_expanded {
-            collect_entries(&child.path, depth + 1, expanded, show_hidden, output)?;
+            collect_entries(&child.path, depth + 1, expanded, view, output)?;
         }
     }
 
     Ok(())
 }
 
+/// Flat list of files whose project-relative path contains `needle`.
+/// Symlinked folders are not followed, so link cycles cannot loop.
+fn collect_filtered_entries(
+    root: &Path,
+    directory: &Path,
+    needle: &str,
+    view: TreeView,
+    depth: usize,
+    output: &mut Vec<ProjectEntry>,
+) {
+    if depth > MAX_TREE_DEPTH || output.len() >= MAX_FILTER_RESULTS {
+        return;
+    }
+    let Ok(children) = readable_children(directory, view) else {
+        return;
+    };
+
+    for child in children {
+        if output.len() >= MAX_FILTER_RESULTS {
+            return;
+        }
+        if child.is_dir {
+            if !child.is_symlink {
+                collect_filtered_entries(root, &child.path, needle, view, depth + 1, output);
+            }
+            continue;
+        }
+        let relative = child
+            .path
+            .strip_prefix(root)
+            .unwrap_or(&child.path)
+            .display()
+            .to_string();
+        if relative.to_lowercase().contains(needle) {
+            output.push(ProjectEntry {
+                path: child.path.clone(),
+                name: relative,
+                depth: 0,
+                is_dir: false,
+                is_symlink: child.is_symlink,
+                expanded: false,
+                git_status: None,
+            });
+        }
+    }
+}
+
 fn collect_directory_paths(
     directory: &Path,
-    show_hidden: bool,
+    view: TreeView,
     output: &mut Vec<PathBuf>,
     limit: usize,
 ) -> io::Result<()> {
@@ -455,13 +585,15 @@ fn collect_directory_paths(
         return Ok(());
     }
 
-    let children = match readable_children(directory, show_hidden) {
+    let children = match readable_children(directory, view) {
         Ok(children) => children,
         Err(_) => return Ok(()),
     };
 
     for child in children {
-        if !child.is_dir {
+        // Never auto-expand through symlinks; a link cycle would recurse
+        // forever.
+        if !child.is_dir || child.is_symlink {
             continue;
         }
 
@@ -470,11 +602,73 @@ fn collect_directory_paths(
             return Ok(());
         }
 
-        collect_directory_paths(&child.path, show_hidden, output, limit)?;
+        collect_directory_paths(&child.path, view, output, limit)?;
         if output.len() >= limit {
             return Ok(());
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("caret-project-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        root
+    }
+
+    #[test]
+    fn gitignored_files_are_hidden_until_toggled() {
+        let root = temp_root("ignore");
+        fs::write(root.join("src/app.rs"), "code").unwrap();
+        fs::write(root.join("build.log"), "log").unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+
+        let mut tree = ProjectTree::new(root.clone()).unwrap();
+        assert!(!tree.entries.iter().any(|entry| entry.name == "build.log"));
+
+        tree.toggle_hidden().unwrap();
+        assert!(tree.entries.iter().any(|entry| entry.name == "build.log"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn filter_lists_matching_files_with_relative_paths() {
+        let root = temp_root("filter");
+        fs::write(root.join("src/main.rs"), "code").unwrap();
+        fs::write(root.join("src/helper.rs"), "code").unwrap();
+        fs::write(root.join("readme.md"), "text").unwrap();
+
+        let mut tree = ProjectTree::new(root.clone()).unwrap();
+        tree.set_filter("main".to_string()).unwrap();
+        assert_eq!(tree.entries.len(), 1);
+        assert!(tree.entries[0].name.contains("main.rs"));
+
+        tree.set_filter(String::new()).unwrap();
+        assert!(tree.entries.len() > 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directories_are_marked_and_not_auto_expanded() {
+        let root = temp_root("symlink");
+        fs::write(root.join("src/real.rs"), "code").unwrap();
+        // A link cycle back to the root must not hang expand_all.
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+
+        let mut tree = ProjectTree::new(root.clone()).unwrap();
+        assert!(tree
+            .entries
+            .iter()
+            .any(|entry| entry.name == "loop" && entry.is_dir && entry.is_symlink));
+        tree.expand_all().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
 }
