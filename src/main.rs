@@ -7,6 +7,7 @@ mod editor;
 mod lsp;
 mod plugin;
 mod project;
+mod project_search;
 mod recovery;
 mod search;
 mod session;

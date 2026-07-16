@@ -227,6 +227,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if app.mode == Mode::Help {
         draw_help(out, app, width, height)?;
     }
+    if app.mode == Mode::ProjectSearch {
+        draw_project_search(out, app, width, height)?;
+    }
     if app.mode == Mode::GitDiff {
         draw_git_diff(out, app, width, height)?;
     }
@@ -1044,7 +1047,7 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         match app.mode {
             Mode::Normal => app.theme.normal_mode,
             Mode::Insert => app.theme.insert_mode,
-            Mode::Search => app.theme.search_mode,
+            Mode::Search | Mode::ProjectSearch => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
@@ -1253,6 +1256,205 @@ fn draw_git_history<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -
         )?;
     }
     Ok(())
+}
+
+/// Rows available for results inside the project-search panel.
+fn project_search_list_rows(height: u16) -> usize {
+    (height as usize).saturating_sub(3 + 5)
+}
+
+fn draw_project_search<W: Write>(
+    out: &mut W,
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let x = 2u16;
+    let panel_width = (width as usize).saturating_sub(4);
+    let y = 1u16;
+    let panel_height = (height as usize).saturating_sub(3);
+    if panel_width < 20 || panel_height < 6 {
+        return Ok(());
+    }
+    let list_rows = project_search_list_rows(height);
+
+    // Keep the selection visible.
+    let state = &mut app.project_search;
+    state.selected = state.selected.min(state.results.len().saturating_sub(1));
+    if state.selected < state.scroll {
+        state.scroll = state.selected;
+    } else if list_rows > 0 && state.selected >= state.scroll + list_rows {
+        state.scroll = state.selected + 1 - list_rows;
+    }
+
+    for row in 0..panel_height {
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print(pad_or_truncate(
+            &format!("PROJECT SEARCH · {}", app.project.root.display()),
+            panel_width.saturating_sub(4)
+        )),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    let mut flags = String::new();
+    if app.search_options.case_sensitive {
+        flags.push_str("  Aa");
+    }
+    if app.search_options.whole_word {
+        flags.push_str("  Word");
+    }
+    if app.search_options.use_regex {
+        flags.push_str("  .*");
+    }
+    let state = &app.project_search;
+    let query_caret = if state.focus_replace { " " } else { "▏" };
+    let replace_caret = if state.focus_replace { "▏" } else { " " };
+    queue!(
+        out,
+        MoveTo(x + 2, y + 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.overlay_text),
+        Print(pad_or_truncate(
+            &fit_bar(
+                &format!(" FIND     {}{query_caret}", state.query),
+                &flags,
+                panel_width.saturating_sub(4)
+            ),
+            panel_width.saturating_sub(4)
+        )),
+        MoveTo(x + 2, y + 2),
+        Print(pad_or_truncate(
+            &format!(" REPLACE  {}{replace_caret}", state.replacement),
+            panel_width.saturating_sub(4)
+        ))
+    )?;
+
+    let status = if let Some(error) = &state.error {
+        error.clone()
+    } else if state.ran_query.is_empty() {
+        "Type a query and press Enter to search the project".to_string()
+    } else {
+        let mut text = format!(
+            "{} match(es) in {} file(s)",
+            state.results.len(),
+            state.files_with_matches
+        );
+        if state.truncated {
+            text.push_str(" · result limit reached (see :set in config)");
+        }
+        if !state.excluded.is_empty() {
+            text.push_str(&format!(" · {} excluded", state.excluded.len()));
+        }
+        text
+    };
+    queue!(
+        out,
+        MoveTo(x + 2, y + 3),
+        SetForegroundColor(if state.error.is_some() {
+            app.theme.error
+        } else {
+            app.theme.muted
+        }),
+        Print(pad_or_truncate(&status, panel_width.saturating_sub(4)))
+    )?;
+
+    for row in 0..list_rows {
+        let index = state.scroll + row;
+        let Some(found) = state.results.get(index) else {
+            break;
+        };
+        let selected = index == state.selected;
+        let excluded = state.excluded.contains(&index);
+        let relative = found
+            .path
+            .strip_prefix(&app.project.root)
+            .unwrap_or(&found.path);
+        let marker = if excluded { "✗" } else { " " };
+        let prefix = format!("{marker} {}:{}: ", relative.display(), found.line + 1);
+
+        let row_y = y + 4 + row as u16;
+        let available = panel_width.saturating_sub(4);
+        let (row_background, row_foreground) = if selected {
+            (app.theme.command_mode, app.theme.background)
+        } else if excluded {
+            (app.theme.overlay, app.theme.muted)
+        } else {
+            (app.theme.overlay, app.theme.overlay_text)
+        };
+        queue!(
+            out,
+            MoveTo(x + 2, row_y),
+            SetBackgroundColor(row_background),
+            SetForegroundColor(row_foreground),
+            Print(pad_or_truncate(
+                &format!("{prefix}{}", found.line_text),
+                available
+            ))
+        )?;
+
+        // Repaint the matched fragment in the search highlight color when it
+        // is inside the visible width.
+        if !selected && !excluded {
+            let before_width = UnicodeWidthStr::width(&found.line_text[..found.byte_start]);
+            let match_text = &found.line_text[found.byte_start..found.byte_end];
+            let match_width = UnicodeWidthStr::width(match_text);
+            let offset = UnicodeWidthStr::width(prefix.as_str()) + before_width;
+            if offset + match_width <= available {
+                queue!(
+                    out,
+                    MoveTo(x + 2 + offset as u16, row_y),
+                    SetBackgroundColor(app.theme.search_background),
+                    SetForegroundColor(app.theme.search_foreground),
+                    Print(match_text)
+                )?;
+            }
+        }
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y + panel_height as u16 - 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(
+            "Enter search/open · ↑↓ select · Del exclude · Tab replace · Alt-C/W/R options · Alt-A replace all · Esc close",
+            panel_width.saturating_sub(4)
+        ))
+    )?;
+    Ok(())
+}
+
+/// Which result row (if any) sits at a screen position, for mouse clicks.
+pub fn project_search_result_at(
+    app: &App,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if app.mode != Mode::ProjectSearch || width < 24 {
+        return None;
+    }
+    let list_rows = project_search_list_rows(height);
+    let first_row = 5u16;
+    if row < first_row || (row - first_row) as usize >= list_rows || column < 2 {
+        return None;
+    }
+    let index = app.project_search.scroll + (row - first_row) as usize;
+    (index < app.project_search.results.len()).then_some(index)
 }
 
 fn draw_theme_gallery<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
@@ -1948,7 +2150,7 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         match app.mode {
             Mode::Normal => app.theme.normal_mode,
             Mode::Insert => app.theme.insert_mode,
-            Mode::Search => app.theme.search_mode,
+            Mode::Search | Mode::ProjectSearch => app.theme.search_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
@@ -2121,6 +2323,14 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("Alt-A", "Replace all"),
             ("Alt-C/W/R", "Case/Word/Regex"),
             ("↑↓", "History"),
+            ("Esc", "Close"),
+        ],
+        (Mode::ProjectSearch, _) => &[
+            ("Enter", "Search/Open"),
+            ("↑↓", "Select"),
+            ("Del", "Exclude"),
+            ("Tab", "Replace field"),
+            ("Alt-A", "Replace all"),
             ("Esc", "Close"),
         ],
         (Mode::Command, _) => &[
@@ -2409,6 +2619,7 @@ fn place_cursor<W: Write>(
     if matches!(
         app.mode,
         Mode::Help
+            | Mode::ProjectSearch
             | Mode::QuitConfirm
             | Mode::ReloadConfirm
             | Mode::GitDiff

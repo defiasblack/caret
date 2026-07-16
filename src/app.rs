@@ -34,6 +34,7 @@ pub enum Mode {
     Normal,
     Insert,
     Search,
+    ProjectSearch,
     Command,
     Help,
     QuitConfirm,
@@ -73,6 +74,7 @@ impl Mode {
             Self::Normal => "NORMAL",
             Self::Insert => "INSERT",
             Self::Search => "SEARCH",
+            Self::ProjectSearch => "PROJECT FIND",
             Self::Command => "COMMAND",
             Self::Help => "HELP",
             Self::QuitConfirm => "QUIT?",
@@ -229,6 +231,26 @@ pub struct ContextMenu {
     pub actions: Vec<ContextAction>,
 }
 
+/// State for the project-wide search and replace panel.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectSearchState {
+    pub query: String,
+    pub replacement: String,
+    pub focus_replace: bool,
+    pub results: Vec<crate::project_search::ProjectMatch>,
+    /// Indices into `results` the user excluded from replacement.
+    pub excluded: std::collections::HashSet<usize>,
+    pub selected: usize,
+    pub scroll: usize,
+    pub truncated: bool,
+    pub files_with_matches: usize,
+    pub error: Option<String>,
+    /// The query text of the most recent completed search run.
+    pub ran_query: String,
+    /// Set after the first Alt-A; the second Alt-A applies the replacement.
+    pub confirm_replace: bool,
+}
+
 pub struct App {
     pub editor: Tabs,
     pub project: ProjectTree,
@@ -256,6 +278,7 @@ pub struct App {
     active_search: Option<CompiledSearch>,
     search_history: Vec<String>,
     search_history_index: Option<usize>,
+    pub project_search: ProjectSearchState,
     pub message: String,
     pub theme_kind: ThemeKind,
     pub theme: Theme,
@@ -466,6 +489,7 @@ impl App {
             active_search: None,
             search_history: Vec::new(),
             search_history_index: None,
+            project_search: ProjectSearchState::default(),
             message: config_message.unwrap_or_else(|| {
                 if show_dashboard {
                     return "Welcome to Caret · choose a recent project or open the current folder"
@@ -929,6 +953,22 @@ impl App {
                 {
                     self.keymap_gallery_selected = index;
                     self.apply_selected_keymap();
+                }
+                return;
+            }
+            if self.mode == Mode::ProjectSearch {
+                if let Some(index) = crate::ui::project_search_result_at(
+                    self,
+                    width,
+                    height,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    if self.project_search.selected == index {
+                        self.open_selected_project_match();
+                    } else {
+                        self.project_search.selected = index;
+                    }
                 }
                 return;
             }
@@ -1924,6 +1964,10 @@ impl App {
             }
             return;
         }
+        if self.mode == Mode::ProjectSearch {
+            self.handle_project_search(key);
+            return;
+        }
         if self.mode == Mode::ContextMenu {
             match key.code {
                 KeyCode::Esc => self.close_context_menu(),
@@ -2006,6 +2050,7 @@ impl App {
             },
             Mode::QuitConfirm
             | Mode::ReloadConfirm
+            | Mode::ProjectSearch
             | Mode::GitDiff
             | Mode::GitHistory
             | Mode::ThemeGallery
@@ -2176,6 +2221,10 @@ impl App {
                     } else {
                         "Select or place the cursor on a word first".to_string()
                     };
+                    return true;
+                }
+                KeyCode::Char('f' | 'F') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.open_project_search();
                     return true;
                 }
                 KeyCode::Char('f') => {
@@ -3952,6 +4001,270 @@ impl App {
         }
     }
 
+    /// Opens the project-wide search panel, seeding the query from a short
+    /// selection.  Previous results stay visible when reopened.
+    fn open_project_search(&mut self) {
+        if let Some(text) = self.editor.selected_text() {
+            if !text.is_empty() && !text.contains('\n') {
+                self.project_search.query = text;
+                self.project_search.results.clear();
+                self.project_search.ran_query.clear();
+            }
+        }
+        self.project_search.focus_replace = false;
+        self.project_search.confirm_replace = false;
+        self.mode = Mode::ProjectSearch;
+        self.message =
+            "Project search · Enter searches, then opens · Tab replace field · Alt-A replace all"
+                .to_string();
+        if !self.project_search.query.is_empty() && self.project_search.results.is_empty() {
+            self.run_project_search();
+        }
+    }
+
+    fn handle_project_search(&mut self, key: KeyEvent) {
+        let is_replace_key = key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char('a' | 'A'));
+        if !is_replace_key {
+            self.project_search.confirm_replace = false;
+        }
+
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('c' | 'C') => {
+                    self.search_options.case_sensitive = !self.search_options.case_sensitive;
+                    self.run_project_search();
+                }
+                KeyCode::Char('w' | 'W') => {
+                    self.search_options.whole_word = !self.search_options.whole_word;
+                    self.run_project_search();
+                }
+                KeyCode::Char('r' | 'R') => {
+                    self.search_options.use_regex = !self.search_options.use_regex;
+                    self.run_project_search();
+                }
+                KeyCode::Char('a' | 'A') => self.project_replace_all(),
+                KeyCode::Enter => self.open_selected_project_match(),
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = self.preferred_editor_mode();
+                self.message = "Project search closed".to_string();
+            }
+            KeyCode::Enter => {
+                if self.project_search.query != self.project_search.ran_query
+                    || self.project_search.results.is_empty()
+                {
+                    self.run_project_search();
+                } else {
+                    self.open_selected_project_match();
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.project_search.focus_replace = !self.project_search.focus_replace;
+            }
+            KeyCode::Up => {
+                self.project_search.selected = self.project_search.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.project_search.selected = (self.project_search.selected + 1)
+                    .min(self.project_search.results.len().saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                self.project_search.selected = self.project_search.selected.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                self.project_search.selected = (self.project_search.selected + 10)
+                    .min(self.project_search.results.len().saturating_sub(1));
+            }
+            KeyCode::Home => self.project_search.selected = 0,
+            KeyCode::End => {
+                self.project_search.selected = self.project_search.results.len().saturating_sub(1)
+            }
+            KeyCode::Delete => {
+                let selected = self.project_search.selected;
+                if selected < self.project_search.results.len()
+                    && !self.project_search.excluded.remove(&selected)
+                {
+                    self.project_search.excluded.insert(selected);
+                }
+            }
+            KeyCode::Backspace => {
+                if self.project_search.focus_replace {
+                    self.project_search.replacement.pop();
+                } else {
+                    self.project_search.query.pop();
+                }
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if self.project_search.focus_replace {
+                    self.project_search.replacement.push(character);
+                } else {
+                    self.project_search.query.push(character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn run_project_search(&mut self) {
+        self.project_search.results.clear();
+        self.project_search.excluded.clear();
+        self.project_search.selected = 0;
+        self.project_search.scroll = 0;
+        self.project_search.truncated = false;
+        self.project_search.files_with_matches = 0;
+        self.project_search.error = None;
+        self.project_search.confirm_replace = false;
+        self.project_search.ran_query = self.project_search.query.clone();
+        if self.project_search.query.is_empty() {
+            return;
+        }
+        let search = match CompiledSearch::compile(&self.project_search.query, self.search_options)
+        {
+            Ok(search) => search,
+            Err(error) => {
+                self.project_search.error = Some(error);
+                return;
+            }
+        };
+        let limit = self.settings.max_search_results.max(50);
+        let results = crate::project_search::search(&self.project.root, &search, limit);
+        self.project_search.results = results.matches;
+        self.project_search.truncated = results.truncated;
+        self.project_search.files_with_matches = results.files_with_matches;
+    }
+
+    fn open_selected_project_match(&mut self) {
+        let Some(found) = self
+            .project_search
+            .results
+            .get(self.project_search.selected)
+            .cloned()
+        else {
+            self.message = "No search result selected".to_string();
+            return;
+        };
+        let before = self.current_location();
+        match self.editor.open_or_switch(&found.path) {
+            Ok(_) => {
+                self.commit_navigation(before);
+                self.editor.goto_line(found.line);
+                let column = found.line_text[..found.byte_start.min(found.line_text.len())]
+                    .chars()
+                    .count();
+                self.editor.cursor.column =
+                    column.min(self.editor.line_len_chars(self.editor.cursor.line));
+                self.explorer_focused = false;
+                self.mode = self.preferred_editor_mode();
+                self.after_tab_switch();
+                self.message = format!("{}:{}", found.path.display(), found.line + 1);
+            }
+            Err(error) => self.message = format!("Open failed: {error}"),
+        }
+    }
+
+    fn project_replace_all(&mut self) {
+        if self.project_search.query != self.project_search.ran_query {
+            self.message = "Press Enter to search first, then replace".to_string();
+            return;
+        }
+        let included: Vec<usize> = (0..self.project_search.results.len())
+            .filter(|index| !self.project_search.excluded.contains(index))
+            .collect();
+        if included.is_empty() {
+            self.message = "No matches to replace".to_string();
+            return;
+        }
+        let files: std::collections::BTreeSet<PathBuf> = included
+            .iter()
+            .map(|index| self.project_search.results[*index].path.clone())
+            .collect();
+
+        if !self.project_search.confirm_replace {
+            self.project_search.confirm_replace = true;
+            self.message = format!(
+                "Replace {} match(es) in {} file(s) on disk? Alt-A again confirms",
+                included.len(),
+                files.len()
+            );
+            return;
+        }
+        self.project_search.confirm_replace = false;
+
+        let search = match CompiledSearch::compile(&self.project_search.query, self.search_options)
+        {
+            Ok(search) => search,
+            Err(error) => {
+                self.message = error;
+                return;
+            }
+        };
+        let replacement = self.project_search.replacement.clone();
+
+        let mut replaced = 0usize;
+        let mut changed_files = 0usize;
+        let mut skipped_dirty = 0usize;
+        let mut errors = 0usize;
+        for path in files {
+            if self
+                .editor
+                .editor_for_path_mut(&path)
+                .is_some_and(|editor| editor.dirty)
+            {
+                skipped_dirty += 1;
+                continue;
+            }
+            let excluded: std::collections::HashSet<(usize, usize)> = self
+                .project_search
+                .excluded
+                .iter()
+                .filter_map(|index| self.project_search.results.get(*index))
+                .filter(|found| found.path == path)
+                .map(|found| (found.line, found.byte_start))
+                .collect();
+            match crate::project_search::replace_in_file(&path, &search, &replacement, &excluded) {
+                Ok(count) if count > 0 => {
+                    replaced += count;
+                    changed_files += 1;
+                    // Refresh a clean open tab so the buffer matches disk.
+                    if let Some(editor) = self.editor.editor_for_path_mut(&path) {
+                        let cursor = editor.cursor;
+                        if editor.reload_from_disk().is_ok() {
+                            editor.goto_line(cursor.line);
+                            editor.cursor.column =
+                                cursor.column.min(editor.line_len_chars(cursor.line));
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => errors += 1,
+            }
+        }
+
+        self.refresh_git_line_changes();
+        self.project.refresh_git_status();
+        let mut summary = format!("Replaced {replaced} match(es) in {changed_files} file(s)");
+        if skipped_dirty > 0 {
+            summary.push_str(&format!(
+                " · skipped {skipped_dirty} file(s) with unsaved changes"
+            ));
+        }
+        if errors > 0 {
+            summary.push_str(&format!(" · {errors} file(s) failed"));
+        }
+        self.message = summary;
+        self.run_project_search();
+    }
+
     fn handle_command_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -4150,6 +4463,8 @@ impl App {
             "symbolrename",
             "find",
             "replace",
+            "projectsearch",
+            "grep",
             "trim",
             "splitline",
             "selectoccurrences",
@@ -4453,6 +4768,14 @@ impl App {
                     self.recompile_search();
                     self.preview_search();
                 }
+            }
+            "projectsearch" | "grep" | "findall" => {
+                if !argument.is_empty() {
+                    self.project_search.query = argument.clone();
+                    self.project_search.results.clear();
+                    self.project_search.ran_query.clear();
+                }
+                self.open_project_search();
             }
             "trim" | "trimwhitespace" => {
                 self.editor.checkpoint();
@@ -6345,6 +6668,74 @@ mod tests {
         assert_eq!(app.search_input, "alpha");
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.search_input, "beta");
+    }
+
+    #[test]
+    fn project_search_finds_excludes_and_replaces_across_files() {
+        let root = std::env::temp_dir().join(format!("caret-app-psearch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "alpha();\nalpha();\n").unwrap();
+        std::fs::write(root.join("b.txt"), "alpha note\n").unwrap();
+
+        let mut app = App::new(None).expect("create app");
+        app.project.set_root(root.clone()).expect("set root");
+        app.open_project_search();
+        assert_eq!(app.mode, Mode::ProjectSearch);
+
+        type_text(&mut app, "alpha");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.project_search.results.len(), 3);
+        assert_eq!(app.project_search.files_with_matches, 2);
+
+        // Exclude the first match in src/a.rs (results are path-sorted:
+        // b.txt first, then src/a.rs line 1 and line 2).
+        app.project_search.selected = 1;
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_text(&mut app, "omega");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert!(app.message.contains("Alt-A again"), "{}", app.message);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert!(app.message.contains("Replaced 2"), "{}", app.message);
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "alpha();\nomega();\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "omega note\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_search_enter_opens_the_selected_match() {
+        let root = std::env::temp_dir().join(format!("caret-app-popen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.txt"), "first\ntarget here\n").unwrap();
+
+        let mut app = App::new(None).expect("create app");
+        app.project.set_root(root.clone()).expect("set root");
+        app.open_project_search();
+        type_text(&mut app, "target");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.project_search.results.len(), 1);
+
+        // Second Enter (query unchanged) opens the selected result.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_ne!(app.mode, Mode::ProjectSearch);
+        assert_eq!(app.editor.cursor.line, 1);
+        assert!(app
+            .editor
+            .path
+            .as_ref()
+            .is_some_and(|path| path.ends_with("notes.txt")));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
