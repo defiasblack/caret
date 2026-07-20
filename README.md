@@ -59,6 +59,8 @@ Caret enables terminal mouse capture automatically.
 - Click a tab in the tab bar to switch to it.
 - Click `F1 Help` in the upper-right corner to open the help panel.
 - Use the mouse wheel over the file tree or editor to scroll that pane.
+- Use the mouse wheel over the theme gallery to move through themes; moving the
+  pointer immediately after a wheel tick does not override the selection.
 
 Mouse support depends on the terminal forwarding mouse events. Windows Terminal,
 GNOME Terminal, Konsole, and most modern terminal emulators support this.
@@ -233,11 +235,27 @@ Open the welcome dashboard at any time with `:welcome`.
 | `:set treewidth=40` | Change sidebar width |
 | `:set number` / `:set nonumber` | Toggle line numbers |
 | `:set tabstop=4` | Change tab width |
+| `:set hidden` / `:set nohidden` | Show or hide dotfiles |
+| `:set maxsearchresults=500` | Set the project-search result cap |
 | `:set startup=folder` | Set the launch view: `session`, `folder`, `empty`, or `dashboard` |
 | `:welcome` | Open the recent-project dashboard |
+| `:settings` | Search settings with current values, defaults, validation, and launch scope |
 | `:theme <name>` / `:themes` | Change theme; built-ins include `system`, `aura`, `ayu`, `carbonfox`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin`, `cobalt2`, `cursor`, `dracula`, `everforest`, `flexoki`, `github`, `gruvbox`, `kanagawa`, `lucent-orng`, `material`, `matrix`, `mercury`, `monokai`, `nightowl`, `nord`, `one-dark`, `opencode`, `orng`, `osaka-jade`, `palenight`, `solarized`, `synthwave84`, `tokyonight`, `vercel`, `vesper`, `zenburn`, plus `oxide` and `mono` |
 | `:doctor` / `:copydiagnostics` | View or copy the support diagnostic report |
 | `:recover N` / `:recovercompare N` / `:discardrecovery` | Restore, compare, or discard crash-recovery snapshots |
+
+## Search and settings
+
+- `Ctrl-F` opens find and `Ctrl-H` opens find-and-replace. Search supports case,
+  whole-word, regex, selection scope, history, replace-one, and replace-all.
+- `Ctrl-Shift-F` or `:grep` searches the project with a reviewable replacement
+  preview. Individual matches can be excluded before applying changes.
+- `Ctrl-P` or `:files` opens the fuzzy file picker, including recently opened
+  files and matched-character highlighting.
+- `:settings` opens a searchable catalog of every saved setting. Each row shows
+  its current value, default, description, validation rules, and whether it
+  applies immediately or on the next launch. Use `:set`, `:theme`, or `:bind`
+  to change values.
 
 ## Coding intelligence
 
@@ -292,3 +310,5 @@ themes, and save hooks. See [Caret plugins](docs/PLUGINS.md) and the
 
 The release smoke checklist for atomic saves, recovery, external changes, and
 session restoration is in [Milestone 0.6 smoke tests](docs/SMOKE_TEST_0.6.md).
+The everyday-editing release checklist is in
+[Milestone 0.7 smoke tests](docs/SMOKE_TEST_0.7.md).

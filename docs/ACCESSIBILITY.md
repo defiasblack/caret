@@ -7,7 +7,7 @@ and the compatibility checks required for releases.
 ## Accessibility baseline
 
 - Every mouse action has a keyboard equivalent. Context menus, theme and keymap
-  galleries, the dashboard, file tree, tabs, dialogs, and command palette can
+  galleries, the settings browser, dashboard, file tree, tabs, dialogs, and command palette can
   all be operated without a mouse.
 - Focus and selection use text markers, bold text, and color. Meaning is never
   conveyed by color alone: Git changes use `+`, `~`, and `-`; notifications use
@@ -37,7 +37,8 @@ For each release, verify the following without using a mouse:
    open Help, and return to the dashboard.
 2. Move between the file tree and editor with `Ctrl-E`; open and close tabs.
 3. Open the command palette with `Ctrl-Shift-P`, filter it, and run a command.
-4. Open `:themes` and `:keymaps`; select and cancel with arrows, Enter, and Esc.
+4. Open `:themes`, `:keymaps`, and `:settings`; select and cancel with arrows,
+   Enter, and Esc. Type in the settings browser to filter its catalog.
 5. Open context menus with a mouse once, then operate them entirely with arrows,
    Enter, and Esc. (Terminals do not provide a portable keyboard context-menu
    event, so the same actions also remain available through shortcuts/commands.)

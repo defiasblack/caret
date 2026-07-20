@@ -29,9 +29,9 @@
 - [x] File tree: filtering (`/` or `f`), root `.gitignore` support, symlink markers with cycle-safe expansion, delete confirmation showing the full path
 - [x] User-editable key bindings (`:bind`, `:unbind`, `:bindreset`, `[custom_keys]` in config) with conflict detection, terminal-interception warnings, macOS modifier-symbol display, and a searchable `:keybindings` browser including per-profile fixed keys
 - [x] Case-sensitivity filesystem tests: recased paths reuse the tab on Windows and open as distinct files on Linux
-- [ ] Searchable settings interface: browse/search all settings with descriptions, defaults, validation, and restart-required indicators (today `:set` covers a subset with basic validation)
-- [ ] Refresh the in-app help pages (F1) and README/docs for the new 0.7 features
-- [ ] Run the milestone 0.7 exit-criteria smoke test on Windows, macOS, and Linux
+- [x] Searchable settings interface: browse/search all settings with descriptions, defaults, validation, and restart-required indicators; `:settings` catalogs all saved settings and `:set` applies validated values
+- [x] Refresh the in-app help pages (F1) and README/docs for the new 0.7 features
+- [ ] Run the milestone 0.7 exit-criteria smoke test on Windows, macOS, and Linux (`docs/SMOKE_TEST_0.7.md` added; Windows automated/CLI checks pass, while interactive macOS/Linux runs remain)
 
 ## Known bugs
 

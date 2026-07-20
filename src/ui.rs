@@ -236,6 +236,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if app.mode == Mode::KeyBrowser {
         draw_key_browser(out, app, width, height)?;
     }
+    if app.mode == Mode::SettingsBrowser {
+        draw_settings_browser(out, app, width, height)?;
+    }
     if app.mode == Mode::GitDiff {
         draw_git_diff(out, app, width, height)?;
     }
@@ -1068,7 +1071,7 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Normal => app.theme.normal_mode,
             Mode::Insert => app.theme.insert_mode,
             Mode::Search | Mode::ProjectSearch | Mode::FilePicker => app.theme.search_mode,
-            Mode::KeyBrowser => app.theme.command_mode,
+            Mode::KeyBrowser | Mode::SettingsBrowser => app.theme.command_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::TabCloseConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
@@ -1354,6 +1357,144 @@ fn draw_key_browser<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -
                 rows.len()
             ),
             panel_width.saturating_sub(4)
+        ))
+    )?;
+    Ok(())
+}
+
+fn draw_settings_browser<W: Write>(
+    out: &mut W,
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let panel_width = (width as usize).saturating_sub(6).min(112);
+    let panel_height = (height as usize).saturating_sub(4);
+    if panel_width < 48 || panel_height < 8 {
+        return Ok(());
+    }
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = 1u16;
+    let visible_rows = panel_height.saturating_sub(3) / 2;
+    let rows = app.setting_rows();
+    app.settings_browser_selected = app
+        .settings_browser_selected
+        .min(rows.len().saturating_sub(1));
+    if app.settings_browser_selected < app.settings_browser_scroll {
+        app.settings_browser_scroll = app.settings_browser_selected;
+    } else if visible_rows > 0
+        && app.settings_browser_selected >= app.settings_browser_scroll + visible_rows
+    {
+        app.settings_browser_scroll = app.settings_browser_selected + 1 - visible_rows;
+    }
+
+    for row in 0..panel_height {
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print(pad_or_truncate(
+            &format!("SETTINGS · search: {}▏", app.settings_browser_input),
+            panel_width.saturating_sub(4),
+        )),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    if rows.is_empty() {
+        queue!(
+            out,
+            MoveTo(x + 2, y + 2),
+            SetForegroundColor(app.theme.muted),
+            Print(pad_or_truncate(
+                &format!(
+                    "No settings match {}",
+                    if app.settings_browser_input.is_empty() {
+                        "the current search"
+                    } else {
+                        &app.settings_browser_input
+                    }
+                ),
+                panel_width.saturating_sub(4),
+            ))
+        )?;
+    } else {
+        for row_index in 0..visible_rows {
+            let Some(index) = app
+                .settings_browser_scroll
+                .checked_add(row_index)
+                .filter(|index| *index < rows.len())
+            else {
+                break;
+            };
+            let setting = &rows[index];
+            let selected = index == app.settings_browser_selected;
+            let background = if selected {
+                app.theme.command_mode
+            } else {
+                app.theme.overlay
+            };
+            let foreground = if selected {
+                app.theme.background
+            } else {
+                app.theme.overlay_text
+            };
+            let restart = if setting.restart_required {
+                "↻ next launch"
+            } else {
+                "live"
+            };
+            let headline = format!(
+                "{:<20}  {:<18}  default {:<10}  {}",
+                setting.name, setting.current, setting.default, restart
+            );
+            let headline_row = y + 1 + (row_index * 2) as u16;
+            queue!(
+                out,
+                MoveTo(x + 2, headline_row),
+                SetBackgroundColor(background),
+                SetForegroundColor(foreground),
+                SetAttribute(if selected {
+                    Attribute::Bold
+                } else {
+                    Attribute::Reset
+                }),
+                Print(pad_or_truncate(&headline, panel_width.saturating_sub(4))),
+                SetAttribute(Attribute::Reset),
+                MoveTo(x + 4, headline_row + 1),
+                SetBackgroundColor(app.theme.overlay),
+                SetForegroundColor(if selected {
+                    app.theme.heading
+                } else {
+                    app.theme.muted
+                }),
+                Print(pad_or_truncate(
+                    &format!("{} · valid: {}", setting.description, setting.validation),
+                    panel_width.saturating_sub(8),
+                ))
+            )?;
+        }
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y + panel_height as u16 - 1),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(
+            &format!(
+                "{} setting(s) · :set changes values · Enter inspects · Esc closes",
+                rows.len()
+            ),
+            panel_width.saturating_sub(4),
         ))
     )?;
     Ok(())
@@ -2474,7 +2615,7 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Normal => app.theme.normal_mode,
             Mode::Insert => app.theme.insert_mode,
             Mode::Search | Mode::ProjectSearch | Mode::FilePicker => app.theme.search_mode,
-            Mode::KeyBrowser => app.theme.command_mode,
+            Mode::KeyBrowser | Mode::SettingsBrowser => app.theme.command_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
             Mode::QuitConfirm | Mode::TabCloseConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
@@ -2669,6 +2810,12 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             (":bind", "Rebind"),
             ("Esc", "Close"),
         ],
+        (Mode::SettingsBrowser, _) => &[
+            ("Type", "Search"),
+            ("↑↓", "Scroll"),
+            ("Enter", "Inspect"),
+            ("Esc", "Close"),
+        ],
         (Mode::Command, _) => &[
             ("Enter", "Run"),
             ("Esc", "Cancel"),
@@ -2782,36 +2929,54 @@ fn draw_help<W: Write>(
         (".", "Show or hide hidden files"),
         ("r", "Refresh the explorer"),
     ];
-    const COMMANDS: [(&str, &str); 12] = [
+    const COMMANDS: [(&str, &str); 13] = [
         (":  (from Normal mode)", "Open the command prompt"),
         (":w  /  :w file", "Save / Save as"),
         (":q  /  :q!", "Quit / Force quit"),
         (":e path", "Open a file or folder"),
         (":terminal / Ctrl-`", "Open or focus the integrated shell"),
+        (
+            "Ctrl-F / Ctrl-H",
+            "Find or replace with options and history",
+        ),
+        (
+            "Ctrl-Shift-F / :grep",
+            "Search and replace across the project",
+        ),
+        ("Ctrl-P / :files", "Fuzzy-open project and recent files"),
         ("Ctrl-Space", "Show LSP completions"),
-        ("F2", "Rename the symbol at the cursor"),
         ("F12 / Shift-F12", "Definition / references"),
-        (":hover", "Show type and documentation"),
-        (":actions", "Show and apply code actions"),
-        (":diagnostics", "Inspect errors and warnings"),
+        (
+            ":actions / :diagnostics",
+            "Apply code actions / inspect issues",
+        ),
+        (":settings", "Search settings and inspect their metadata"),
         (":plugins", "List loaded plugins and commands"),
     ];
-    const CUSTOMIZE: [(&str, &str); 11] = [
-        ("Click Themes / :themes", "Open the live theme gallery"),
-        ("Hover a theme", "Temporarily preview its colors"),
-        ("Click / Enter", "Apply and remember the selected theme"),
-        (":keymaps", "Open the keymap profile chooser"),
-        (":keymap caret", "Insert-first Caret workflow"),
-        (":keymap vim", "Modal Vim-style workflow"),
+    const CUSTOMIZE: [(&str, &str); 10] = [
         (
-            ":keymap conventional",
-            "Always-type workflow with Ctrl shortcuts",
+            ":settings",
+            "Search all settings and inspect their metadata",
+        ),
+        (
+            "Type / ↑↓ / Enter",
+            "Filter, navigate, and inspect a setting",
+        ),
+        (
+            ":set <value>",
+            "Apply a validated setting; some apply next launch",
+        ),
+        (":themes / :theme <name>", "Open or apply the theme gallery"),
+        ("Hover / wheel / Enter", "Preview, scroll, and apply themes"),
+        (":keymaps / :keymap", "Choose an editing workflow"),
+        (
+            ":keybindings / :bind",
+            "Search or customize keyboard bindings",
         ),
         ("Ctrl-Shift-P", "Open the command palette from any profile"),
-        (":config", "Show the saved configuration path"),
         (
-            ":theme mono / NO_COLOR=1",
-            "Use the high-contrast monochrome theme",
+            ":config / :theme mono",
+            "Show config path / use high contrast",
         ),
         (
             ":set reducedmotion",
@@ -2958,6 +3123,7 @@ fn place_cursor<W: Write>(
         Mode::Help
             | Mode::ProjectSearch
             | Mode::FilePicker
+            | Mode::SettingsBrowser
             | Mode::KeyBrowser
             | Mode::QuitConfirm
             | Mode::TabCloseConfirm

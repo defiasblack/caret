@@ -38,6 +38,7 @@ pub enum Mode {
     ProjectSearch,
     FilePicker,
     KeyBrowser,
+    SettingsBrowser,
     Command,
     Help,
     QuitConfirm,
@@ -81,6 +82,7 @@ impl Mode {
             Self::ProjectSearch => "PROJECT FIND",
             Self::FilePicker => "OPEN FILE",
             Self::KeyBrowser => "KEYS",
+            Self::SettingsBrowser => "SETTINGS",
             Self::Command => "COMMAND",
             Self::Help => "HELP",
             Self::QuitConfirm => "QUIT?",
@@ -313,6 +315,9 @@ pub struct App {
     keys: KeyBindings,
     pub key_browser_input: String,
     pub key_browser_scroll: usize,
+    pub settings_browser_input: String,
+    pub settings_browser_selected: usize,
+    pub settings_browser_scroll: usize,
     pub message: String,
     pub theme_kind: ThemeKind,
     pub theme: Theme,
@@ -534,6 +539,9 @@ impl App {
             keys,
             key_browser_input: String::new(),
             key_browser_scroll: 0,
+            settings_browser_input: String::new(),
+            settings_browser_selected: 0,
+            settings_browser_scroll: 0,
             message: config_message.unwrap_or_else(|| {
                 if show_dashboard {
                     return "Welcome to Caret · choose a recent project or open the current folder"
@@ -2040,6 +2048,10 @@ impl App {
             self.handle_file_picker(key);
             return;
         }
+        if self.mode == Mode::SettingsBrowser {
+            self.handle_settings_browser(key);
+            return;
+        }
         if self.mode == Mode::KeyBrowser {
             self.handle_key_browser(key);
             return;
@@ -2129,6 +2141,7 @@ impl App {
             | Mode::ReloadConfirm
             | Mode::ProjectSearch
             | Mode::FilePicker
+            | Mode::SettingsBrowser
             | Mode::KeyBrowser
             | Mode::GitDiff
             | Mode::GitHistory
@@ -2418,6 +2431,97 @@ impl App {
         self.key_browser_scroll = 0;
         self.mode = Mode::KeyBrowser;
         self.message = "Key bindings · type to search · :bind <action> <keys> rebinds".to_string();
+    }
+
+    fn open_settings_browser(&mut self) {
+        self.settings_browser_input.clear();
+        self.settings_browser_selected = 0;
+        self.settings_browser_scroll = 0;
+        self.mode = Mode::SettingsBrowser;
+        self.message =
+            "Settings · type to search · Enter inspects · Esc closes · edit with :set".to_string();
+    }
+
+    fn handle_settings_browser(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = self.preferred_editor_mode();
+                self.message.clear();
+            }
+            KeyCode::Enter => {
+                if let Some(setting) = self.setting_rows().get(self.settings_browser_selected) {
+                    self.message = format!(
+                        "{} = {} · {}",
+                        setting.name, setting.current, setting.validation
+                    );
+                }
+            }
+            KeyCode::Up => {
+                self.settings_browser_selected = self.settings_browser_selected.saturating_sub(1)
+            }
+            KeyCode::Down => {
+                self.settings_browser_selected = (self.settings_browser_selected + 1)
+                    .min(self.setting_rows().len().saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                self.settings_browser_selected = self.settings_browser_selected.saturating_sub(8)
+            }
+            KeyCode::PageDown => {
+                self.settings_browser_selected = (self.settings_browser_selected + 8)
+                    .min(self.setting_rows().len().saturating_sub(1));
+            }
+            KeyCode::Home => self.settings_browser_selected = 0,
+            KeyCode::End => {
+                self.settings_browser_selected = self.setting_rows().len().saturating_sub(1)
+            }
+            KeyCode::Backspace => {
+                self.settings_browser_input.pop();
+                self.settings_browser_selected = 0;
+                self.settings_browser_scroll = 0;
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.settings_browser_input.push(character);
+                self.settings_browser_selected = 0;
+                self.settings_browser_scroll = 0;
+            }
+            _ => {}
+        }
+        self.ensure_settings_browser_visible();
+    }
+
+    pub fn setting_rows(&self) -> Vec<config::SettingInfo> {
+        let query = self.settings_browser_input.to_ascii_lowercase();
+        self.settings
+            .setting_infos()
+            .into_iter()
+            .filter(|setting| {
+                query.is_empty()
+                    || setting.name.contains(&query)
+                    || setting.current.to_ascii_lowercase().contains(&query)
+                    || setting.default.to_ascii_lowercase().contains(&query)
+                    || setting.description.to_ascii_lowercase().contains(&query)
+                    || setting.validation.to_ascii_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    fn ensure_settings_browser_visible(&mut self) {
+        let count = self.setting_rows().len();
+        if count == 0 {
+            self.settings_browser_selected = 0;
+            self.settings_browser_scroll = 0;
+            return;
+        }
+        self.settings_browser_selected = self.settings_browser_selected.min(count - 1);
+        if self.settings_browser_selected < self.settings_browser_scroll {
+            self.settings_browser_scroll = self.settings_browser_selected;
+        } else if self.settings_browser_selected >= self.settings_browser_scroll + 8 {
+            self.settings_browser_scroll = self.settings_browser_selected + 1 - 8;
+        }
     }
 
     fn handle_key_browser(&mut self, key: KeyEvent) {
@@ -4863,6 +4967,10 @@ impl App {
             "addcursorbelow",
             "set formatonsave",
             "set noformatonsave",
+            "set hidden",
+            "set nohidden",
+            "set restoresession",
+            "set norestoresession",
             "set reducedmotion",
             "set noreducedmotion",
             "set number",
@@ -4878,11 +4986,13 @@ impl App {
             "set startup=folder",
             "set startup=empty",
             "set startup=dashboard",
+            "set maxsearchresults=500",
             "set",
             "theme",
             "themes",
             "keymap",
             "keymaps",
+            "settings",
             "keybindings",
             "bind",
             "unbind",
@@ -5272,6 +5382,7 @@ impl App {
             "themes" | "themegallery" => self.open_theme_gallery(),
             "keymap" => self.execute_keymap(&argument),
             "keymaps" | "keymapgallery" => self.open_keymap_gallery(),
+            "settings" | "setting" | "settingsbrowser" => self.open_settings_browser(),
             "keybindings" | "binds" | "shortcuts" => self.open_key_browser(),
             "bind" => {
                 let mut values = argument.split_whitespace();
@@ -5497,6 +5608,38 @@ impl App {
                 self.persist_settings();
                 self.message = "Line numbers disabled".to_string();
             }
+            "hidden" | "showhidden" => {
+                self.settings.show_hidden_files = true;
+                self.project.show_hidden = true;
+                match self.project.refresh() {
+                    Ok(()) => {
+                        self.persist_settings();
+                        self.message = "Hidden files shown".to_string();
+                    }
+                    Err(error) => self.message = format!("Refresh failed: {error}"),
+                }
+            }
+            "nohidden" | "noshowhidden" => {
+                self.settings.show_hidden_files = false;
+                self.project.show_hidden = false;
+                match self.project.refresh() {
+                    Ok(()) => {
+                        self.persist_settings();
+                        self.message = "Hidden files hidden".to_string();
+                    }
+                    Err(error) => self.message = format!("Refresh failed: {error}"),
+                }
+            }
+            "restoresession" => {
+                self.settings.restore_session = true;
+                self.persist_settings();
+                self.message = "Session restoration enabled (next launch)".to_string();
+            }
+            "norestoresession" => {
+                self.settings.restore_session = false;
+                self.persist_settings();
+                self.message = "Session restoration disabled (next launch)".to_string();
+            }
             "formatonsave" | "fos" => {
                 self.settings.format_on_save = true;
                 self.persist_settings();
@@ -5575,6 +5718,22 @@ impl App {
                     }
                     _ => {
                         self.message = "Undo limit must be between 10 and 100000 steps".to_string()
+                    }
+                }
+            }
+            value if value.starts_with("maxsearchresults=") => {
+                let number = value
+                    .split_once('=')
+                    .and_then(|(_, value)| value.parse::<usize>().ok());
+                match number {
+                    Some(number @ 50..=100_000) => {
+                        self.settings.max_search_results = number;
+                        self.persist_settings();
+                        self.message = format!("Maximum search results: {number}");
+                    }
+                    _ => {
+                        self.message =
+                            "Maximum search results must be between 50 and 100000".to_string()
                     }
                 }
             }
@@ -7286,6 +7445,24 @@ mod tests {
         assert!(filtered
             .iter()
             .any(|(_, description, _)| description.contains("Undo")));
+    }
+
+    #[test]
+    fn settings_browser_lists_and_searches_settings() {
+        let mut app = App::new(None).expect("create app");
+        app.execute_command("settings");
+        assert_eq!(app.mode, Mode::SettingsBrowser);
+
+        let all = app.setting_rows();
+        assert_eq!(all.len(), 19);
+
+        type_text(&mut app, "undo");
+        let filtered = app.setting_rows();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "undolimit");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.message.contains("undolimit"), "{}", app.message);
     }
 
     #[test]
