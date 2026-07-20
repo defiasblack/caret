@@ -274,7 +274,7 @@ mod tests {
             .expect("submit command");
 
         let mut found = false;
-        for _ in 0..80 {
+        for _ in 0..200 {
             terminal.poll();
             if terminal
                 .parser

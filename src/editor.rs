@@ -236,6 +236,16 @@ impl Editor {
             }
         }
 
+        if fs::metadata(path)
+            .map(|metadata| metadata.permissions().readonly())
+            .unwrap_or(false)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file is read-only",
+            ));
+        }
+
         // Saving applies the configured cleanups as ordinary undoable edits
         // before the bytes leave the buffer.
         if self.trim_on_save {
@@ -2486,20 +2496,22 @@ mod tests {
         assert_eq!(editor.cursor.column, 100_000);
     }
 
-    #[cfg(unix)]
     #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
     fn read_only_files_are_not_replaced() {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = std::env::temp_dir().join(format!("caret-read-only-{}", std::process::id()));
         fs::write(&path, "original").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
         let mut editor = Editor::from_file(&path).unwrap();
         editor.insert_text("replacement");
         let result = editor.save();
         assert!(result.is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
         let _ = fs::remove_file(path);
     }
 
