@@ -251,6 +251,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if app.mode == Mode::ContextMenu {
         draw_context_menu(out, app, width, height)?;
     }
+    if app.mode == Mode::TabCloseConfirm {
+        draw_tab_close_confirm(out, app, width, height)?;
+    }
     if app.mode == Mode::Dashboard {
         draw_dashboard(out, app, width, height)?;
     }
@@ -1067,7 +1070,7 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Search | Mode::ProjectSearch | Mode::FilePicker => app.theme.search_mode,
             Mode::KeyBrowser => app.theme.command_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
-            Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
+            Mode::QuitConfirm | Mode::TabCloseConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
             | Mode::GitHistory
             | Mode::ThemeGallery
@@ -1677,10 +1680,8 @@ pub fn project_search_result_at(
 }
 
 fn draw_theme_gallery<W: Write>(out: &mut W, app: &App, width: u16, height: u16) -> io::Result<()> {
-    let panel_width = 46usize.min(width.saturating_sub(4) as usize);
-    let panel_height = ThemeKind::ALL.len() + 4;
-    let x = width.saturating_sub(panel_width as u16) / 2;
-    let y = height.saturating_sub(panel_height as u16) / 2;
+    let (x, y, panel_width, visible_rows, first) = theme_gallery_geometry(app, width, height);
+    let panel_height = visible_rows + 4;
     for row in 0..panel_height {
         queue!(
             out,
@@ -1697,11 +1698,17 @@ fn draw_theme_gallery<W: Write>(out: &mut W, app: &App, width: u16, height: u16)
         Print("THEME GALLERY · live preview"),
         SetAttribute(Attribute::Reset)
     )?;
-    for (index, kind) in ThemeKind::ALL.iter().enumerate() {
+    for (row, (index, kind)) in ThemeKind::ALL
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible_rows)
+        .enumerate()
+    {
         let selected = index == app.theme_gallery_selected;
         queue!(
             out,
-            MoveTo(x + 2, y + 2 + index as u16),
+            MoveTo(x + 2, y + 2 + row as u16),
             SetBackgroundColor(if selected {
                 app.theme.command_mode
             } else {
@@ -1725,6 +1732,22 @@ fn draw_theme_gallery<W: Write>(out: &mut W, app: &App, width: u16, height: u16)
         Print("Hover preview · Click apply · ↑↓/Enter · Esc cancel")
     )?;
     Ok(())
+}
+
+fn theme_gallery_geometry(app: &App, width: u16, height: u16) -> (u16, u16, usize, usize, usize) {
+    let panel_width = 46usize.min(width.saturating_sub(4) as usize);
+    let panel_height = (ThemeKind::ALL.len() + 4).min(height.saturating_sub(2) as usize);
+    let visible_rows = panel_height
+        .saturating_sub(4)
+        .max(1)
+        .min(ThemeKind::ALL.len());
+    let first = app
+        .theme_gallery_selected
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(ThemeKind::ALL.len().saturating_sub(visible_rows));
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = height.saturating_sub(panel_height as u16) / 2;
+    (x, y, panel_width, visible_rows, first)
 }
 
 fn draw_keymap_gallery<W: Write>(
@@ -2191,18 +2214,26 @@ pub fn theme_gallery_item_at(
     if app.mode != Mode::ThemeGallery {
         return None;
     }
-    let panel_width = 46usize.min(width.saturating_sub(4) as usize);
-    let panel_height = ThemeKind::ALL.len() + 4;
-    let x = width.saturating_sub(panel_width as u16) / 2;
-    let y = height.saturating_sub(panel_height as u16) / 2;
+    let (x, y, panel_width, visible_rows, first_index) = theme_gallery_geometry(app, width, height);
     if column < x || column >= x.saturating_add(panel_width as u16) {
         return None;
     }
-    let first = y.saturating_add(2);
-    if row < first || row >= first.saturating_add(ThemeKind::ALL.len() as u16) {
+    let list_start = y.saturating_add(2);
+    if row < list_start || row >= list_start.saturating_add(visible_rows as u16) {
         return None;
     }
-    Some((row - first) as usize)
+    Some(first_index + (row - list_start) as usize)
+}
+
+pub fn theme_gallery_contains(app: &App, width: u16, height: u16, column: u16, row: u16) -> bool {
+    if app.mode != Mode::ThemeGallery {
+        return false;
+    }
+    let (x, y, panel_width, visible_rows, _) = theme_gallery_geometry(app, width, height);
+    column >= x
+        && column < x.saturating_add(panel_width as u16)
+        && row >= y
+        && row < y.saturating_add((visible_rows + 4) as u16)
 }
 
 fn draw_command_palette<W: Write>(
@@ -2303,6 +2334,11 @@ fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             app.theme.error,
             app.theme.background,
         ),
+        Mode::TabCloseConfirm => (
+            " Unsaved changes — [D] Discard & close   [Esc] Keep tab open".to_string(),
+            app.theme.error,
+            app.theme.background,
+        ),
         Mode::ReloadConfirm => (
             format!(" {}", app.message),
             app.theme.error,
@@ -2324,11 +2360,13 @@ fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         MoveTo(0, row),
         SetBackgroundColor(background),
         SetForegroundColor(foreground),
-        SetAttribute(if app.mode == Mode::QuitConfirm {
-            Attribute::Bold
-        } else {
-            Attribute::Reset
-        }),
+        SetAttribute(
+            if matches!(app.mode, Mode::QuitConfirm | Mode::TabCloseConfirm) {
+                Attribute::Bold
+            } else {
+                Attribute::Reset
+            }
+        ),
         Print(pad_or_truncate(&prompt, width as usize)),
         SetAttribute(Attribute::Reset)
     )
@@ -2360,6 +2398,72 @@ fn notification_presentation(message: &str, app: &App) -> (&'static str, Color) 
     }
 }
 
+fn draw_tab_close_confirm<W: Write>(
+    out: &mut W,
+    app: &App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let panel_width = 56usize.min(width.saturating_sub(4) as usize);
+    let panel_height = 7u16.min(height.saturating_sub(2));
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = height.saturating_sub(panel_height) / 2;
+    let inner_width = panel_width.saturating_sub(2);
+
+    for row in 0..panel_height {
+        let border = row == 0 || row + 1 == panel_height;
+        let line = if border {
+            if row == 0 {
+                format!("┌{}┐", "─".repeat(inner_width))
+            } else {
+                format!("└{}┘", "─".repeat(inner_width))
+            }
+        } else {
+            format!("│{}│", " ".repeat(inner_width))
+        };
+        queue!(
+            out,
+            MoveTo(x, y + row),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(if border {
+                app.theme.error
+            } else {
+                app.theme.overlay_text
+            }),
+            Print(line)
+        )?;
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y + 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.error),
+        SetAttribute(Attribute::Bold),
+        Print("UNSAVED CHANGES"),
+        SetAttribute(Attribute::Reset),
+        MoveTo(x + 2, y + 2),
+        SetForegroundColor(app.theme.overlay_text),
+        Print(pad_or_truncate(
+            &format!("{} has unsaved changes.", app.editor.active_title()),
+            inner_width.saturating_sub(2),
+        )),
+        MoveTo(x + 2, y + 4),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(
+            "[D] Discard & close   [Esc] Keep tab open",
+            inner_width.saturating_sub(2),
+        )),
+        MoveTo(x + 2, y + 5),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(
+            "To discard without prompting: :tabclose!",
+            inner_width.saturating_sub(2),
+        ))
+    )?;
+    Ok(())
+}
+
 fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
     let mode_color = if app.terminal_focused {
         app.theme.insert_mode
@@ -2372,7 +2476,7 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             Mode::Search | Mode::ProjectSearch | Mode::FilePicker => app.theme.search_mode,
             Mode::KeyBrowser => app.theme.command_mode,
             Mode::Command | Mode::Help => app.theme.command_mode,
-            Mode::QuitConfirm | Mode::ReloadConfirm => app.theme.error,
+            Mode::QuitConfirm | Mode::TabCloseConfirm | Mode::ReloadConfirm => app.theme.error,
             Mode::GitDiff
             | Mode::GitHistory
             | Mode::ThemeGallery
@@ -2579,6 +2683,7 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("F1", "Close"),
         ],
         (Mode::QuitConfirm, _) => &[("S", "Save+Quit"), ("D", "Discard+Quit"), ("Esc", "Cancel")],
+        (Mode::TabCloseConfirm, _) => &[("D", "Discard+Close"), ("Esc", "Keep open")],
         (Mode::ReloadConfirm, _) => &[
             ("R", "Reload"),
             ("K", "Keep"),
@@ -2855,6 +2960,7 @@ fn place_cursor<W: Write>(
             | Mode::FilePicker
             | Mode::KeyBrowser
             | Mode::QuitConfirm
+            | Mode::TabCloseConfirm
             | Mode::ReloadConfirm
             | Mode::GitDiff
             | Mode::GitHistory
@@ -2990,5 +3096,15 @@ mod tests {
 
         assert_eq!(command_suggestion_at(&app, 80, 24, 1, 14), Some(1));
         assert_eq!(command_suggestion_at(&app, 80, 24, 1, 21), Some(8));
+    }
+
+    #[test]
+    fn theme_gallery_hit_testing_tracks_the_scrolled_window() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::ThemeGallery;
+        app.theme_gallery_selected = 20;
+
+        assert!(theme_gallery_contains(&app, 80, 24, 18, 1));
+        assert_eq!(theme_gallery_item_at(&app, 80, 24, 18, 3), Some(3));
     }
 }

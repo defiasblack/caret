@@ -235,7 +235,7 @@ Open the welcome dashboard at any time with `:welcome`.
 | `:set tabstop=4` | Change tab width |
 | `:set startup=folder` | Set the launch view: `session`, `folder`, `empty`, or `dashboard` |
 | `:welcome` | Open the recent-project dashboard |
-| `:theme oxide` / `:theme mono` | Change theme |
+| `:theme <name>` / `:themes` | Change theme; built-ins include `system`, `aura`, `ayu`, `carbonfox`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin`, `cobalt2`, `cursor`, `dracula`, `everforest`, `flexoki`, `github`, `gruvbox`, `kanagawa`, `lucent-orng`, `material`, `matrix`, `mercury`, `monokai`, `nightowl`, `nord`, `one-dark`, `opencode`, `orng`, `osaka-jade`, `palenight`, `solarized`, `synthwave84`, `tokyonight`, `vercel`, `vesper`, `zenburn`, plus `oxide` and `mono` |
 | `:doctor` / `:copydiagnostics` | View or copy the support diagnostic report |
 | `:recover N` / `:recovercompare N` / `:discardrecovery` | Restore, compare, or discard crash-recovery snapshots |
 

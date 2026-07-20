@@ -41,6 +41,7 @@ pub enum Mode {
     Command,
     Help,
     QuitConfirm,
+    TabCloseConfirm,
     ReloadConfirm,
     GitDiff,
     GitHistory,
@@ -83,6 +84,7 @@ impl Mode {
             Self::Command => "COMMAND",
             Self::Help => "HELP",
             Self::QuitConfirm => "QUIT?",
+            Self::TabCloseConfirm => "CLOSE TAB?",
             Self::ReloadConfirm => "RELOAD?",
             Self::GitDiff => "DIFF",
             Self::GitHistory => "HISTORY",
@@ -290,6 +292,7 @@ pub struct App {
     pub command_suggestion: usize,
     pub command_suggestion_scroll: usize,
     command_suggestion_hover_lock_until: Option<Instant>,
+    theme_gallery_hover_lock_until: Option<Instant>,
     command_selection: Option<(usize, usize)>,
     command_cursor: usize,
     command_anchor: Option<usize>,
@@ -510,6 +513,7 @@ impl App {
             command_suggestion: 0,
             command_suggestion_scroll: 0,
             command_suggestion_hover_lock_until: None,
+            theme_gallery_hover_lock_until: None,
             command_selection: None,
             command_cursor: 0,
             command_anchor: None,
@@ -816,6 +820,9 @@ impl App {
                     }
                 }
                 if self.mode == Mode::ThemeGallery {
+                    if self.theme_gallery_hover_is_locked() {
+                        return false;
+                    }
                     if let Ok((width, height)) = terminal::size() {
                         if let Some(index) = crate::ui::theme_gallery_item_at(
                             self,
@@ -892,7 +899,7 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.mode == Mode::QuitConfirm {
+        if matches!(self.mode, Mode::QuitConfirm | Mode::TabCloseConfirm) {
             return;
         }
 
@@ -919,6 +926,23 @@ impl App {
             });
             self.command_suggestion_hover_lock_until =
                 Some(Instant::now() + Duration::from_millis(500));
+            return;
+        }
+
+        if self.mode == Mode::ThemeGallery
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+            && crate::ui::theme_gallery_contains(self, width, height, mouse.column, mouse.row)
+        {
+            self.theme_gallery_selected = if mouse.kind == MouseEventKind::ScrollUp {
+                self.theme_gallery_selected.saturating_sub(1)
+            } else {
+                (self.theme_gallery_selected + 1).min(ThemeKind::ALL.len() - 1)
+            };
+            self.preview_gallery_theme();
+            self.theme_gallery_hover_lock_until = Some(Instant::now() + Duration::from_millis(500));
             return;
         }
 
@@ -1843,6 +1867,10 @@ impl App {
             self.handle_quit_confirmation(key);
             return;
         }
+        if self.mode == Mode::TabCloseConfirm {
+            self.handle_tab_close_confirmation(key);
+            return;
+        }
         if self.mode == Mode::ReloadConfirm {
             self.handle_reload_confirmation(key);
             return;
@@ -2097,6 +2125,7 @@ impl App {
                 _ => {}
             },
             Mode::QuitConfirm
+            | Mode::TabCloseConfirm
             | Mode::ReloadConfirm
             | Mode::ProjectSearch
             | Mode::FilePicker
@@ -2195,6 +2224,17 @@ impl App {
                     self.mode = self.preferred_editor_mode();
                 }
             }
+            _ => {}
+        }
+    }
+
+    fn handle_tab_close_confirmation(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.mode = self.preferred_editor_mode();
+                self.message = "Tab close cancelled".to_string();
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => self.close_active_tab(true),
             _ => {}
         }
     }
@@ -3204,9 +3244,13 @@ impl App {
             Ok(title) => {
                 self.pending_key = None;
                 self.search_origin = self.editor.cursor;
+                self.mode = self.preferred_editor_mode();
                 self.message = format!("Closed {title}");
             }
-            Err(message) => self.message = message,
+            Err(message) => {
+                self.message = message;
+                self.mode = Mode::TabCloseConfirm;
+            }
         }
     }
 
@@ -4695,6 +4739,11 @@ impl App {
 
     fn command_suggestion_hover_is_locked(&self) -> bool {
         self.command_suggestion_hover_lock_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn theme_gallery_hover_is_locked(&self) -> bool {
+        self.theme_gallery_hover_lock_until
             .is_some_and(|until| Instant::now() < until)
     }
 
@@ -6469,28 +6518,28 @@ impl App {
             self.message = format!("Theme: {argument} (plugin)");
             return;
         }
-        let kind = match argument {
-            "oxide" | "" => ThemeKind::Oxide,
-            "mono" | "monochrome" => ThemeKind::Mono,
-            "nord" => ThemeKind::Nord,
-            "dracula" => ThemeKind::Dracula,
-            "solarized" | "solarized-dark" => ThemeKind::Solarized,
-            "gallery" => {
-                self.open_theme_gallery();
-                return;
-            }
-            _ => {
-                let custom = self.plugins.theme_names();
-                self.message = if custom.is_empty() {
-                    "Themes: oxide, nord, dracula, solarized, mono, gallery".to_string()
-                } else {
-                    format!(
-                        "Themes: oxide, nord, dracula, solarized, mono, gallery · plugins: {}",
-                        custom.join(", ")
-                    )
-                };
-                return;
-            }
+        let normalized = argument.trim().to_ascii_lowercase();
+        let kind = if normalized == "gallery" {
+            self.open_theme_gallery();
+            return;
+        } else if let Some(kind) = ThemeKind::parse(&normalized) {
+            kind
+        } else {
+            let custom = self.plugins.theme_names();
+            let built_in = ThemeKind::ALL
+                .iter()
+                .map(|kind| kind.name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.message = if custom.is_empty() {
+                format!("Themes: {built_in}, gallery")
+            } else {
+                format!(
+                    "Themes: {built_in}, gallery · plugins: {}",
+                    custom.join(", ")
+                )
+            };
+            return;
         };
 
         self.theme_kind = kind;
@@ -6515,6 +6564,7 @@ impl App {
             .iter()
             .position(|kind| *kind == self.theme_kind)
             .unwrap_or(0);
+        self.theme_gallery_hover_lock_until = None;
         self.mode = Mode::ThemeGallery;
         self.preview_gallery_theme();
     }
@@ -6968,6 +7018,35 @@ mod tests {
     }
 
     #[test]
+    fn dirty_tab_close_requires_confirmation_before_discarding() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.mode = Mode::Insert;
+        app.editor.insert_text("unsaved");
+        app.editor.finish_undo_group();
+
+        app.close_active_tab(false);
+        assert_eq!(app.mode, Mode::TabCloseConfirm);
+        assert!(app.message.contains("unsaved changes"), "{}", app.message);
+
+        app.handle_key(key('x'));
+        assert_eq!(app.mode, Mode::TabCloseConfirm);
+        assert!(app.editor.tab_dirty(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Insert);
+        assert!(app.editor.tab_dirty(0));
+
+        app.close_active_tab(false);
+        assert_eq!(app.mode, Mode::TabCloseConfirm);
+
+        app.handle_key(key('d'));
+        assert_eq!(app.mode, Mode::Insert);
+        assert!(!app.editor.tab_dirty(0));
+        assert!(app.message.contains("Closed Untitled 1"), "{}", app.message);
+    }
+
+    #[test]
     fn search_panel_replaces_all_occurrences_as_one_undo_step() {
         let mut app = App::new(None).expect("create app");
         app.explorer_focused = false;
@@ -7311,6 +7390,16 @@ mod tests {
 
         app.command_suggestion_hover_lock_until = Some(Instant::now() - Duration::from_secs(1));
         assert!(!app.command_suggestion_hover_is_locked());
+    }
+
+    #[test]
+    fn theme_gallery_hover_lock_expires() {
+        let mut app = App::new(None).expect("create app");
+        app.theme_gallery_hover_lock_until = Some(Instant::now() + Duration::from_secs(1));
+        assert!(app.theme_gallery_hover_is_locked());
+
+        app.theme_gallery_hover_lock_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!app.theme_gallery_hover_is_locked());
     }
 
     #[test]
