@@ -4,6 +4,12 @@ Run this checklist on Windows, macOS, and Linux before a 0.6 release. Use a
 disposable copy of a project; the forced-termination checks intentionally stop
 the editor without allowing normal cleanup.
 
+The automated suite now covers the durable save failure paths, BOM/line-ending
+handling, Unicode cell positioning, external-change protection, invalid
+configuration, session serialization, platform replacement, LSP stderr
+capture, and a process-level recovery kill/startup test. The checklist below
+remains the release sign-off for real terminals and filesystems.
+
 1. Open a UTF-8 file with CRLF endings and a BOM. Edit and save it. Confirm the
    BOM, CRLF endings, and final-newline state are unchanged.
 2. Start editing a named file, wait at least two seconds, then forcibly stop

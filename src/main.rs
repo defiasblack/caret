@@ -7,6 +7,7 @@ mod editor;
 mod fuzzy;
 mod keys;
 mod lsp;
+mod platform;
 mod plugin;
 mod project;
 mod project_search;

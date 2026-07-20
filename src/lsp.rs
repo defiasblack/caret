@@ -30,12 +30,14 @@ impl LspClient {
         let mut child = process
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
         let input = child.stdin.take().expect("piped stdin");
         let output = child.stdout.take().expect("piped stdout");
+        let errors = child.stderr.take().expect("piped stderr");
         let (sender, messages) = mpsc::channel();
         thread::spawn(move || read_messages(output, sender));
+        thread::spawn(move || read_errors(errors));
 
         let mut client = Self {
             child,
@@ -205,9 +207,34 @@ fn read_messages(output: impl io::Read, sender: mpsc::Sender<Value>) {
     }
 }
 
+fn read_errors(output: impl io::Read) {
+    read_errors_with(output, |line| {
+        let _ = crate::diagnostics::append("lsp", line);
+    });
+}
+
+fn read_errors_with<F>(output: impl io::Read, mut record: F)
+where
+    F: FnMut(&str),
+{
+    for line in BufReader::new(output).lines() {
+        match line {
+            Ok(line) if !line.trim().is_empty() => {
+                record(&line);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                record(&format!("stderr read failed: {error}"));
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -216,6 +243,39 @@ mod tests {
         let path = path_from_uri(uri).expect("decode URI");
         assert!(path.to_string_lossy().contains("hello world"));
         assert!(path.to_string_lossy().contains('✓'));
+    }
+
+    #[test]
+    fn stderr_lines_are_written_to_the_structured_log() {
+        let mut lines = Vec::new();
+        read_errors_with(Cursor::new(b"server failed\n\nsecond line\n"), |line| {
+            lines.push(line.to_string())
+        });
+        assert_eq!(lines, ["server failed", "second line"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_paths_round_trip_through_file_uris() {
+        let path = std::path::PathBuf::from(r"C:\work\caret\main.rs");
+        let decoded = path_from_uri(&file_uri(&path)).unwrap();
+        assert_eq!(decoded, path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_paths_round_trip_through_file_uris() {
+        let path = std::path::PathBuf::from("/Users/test/project/main.rs");
+        let decoded = path_from_uri(&file_uri(&path)).unwrap();
+        assert_eq!(decoded, path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_paths_round_trip_through_file_uris() {
+        let path = std::path::PathBuf::from("/home/test/project/main.rs");
+        let decoded = path_from_uri(&file_uri(&path)).unwrap();
+        assert_eq!(decoded, path);
     }
 
     #[test]

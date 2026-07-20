@@ -94,4 +94,17 @@ mod tests {
         );
         let _ = fs::remove_dir_all(directory);
     }
+
+    #[test]
+    fn corrupt_journal_is_reported_instead_of_being_silently_discarded() {
+        let directory =
+            std::env::temp_dir().join(format!("caret-recovery-invalid-{}", std::process::id()));
+        let path = directory.join("journal.json");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&path, b"not json").unwrap();
+        let error = load_at(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(directory);
+    }
 }

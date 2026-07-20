@@ -104,6 +104,7 @@ pub struct Editor {
     pub final_newline: FinalNewline,
     disk_modified: Option<SystemTime>,
     disk_len: Option<u64>,
+    disk_fingerprint: Option<u64>,
     external_change_pending: bool,
     format: FileFormat,
     folded_ranges: BTreeMap<usize, usize>,
@@ -134,6 +135,7 @@ impl Editor {
                 final_newline: FinalNewline::Preserve,
                 disk_modified: None,
                 disk_len: None,
+                disk_fingerprint: None,
                 external_change_pending: false,
                 format: FileFormat {
                     utf8_bom: false,
@@ -168,6 +170,7 @@ impl Editor {
             final_newline: FinalNewline::Preserve,
             disk_modified: None,
             disk_len: None,
+            disk_fingerprint: None,
             external_change_pending: false,
             format: FileFormat {
                 utf8_bom: false,
@@ -203,6 +206,7 @@ impl Editor {
                 .and_then(|metadata| metadata.modified())
                 .ok(),
             disk_len: fs::metadata(path).map(|metadata| metadata.len()).ok(),
+            disk_fingerprint: document::fingerprint(path).ok(),
             external_change_pending: false,
             format,
             folded_ranges: BTreeMap::new(),
@@ -263,6 +267,7 @@ impl Editor {
             .and_then(|metadata| metadata.modified())
             .ok();
         self.disk_len = fs::metadata(path).map(|metadata| metadata.len()).ok();
+        self.disk_fingerprint = document::fingerprint(path).ok();
         self.external_change_pending = false;
         Ok(())
     }
@@ -276,7 +281,10 @@ impl Editor {
             .as_ref()
             .and_then(|metadata| metadata.modified().ok());
         let len = metadata.as_ref().map(|metadata| metadata.len());
-        modified != self.disk_modified || len != self.disk_len
+        let fingerprint = document::fingerprint(path).ok();
+        modified != self.disk_modified
+            || len != self.disk_len
+            || fingerprint != self.disk_fingerprint
     }
 
     pub fn acknowledge_disk_change(&mut self) {
@@ -289,6 +297,10 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|path| fs::metadata(path).map(|metadata| metadata.len()).ok());
+        self.disk_fingerprint = self
+            .path
+            .as_ref()
+            .and_then(|path| document::fingerprint(path).ok());
     }
 
     pub fn keep_disk_change(&mut self) {
@@ -833,14 +845,19 @@ impl Editor {
     /// the new line when auto-indent is enabled.
     pub fn insert_newline(&mut self) {
         self.begin_undo_group();
+        let ending = self.line_ending();
         if !self.secondary_cursors.is_empty() {
-            self.replace_at_cursors("\n");
+            self.replace_at_cursors(ending);
             return;
         }
         self.delete_selection();
 
         if !self.auto_indent {
-            self.insert_char('\n');
+            let index = self.current_char_index();
+            self.edit(index, 0, ending);
+            self.cursor.line += 1;
+            self.cursor.column = 0;
+            self.preferred_column = None;
             return;
         }
 
@@ -851,7 +868,7 @@ impl Editor {
             .take_while(|character| *character == ' ' || *character == '\t')
             .collect();
         let index = self.current_char_index();
-        self.edit(index, 0, &format!("\n{indent}"));
+        self.edit(index, 0, &format!("{ending}{indent}"));
         self.cursor.line += 1;
         self.cursor.column = indent.chars().count();
         self.preferred_column = None;
@@ -2437,6 +2454,56 @@ mod tests {
     }
 
     #[test]
+    fn detects_same_length_external_replacements_when_metadata_is_unchanged() {
+        let path =
+            std::env::temp_dir().join(format!("caret-external-same-size-{}", std::process::id()));
+        fs::write(&path, "one").unwrap();
+        let editor = Editor::from_file(&path).unwrap();
+        fs::write(&path, "two").unwrap();
+        assert!(editor.changed_on_disk());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unicode_cursor_positions_use_characters_and_display_cells() {
+        let mut editor = Editor::blank();
+        editor.insert_text("a界e\u{301}🙂");
+        editor.set_cursor_from_display_position(0, 3);
+        assert_eq!(editor.cursor.column, 2);
+        editor.set_cursor_from_display_position(0, 4);
+        assert_eq!(editor.cursor.column, 4);
+        assert_eq!(display_width("a界e\u{301}🙂", 4), 6);
+    }
+
+    #[test]
+    fn extremely_long_lines_and_empty_files_remain_valid_buffers() {
+        let mut editor = Editor::blank();
+        assert_eq!(editor.line_count(), 1);
+        editor.insert_text(&"x".repeat(100_000));
+        assert_eq!(editor.line_count(), 1);
+        assert_eq!(editor.line_len_chars(0), 100_000);
+        editor.set_cursor_from_char_index(100_000);
+        assert_eq!(editor.cursor.column, 100_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_files_are_not_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!("caret-read-only-{}", std::process::id()));
+        fs::write(&path, "original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let mut editor = Editor::from_file(&path).unwrap();
+        editor.insert_text("replacement");
+        let result = editor.save();
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn newline_copies_the_current_indentation() {
         let mut editor = Editor::blank();
         editor.insert_text("    let x = 1;");
@@ -2533,6 +2600,23 @@ mod tests {
         editor.insert_text("   ");
         editor.save().unwrap();
         assert!(!fs::read_to_string(&path).unwrap().ends_with(' '));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn editing_a_crlf_file_keeps_inserted_line_breaks_as_crlf() {
+        let path = std::env::temp_dir().join(format!("caret-crlf-edit-{}", std::process::id()));
+        fs::write(&path, b"first\r\nsecond").unwrap();
+        let mut editor = Editor::from_file(&path).unwrap();
+        editor.cursor = Cursor { line: 0, column: 5 };
+        editor.insert_newline();
+        editor.save().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes, b"first\r\n\r\nsecond");
+        assert_eq!(
+            bytes.iter().filter(|byte| **byte == b'\n').count(),
+            bytes.windows(2).filter(|window| *window == b"\r\n").count()
+        );
         let _ = fs::remove_file(path);
     }
 

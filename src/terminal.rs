@@ -231,30 +231,12 @@ fn io_other(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(windows)]
 fn shell_command() -> (String, Vec<String>, String) {
-    if let Ok(program) = std::env::var("CARET_SHELL") {
-        let name = Path::new(&program)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("shell")
-            .to_string();
-        return (program, Vec::new(), name);
-    }
-    (
-        "powershell.exe".to_string(),
-        vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
-        "PowerShell".to_string(),
-    )
+    crate::platform::shell_command()
 }
 
 #[cfg(not(windows))]
 fn shell_command() -> (String, Vec<String>, String) {
-    let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let name = Path::new(&program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("shell")
-        .to_string();
-    (program, Vec::new(), name)
+    crate::platform::shell_command()
 }
 
 #[cfg(test)]

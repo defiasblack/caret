@@ -17,7 +17,6 @@ use serde_json::{json, Value};
 
 use crate::{
     config::{self, KeymapProfile, Settings, StartupView},
-    document::FinalNewline,
     editor::{Cursor, EditorOptions, ReplaceOutcome},
     keys::{Action as KeyAction, KeyBindings},
     lsp::{self, LspClient},
@@ -29,6 +28,11 @@ use crate::{
     terminal::TerminalPane,
     theme::{Theme, ThemeKind},
 };
+
+#[path = "app/persistence.rs"]
+mod persistence;
+#[path = "app/settings.rs"]
+mod settings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -878,6 +882,10 @@ impl App {
         }
         self.poll_lsp();
         if self.mode != Mode::ReloadConfirm && self.editor.changed_on_disk() {
+            // Record the conflict immediately. Choosing "Later" must not
+            // acknowledge the new disk version and silently allow a later
+            // save to overwrite it.
+            self.editor.keep_disk_change();
             self.mode = Mode::ReloadConfirm;
             self.message =
                 "File changed on disk — [R] Reload   [K] Keep buffer   [C] Compare   [Esc] Later"
@@ -2279,9 +2287,8 @@ impl App {
             KeyCode::Char('c') | KeyCode::Char('C') => self.compare_external_change(),
             KeyCode::Esc => {
                 self.pending_save_after_disk_change = false;
-                self.editor.acknowledge_disk_change();
                 self.mode = self.preferred_editor_mode();
-                self.message = "Reload deferred".to_string();
+                self.message = "Reload deferred; saving will ask before overwriting".to_string();
             }
             _ => {}
         }
@@ -2431,97 +2438,6 @@ impl App {
         self.key_browser_scroll = 0;
         self.mode = Mode::KeyBrowser;
         self.message = "Key bindings · type to search · :bind <action> <keys> rebinds".to_string();
-    }
-
-    fn open_settings_browser(&mut self) {
-        self.settings_browser_input.clear();
-        self.settings_browser_selected = 0;
-        self.settings_browser_scroll = 0;
-        self.mode = Mode::SettingsBrowser;
-        self.message =
-            "Settings · type to search · Enter inspects · Esc closes · edit with :set".to_string();
-    }
-
-    fn handle_settings_browser(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = self.preferred_editor_mode();
-                self.message.clear();
-            }
-            KeyCode::Enter => {
-                if let Some(setting) = self.setting_rows().get(self.settings_browser_selected) {
-                    self.message = format!(
-                        "{} = {} · {}",
-                        setting.name, setting.current, setting.validation
-                    );
-                }
-            }
-            KeyCode::Up => {
-                self.settings_browser_selected = self.settings_browser_selected.saturating_sub(1)
-            }
-            KeyCode::Down => {
-                self.settings_browser_selected = (self.settings_browser_selected + 1)
-                    .min(self.setting_rows().len().saturating_sub(1));
-            }
-            KeyCode::PageUp => {
-                self.settings_browser_selected = self.settings_browser_selected.saturating_sub(8)
-            }
-            KeyCode::PageDown => {
-                self.settings_browser_selected = (self.settings_browser_selected + 8)
-                    .min(self.setting_rows().len().saturating_sub(1));
-            }
-            KeyCode::Home => self.settings_browser_selected = 0,
-            KeyCode::End => {
-                self.settings_browser_selected = self.setting_rows().len().saturating_sub(1)
-            }
-            KeyCode::Backspace => {
-                self.settings_browser_input.pop();
-                self.settings_browser_selected = 0;
-                self.settings_browser_scroll = 0;
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.settings_browser_input.push(character);
-                self.settings_browser_selected = 0;
-                self.settings_browser_scroll = 0;
-            }
-            _ => {}
-        }
-        self.ensure_settings_browser_visible();
-    }
-
-    pub fn setting_rows(&self) -> Vec<config::SettingInfo> {
-        let query = self.settings_browser_input.to_ascii_lowercase();
-        self.settings
-            .setting_infos()
-            .into_iter()
-            .filter(|setting| {
-                query.is_empty()
-                    || setting.name.contains(&query)
-                    || setting.current.to_ascii_lowercase().contains(&query)
-                    || setting.default.to_ascii_lowercase().contains(&query)
-                    || setting.description.to_ascii_lowercase().contains(&query)
-                    || setting.validation.to_ascii_lowercase().contains(&query)
-            })
-            .collect()
-    }
-
-    fn ensure_settings_browser_visible(&mut self) {
-        let count = self.setting_rows().len();
-        if count == 0 {
-            self.settings_browser_selected = 0;
-            self.settings_browser_scroll = 0;
-            return;
-        }
-        self.settings_browser_selected = self.settings_browser_selected.min(count - 1);
-        if self.settings_browser_selected < self.settings_browser_scroll {
-            self.settings_browser_scroll = self.settings_browser_selected;
-        } else if self.settings_browser_selected >= self.settings_browser_scroll + 8 {
-            self.settings_browser_scroll = self.settings_browser_selected + 1 - 8;
-        }
     }
 
     fn handle_key_browser(&mut self, key: KeyEvent) {
@@ -5594,211 +5510,6 @@ impl App {
         }
     }
 
-    fn execute_set(&mut self, argument: &str) {
-        match argument {
-            "number" | "nu" => {
-                self.settings.show_line_numbers = true;
-                self.apply_editor_settings();
-                self.persist_settings();
-                self.message = "Line numbers enabled".to_string();
-            }
-            "nonumber" | "nonu" => {
-                self.settings.show_line_numbers = false;
-                self.apply_editor_settings();
-                self.persist_settings();
-                self.message = "Line numbers disabled".to_string();
-            }
-            "hidden" | "showhidden" => {
-                self.settings.show_hidden_files = true;
-                self.project.show_hidden = true;
-                match self.project.refresh() {
-                    Ok(()) => {
-                        self.persist_settings();
-                        self.message = "Hidden files shown".to_string();
-                    }
-                    Err(error) => self.message = format!("Refresh failed: {error}"),
-                }
-            }
-            "nohidden" | "noshowhidden" => {
-                self.settings.show_hidden_files = false;
-                self.project.show_hidden = false;
-                match self.project.refresh() {
-                    Ok(()) => {
-                        self.persist_settings();
-                        self.message = "Hidden files hidden".to_string();
-                    }
-                    Err(error) => self.message = format!("Refresh failed: {error}"),
-                }
-            }
-            "restoresession" => {
-                self.settings.restore_session = true;
-                self.persist_settings();
-                self.message = "Session restoration enabled (next launch)".to_string();
-            }
-            "norestoresession" => {
-                self.settings.restore_session = false;
-                self.persist_settings();
-                self.message = "Session restoration disabled (next launch)".to_string();
-            }
-            "formatonsave" | "fos" => {
-                self.settings.format_on_save = true;
-                self.persist_settings();
-                self.message = "Format on save enabled".to_string();
-            }
-            "noformatonsave" | "nofos" => {
-                self.settings.format_on_save = false;
-                self.persist_settings();
-                self.message = "Format on save disabled".to_string();
-            }
-            "reducedmotion" | "reduce-motion" => {
-                self.settings.reduced_motion = true;
-                self.persist_settings();
-                self.message = "Reduced motion enabled".to_string();
-            }
-            "noreducedmotion" | "no-reduce-motion" => {
-                self.settings.reduced_motion = false;
-                self.persist_settings();
-                self.message = "Reduced motion disabled".to_string();
-            }
-            "autoindent" | "ai" => {
-                self.settings.auto_indent = true;
-                self.apply_editor_settings();
-                self.persist_settings();
-                self.message = "Auto-indent enabled".to_string();
-            }
-            "noautoindent" | "noai" => {
-                self.settings.auto_indent = false;
-                self.apply_editor_settings();
-                self.persist_settings();
-                self.message = "Auto-indent disabled".to_string();
-            }
-            "trimonsave" => {
-                self.settings.trim_trailing_whitespace_on_save = true;
-                self.apply_editor_settings();
-                self.persist_settings();
-                self.message = "Trailing whitespace is trimmed on save".to_string();
-            }
-            "notrimonsave" => {
-                self.settings.trim_trailing_whitespace_on_save = false;
-                self.apply_editor_settings();
-                self.persist_settings();
-                self.message = "Trailing whitespace is kept on save".to_string();
-            }
-            value if value.starts_with("finalnewline=") => {
-                let choice = value.split_once('=').map(|(_, value)| value);
-                let policy = match choice {
-                    Some("preserve") => Some(FinalNewline::Preserve),
-                    Some("always") => Some(FinalNewline::Always),
-                    Some("strip") => Some(FinalNewline::Strip),
-                    _ => None,
-                };
-                match policy {
-                    Some(policy) => {
-                        self.settings.final_newline = policy;
-                        self.apply_editor_settings();
-                        self.persist_settings();
-                        self.message = format!("Final newline on save: {}", policy.name());
-                    }
-                    None => {
-                        self.message =
-                            "Final newline must be preserve, always, or strip".to_string()
-                    }
-                }
-            }
-            value if value.starts_with("undolimit=") => {
-                let number = value
-                    .split_once('=')
-                    .and_then(|(_, value)| value.parse::<usize>().ok());
-                match number {
-                    Some(number @ 10..=100_000) => {
-                        self.settings.undo_history_limit = number;
-                        self.apply_editor_settings();
-                        self.persist_settings();
-                        self.message = format!("Undo history limit: {number} steps");
-                    }
-                    _ => {
-                        self.message = "Undo limit must be between 10 and 100000 steps".to_string()
-                    }
-                }
-            }
-            value if value.starts_with("maxsearchresults=") => {
-                let number = value
-                    .split_once('=')
-                    .and_then(|(_, value)| value.parse::<usize>().ok());
-                match number {
-                    Some(number @ 50..=100_000) => {
-                        self.settings.max_search_results = number;
-                        self.persist_settings();
-                        self.message = format!("Maximum search results: {number}");
-                    }
-                    _ => {
-                        self.message =
-                            "Maximum search results must be between 50 and 100000".to_string()
-                    }
-                }
-            }
-            value if value.starts_with("tabstop=") || value.starts_with("ts=") => {
-                let number = value
-                    .split_once('=')
-                    .and_then(|(_, value)| value.parse::<usize>().ok());
-
-                match number {
-                    Some(number @ 1..=16) => {
-                        self.settings.tab_width = number;
-                        self.apply_editor_settings();
-                        self.persist_settings();
-                        self.message = format!("Tab width: {number}");
-                    }
-                    _ => self.message = "Tab width must be between 1 and 16".to_string(),
-                }
-            }
-            value if value.starts_with("treewidth=") => {
-                let number = value
-                    .split_once('=')
-                    .and_then(|(_, value)| value.parse::<usize>().ok());
-
-                match number {
-                    Some(number @ 22..=80) => {
-                        self.project.width = number;
-                        self.settings.tree_width = number;
-                        self.persist_settings();
-                        self.message = format!("Tree width: {number}");
-                    }
-                    _ => self.message = "Tree width must be between 22 and 80".to_string(),
-                }
-            }
-            value if value.starts_with("startup=") => {
-                let choice = value.split_once('=').map(|(_, value)| value);
-                let view = match choice {
-                    Some("session") => Some(StartupView::Session),
-                    Some("folder") => Some(StartupView::Folder),
-                    Some("empty") => Some(StartupView::Empty),
-                    Some("dashboard") => Some(StartupView::Dashboard),
-                    _ => None,
-                };
-                match view {
-                    Some(view) => {
-                        self.settings.startup = view;
-                        self.persist_settings();
-                        self.message = format!(
-                            "Startup view: {} (applies on next launch)",
-                            choice.unwrap_or_default()
-                        );
-                    }
-                    None => {
-                        self.message =
-                            "Startup must be session, folder, empty, or dashboard".to_string()
-                    }
-                }
-            }
-            _ => {
-                self.message =
-                    "Try :set number, :set startup=folder, :set formatonsave, or :set tabstop=4"
-                        .to_string()
-            }
-        }
-    }
-
     fn start_lsp(&mut self) {
         self.lsp = None;
         self.lsp_panel = None;
@@ -6790,121 +6501,6 @@ impl App {
         self.mode = self.preferred_editor_mode();
         self.message = format!("Keymap: {}", profile.name());
     }
-
-    fn persist_settings(&mut self) {
-        // Tests must never overwrite the user's real configuration file.
-        if cfg!(test) {
-            return;
-        }
-        if let Err(error) = config::save(&self.settings) {
-            self.message = format!("Could not save settings: {error}");
-        }
-    }
-
-    fn save_all(&mut self) {
-        self.save_all_internal();
-    }
-
-    fn save_all_internal(&mut self) -> bool {
-        let (saved, errors) = self.editor.save_all();
-        let _ = self.project.refresh();
-
-        if errors.is_empty() {
-            self.message = if saved == 0 {
-                "All named tabs are already saved".to_string()
-            } else {
-                format!("Saved {saved} tab(s)")
-            };
-            true
-        } else {
-            self.message = format!(
-                "Saved {saved}; {} tab(s) failed: {}",
-                errors.len(),
-                errors.join("; ")
-            );
-            false
-        }
-    }
-
-    fn save(&mut self) {
-        self.save_internal();
-    }
-
-    fn save_as(&mut self, path: PathBuf) {
-        match self.editor.save_as(&path) {
-            Ok(()) => {
-                let hooks = match self.run_save_hooks() {
-                    Ok(count) => count,
-                    Err(error) => {
-                        self.message = error;
-                        return;
-                    }
-                };
-                let _ = self.project.refresh();
-                self.project.refresh_git_status();
-                self.refresh_git_line_changes();
-                self.message = if hooks == 0 {
-                    format!("Saved {}", path.display())
-                } else {
-                    format!("Saved {} · ran {hooks} plugin hook(s)", path.display())
-                };
-                self.request_formatting_after_save();
-            }
-            Err(error) => self.message = format!("Save failed: {error}"),
-        }
-    }
-
-    fn save_internal(&mut self) -> bool {
-        if self.editor.has_pending_external_change() {
-            self.pending_save_after_disk_change = true;
-            self.mode = Mode::ReloadConfirm;
-            self.message = "Disk changes were kept — [R] Reload   [K] Overwrite with current buffer   [C] Compare   [Esc] Cancel".to_string();
-            return false;
-        }
-        match self.editor.save() {
-            Ok(()) => {
-                let hooks = match self.run_save_hooks() {
-                    Ok(count) => count,
-                    Err(error) => {
-                        self.message = error;
-                        return false;
-                    }
-                };
-                let _ = self.project.refresh();
-                self.project.refresh_git_status();
-                self.refresh_git_line_changes();
-                let name = self
-                    .editor
-                    .path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "[No Name]".to_string());
-                self.message = if hooks == 0 {
-                    format!("Saved {name}")
-                } else {
-                    format!("Saved {name} · ran {hooks} plugin hook(s)")
-                };
-                self.request_formatting_after_save();
-                true
-            }
-            Err(error) => {
-                self.message = format!("Save failed: {error}");
-                false
-            }
-        }
-    }
-
-    fn request_quit(&mut self, force: bool) {
-        if force || !self.editor.any_dirty() {
-            self.should_quit = true;
-            return;
-        }
-
-        let dirty = self.editor.dirty_titles();
-        self.explorer_focused = false;
-        self.mode = Mode::QuitConfirm;
-        self.message = format!("{} unsaved tab(s): {}", dirty.len(), dirty.join(", "));
-    }
 }
 
 fn parse_git_hunks(diff: &str, line_count: usize) -> HashMap<usize, GitLineChange> {
@@ -7203,6 +6799,85 @@ mod tests {
         assert_eq!(app.mode, Mode::Insert);
         assert!(!app.editor.tab_dirty(0));
         assert!(app.message.contains("Closed Untitled 1"), "{}", app.message);
+    }
+
+    #[test]
+    fn deferring_an_external_change_keeps_future_saves_protected() {
+        let path = std::env::temp_dir().join(format!("caret-app-external-{}", std::process::id()));
+        std::fs::write(&path, "original").unwrap();
+        let mut app = App::new(Some(&path)).expect("create app");
+        std::fs::write(&path, "external").unwrap();
+
+        app.poll_background();
+        assert_eq!(app.mode, Mode::ReloadConfirm);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.editor.has_pending_external_change());
+        app.save_internal();
+        assert_eq!(app.mode, Mode::ReloadConfirm);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn forced_termination_preserves_a_recovery_journal_across_processes() {
+        let root =
+            std::env::temp_dir().join(format!("caret-app-recovery-process-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let journal = root.join("recovery").join("journal.json");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::recovery_child_process",
+                "--nocapture",
+            ])
+            .env("CARET_DATA_DIR", &root)
+            .env("CARET_CONFIG_DIR", root.join("config"))
+            .env("CARET_RECOVERY_CHILD", "1")
+            .spawn()
+            .expect("spawn recovery child");
+
+        for _ in 0..100 {
+            if journal.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(journal.exists(), "recovery child did not checkpoint");
+        child.kill().expect("terminate recovery child");
+        let _ = child.wait();
+
+        let entries: Vec<crate::recovery::RecoveryEntry> =
+            serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "unsaved child work");
+        let verifier = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "app::tests::recovery_child_process"])
+            .env("CARET_DATA_DIR", &root)
+            .env("CARET_CONFIG_DIR", root.join("config"))
+            .env("CARET_RECOVERY_VERIFY", "1")
+            .status()
+            .expect("start recovery verifier");
+        assert!(verifier.success(), "recovery was not discovered on startup");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_child_process() {
+        if std::env::var_os("CARET_RECOVERY_VERIFY").is_some() {
+            let app = App::new(None).expect("create recovery verifier app");
+            assert!(app.message.contains("Recovery:"), "{}", app.message);
+            return;
+        }
+        if std::env::var_os("CARET_RECOVERY_CHILD").is_none() {
+            return;
+        }
+        let mut app = App::new(None).expect("create recovery child app");
+        app.mode = Mode::Insert;
+        app.editor.insert_text("unsaved child work");
+        app.last_recovery_checkpoint = Instant::now() - Duration::from_secs(3);
+        app.handle_event(Event::Resize(80, 24));
+        std::thread::sleep(Duration::from_secs(30));
     }
 
     #[test]

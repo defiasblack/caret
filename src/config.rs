@@ -1,6 +1,5 @@
 use std::{fs, io, path::PathBuf};
 
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::document::FinalNewline;
@@ -61,7 +60,7 @@ impl StartupView {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeKind,
@@ -295,8 +294,11 @@ impl Default for Settings {
 }
 
 pub fn load() -> (Settings, Option<String>) {
-    let path = config_path();
-    let Ok(contents) = fs::read_to_string(&path) else {
+    load_at(&config_path())
+}
+
+fn load_at(path: &std::path::Path) -> (Settings, Option<String>) {
+    let Ok(contents) = fs::read_to_string(path) else {
         return (Settings::default(), None);
     };
 
@@ -317,9 +319,7 @@ pub fn save(settings: &Settings) -> io::Result<()> {
 }
 
 pub fn config_path() -> PathBuf {
-    ProjectDirs::from("com", "Caret", "Caret")
-        .map(|directories| directories.config_dir().join("config.toml"))
-        .unwrap_or_else(|| PathBuf::from("caret-config.toml"))
+    crate::platform::config_dir().join("config.toml")
 }
 
 pub fn plugins_dir() -> PathBuf {
@@ -378,5 +378,16 @@ mod tests {
         assert!(rows.iter().any(|row| row.name == "undolimit"));
         assert!(rows.iter().all(|row| !row.description.is_empty()));
         assert!(rows.iter().all(|row| !row.validation.is_empty()));
+    }
+
+    #[test]
+    fn invalid_settings_are_rejected_without_partial_state() {
+        let path =
+            std::env::temp_dir().join(format!("caret-invalid-config-{}.toml", std::process::id()));
+        fs::write(&path, "tab_width = 'not-a-number'\n").unwrap();
+        let (settings, message) = load_at(&path);
+        assert_eq!(settings, Settings::default());
+        assert!(message.is_some());
+        let _ = fs::remove_file(path);
     }
 }

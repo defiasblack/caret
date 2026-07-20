@@ -13,6 +13,12 @@
 - [x] Recovery discovery with filename/timestamp and recover/compare/discard commands
 - [x] Windows, macOS, and Linux CI build/test/diagnostic smoke matrix
 - [x] Ubuntu install and pseudo-terminal startup smoke test
+- [x] Platform replacement boundary: Windows `MoveFileExW` replacement/write-through and Unix same-directory rename
+- [x] Content fingerprints alongside timestamps and sizes for delayed/coarse filesystem metadata
+- [x] LSP stderr capture into structured diagnostics logs
+- [x] Focused application persistence/settings modules and documented reliability boundaries (`docs/ARCHITECTURE.md`)
+- [x] Automated regression coverage for interrupted/write-failure saves, permissions, encodings, Unicode display cells, long lines, empty files, invalid settings, external changes, sessions, and platform paths
+- [x] Process-level recovery test that forcibly terminates a dirty Caret instance and verifies startup recovery
 - [ ] Run the documented forced-termination smoke tests on Windows, macOS, and Linux before release (`docs/SMOKE_TEST_0.6.md`)
 
 

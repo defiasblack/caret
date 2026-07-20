@@ -98,4 +98,59 @@ mod tests {
     fn session_uses_application_data_directory() {
         assert!(session_path().ends_with("session.json"));
     }
+
+    #[test]
+    fn session_round_trip_preserves_workspace_and_view_state() {
+        let root = std::env::temp_dir().join(format!("caret-session-test-{}", std::process::id()));
+        let path = root.join("session.json");
+        let state = SessionState {
+            project_root: PathBuf::from("C:/work/project"),
+            tabs: vec![TabState {
+                path: PathBuf::from("C:/work/project/src/main.rs"),
+                cursor: CursorState {
+                    line: 7,
+                    column: 11,
+                },
+                scroll_line: 4,
+                scroll_column: 2,
+            }],
+            active_tab: 0,
+            sidebar_visible: false,
+            sidebar_outline: true,
+            split: Some(SplitState {
+                primary: ViewState {
+                    tab_index: 0,
+                    cursor: CursorState {
+                        line: 7,
+                        column: 11,
+                    },
+                    scroll_line: 4,
+                    scroll_column: 2,
+                },
+                secondary: ViewState {
+                    tab_index: 0,
+                    cursor: CursorState { line: 2, column: 3 },
+                    scroll_line: 1,
+                    scroll_column: 0,
+                },
+                secondary_active: true,
+                vertical: true,
+            }),
+        };
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        save_at(&path, &state).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let restored: SessionState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.project_root, state.project_root);
+        assert_eq!(restored.tabs[0].cursor.line, 7);
+        assert!(restored.split.as_ref().unwrap().vertical);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn save_at(path: &std::path::Path, session: &SessionState) -> io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(session)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        document::atomic_write(path, &bytes)
+    }
 }

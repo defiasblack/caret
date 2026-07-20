@@ -26,8 +26,18 @@ pub fn append(level: &str, message: &str) -> io::Result<()> {
             .create(true)
             .append(true)
             .open(path)?,
-        "{{\"timestamp\":{timestamp},\"level\":{level:?},\"message\":{message:?}}}"
+        "{}",
+        format_record(timestamp, level, message)
     )
+}
+
+fn format_record(timestamp: u64, level: &str, message: &str) -> String {
+    serde_json::json!({
+        "timestamp": timestamp,
+        "level": level,
+        "message": message,
+    })
+    .to_string()
 }
 
 pub fn report(version: &str) -> String {
@@ -41,8 +51,20 @@ pub fn report(version: &str) -> String {
     } else {
         "unavailable (internal clipboard remains available)"
     };
+    let (settings, config_error) = crate::config::load();
+    let configuration = config_error.map_or_else(
+        || {
+            format!(
+                "valid · theme={} · keymap={} · startup={}",
+                settings.theme.name(),
+                settings.keymap.name(),
+                settings.startup.name()
+            )
+        },
+        |error| format!("invalid · {error}"),
+    );
     format!(
-        "Caret diagnostic report\nversion: {version}\nos: {} {}\nterminal: {terminal}\nterminal color: {color}\nshell: {shell}\nconfig: {}\nrecovery: {}\nlog: {}\nclipboard: {clipboard}",
+        "Caret diagnostic report\nversion: {version}\nos: {} {}\nterminal: {terminal}\nterminal color: {color}\nshell: {shell}\nconfig: {} ({configuration})\nrecovery: {}\nlog: {}\nlsp stderr: structured records in log\nclipboard: {clipboard}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         crate::config::config_path().display(),
@@ -61,5 +83,15 @@ mod tests {
         assert!(report.contains("version: test"));
         assert!(report.contains("os:"));
         assert!(report.contains("clipboard:"));
+        assert!(report.contains("configuration") || report.contains("config:"));
+    }
+
+    #[test]
+    fn log_records_are_valid_structured_json() {
+        let value: serde_json::Value =
+            serde_json::from_str(&format_record(123, "lsp", "server failed")).unwrap();
+        assert_eq!(value["timestamp"], 123);
+        assert_eq!(value["level"], "lsp");
+        assert_eq!(value["message"], "server failed");
     }
 }
