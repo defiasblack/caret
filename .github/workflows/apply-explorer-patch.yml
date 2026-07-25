@@ -35,7 +35,7 @@ jobs:
       - name: Apply patch
         run: git apply /tmp/explorer-upgrade.patch
 
-      - name: Apply Clippy correction
+      - name: Apply Clippy corrections
         shell: bash
         run: |
           python3 <<'PY'
@@ -48,7 +48,7 @@ jobs:
               "sync::mpsc::{self, Receiver, Sender}",
               1,
           )
-          old = (
+          old_try_recv = (
               "    fn try_recv(&self) -> Option<ExplorerEvent> {\n"
               "        match self.events.try_recv() {\n"
               "            Ok(event) => Some(event),\n"
@@ -56,14 +56,35 @@ jobs:
               "        }\n"
               "    }"
           )
-          new = (
+          new_try_recv = (
               "    fn try_recv(&self) -> Option<ExplorerEvent> {\n"
               "        self.events.try_recv().ok()\n"
               "    }"
           )
-          if old not in text:
+          if old_try_recv not in text:
               raise SystemExit("expected try_recv implementation not found")
-          path.write_text(text.replace(old, new, 1))
+          text = text.replace(old_try_recv, new_try_recv, 1)
+
+          old_error = (
+              "    Err(io::Error::new(\n"
+              "        io::ErrorKind::Other,\n"
+              "        if message.is_empty() {\n"
+              "            \"git status failed without an error message\".to_string()\n"
+              "        } else {\n"
+              "            message\n"
+              "        },\n"
+              "    ))"
+          )
+          new_error = (
+              "    Err(io::Error::other(if message.is_empty() {\n"
+              "        \"git status failed without an error message\".to_string()\n"
+              "    } else {\n"
+              "        message\n"
+              "    }))"
+          )
+          if old_error not in text:
+              raise SystemExit("expected io::Error::new block not found")
+          path.write_text(text.replace(old_error, new_error, 1))
           PY
 
       - name: Verify synchronous tree Git refresh was removed
