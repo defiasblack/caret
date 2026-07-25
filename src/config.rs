@@ -27,7 +27,7 @@ impl KeymapProfile {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Caret => "Insert-first with fast Normal-mode commands",
+            Self::Caret => "Recommended; typing always inserts text",
             Self::Vim => "Modal editing; files open in Normal mode",
             Self::Conventional => "Always typing; familiar Ctrl shortcuts",
         }

@@ -11,7 +11,7 @@ use crossterm::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, BackgroundState, HoverTarget, Mode, SidebarView},
+    app::{App, BackgroundState, HoverTarget, Mode, SidebarView, COMMAND_PALETTE_ROWS},
     config::KeymapProfile,
     editor::display_width,
     project::GitStatus,
@@ -335,6 +335,52 @@ fn effective_sidebar_width(app: &App, terminal_width: u16) -> usize {
     app.project.width.clamp(22, maximum)
 }
 
+/// Everything in `title_bar_right` except the project name.
+const TITLE_BAR_RIGHT_FIXED: u16 = 47;
+/// Columns the left half needs before `[FILES]` is fully drawn.
+const TITLE_BAR_FILES_END: u16 = 18;
+
+/// The right-aligned segment of the title bar.  `title_bar_targets` hard-codes
+/// offsets into this string, and a test pins the two together.
+fn title_bar_right(root: &str) -> String {
+    format!(" {root}  │ [Themes] │ [Command] │ [F1 Help] │ [Quit] ")
+}
+
+/// The clickable controls in the title bar.  Drawing, hover, and click
+/// handling all read this one table so the hit zones cannot drift from what
+/// is actually painted.
+///
+/// `fit_bar` right-aligns the trailing segment and truncates the title to
+/// fit, so a control is only where these offsets claim while the segment
+/// still fits: on a narrow terminal the entries are dropped rather than
+/// pointing at whatever ended up in that column.
+fn title_bar_targets(width: u16, root_width: u16) -> Vec<(HoverTarget, u16, &'static str)> {
+    let right_width = root_width.saturating_add(TITLE_BAR_RIGHT_FIXED);
+    let mut targets = Vec::with_capacity(5);
+
+    if width >= right_width.saturating_add(TITLE_BAR_FILES_END) {
+        targets.push((HoverTarget::Files, 11, "[FILES]"));
+    }
+    if width > right_width {
+        targets.extend([
+            (HoverTarget::Themes, width - 42, "[Themes]"),
+            (HoverTarget::Command, width - 31, "[Command]"),
+            (HoverTarget::Help, width - 19, "[F1 Help]"),
+            (HoverTarget::Quit, width - 7, "[Quit]"),
+        ]);
+    }
+    targets
+}
+
+/// The title-bar control under a column, or `None` for the gaps between them.
+pub fn title_bar_target_at(app: &App, width: u16, column: u16) -> Option<HoverTarget> {
+    let root_width = UnicodeWidthStr::width(app.project.root_name().as_str()) as u16;
+    title_bar_targets(width, root_width)
+        .into_iter()
+        .find(|(_, x, label)| column >= *x && column < x.saturating_add(label.len() as u16))
+        .map(|(target, _, _)| target)
+}
+
 fn draw_top_bar<W: Write>(out: &mut W, app: &App, width: u16) -> io::Result<()> {
     let filename = app
         .editor
@@ -352,10 +398,8 @@ fn draw_top_bar<W: Write>(out: &mut W, app: &App, width: u16) -> io::Result<()> 
         format!("  › {breadcrumb}")
     };
     let title = format!("  CARET  │ [FILES] │  {filename}{dirty}{location}");
-    let right = format!(
-        " {}  │ [Themes] │ [F1 Help] │ [Quit] ",
-        app.project.root_name()
-    );
+    let root = app.project.root_name();
+    let right = title_bar_right(&root);
 
     queue!(
         out,
@@ -367,12 +411,8 @@ fn draw_top_bar<W: Write>(out: &mut W, app: &App, width: u16) -> io::Result<()> 
         SetAttribute(Attribute::Reset)
     )?;
 
-    for (target, x, label) in [
-        (HoverTarget::Files, 11u16, "[FILES]"),
-        (HoverTarget::Themes, width.saturating_sub(30), "[Themes]"),
-        (HoverTarget::Help, width.saturating_sub(19), "[F1 Help]"),
-        (HoverTarget::Quit, width.saturating_sub(7), "[Quit]"),
-    ] {
+    let root_width = UnicodeWidthStr::width(root.as_str()) as u16;
+    for (target, x, label) in title_bar_targets(width, root_width) {
         if app.hover_target == Some(target) {
             queue!(
                 out,
@@ -2386,6 +2426,27 @@ pub fn theme_gallery_contains(app: &App, width: u16, height: u16, column: u16, r
         && row < y.saturating_add((visible_rows + 4) as u16)
 }
 
+/// Rows above the list inside the palette: blank, title, search field,
+/// separator.
+const PALETTE_LIST_TOP: u16 = 4;
+/// The list rows plus `PALETTE_LIST_TOP` and the footer.
+const PALETTE_CHROME_ROWS: usize = PALETTE_LIST_TOP as usize + 2;
+
+/// `(x, y, panel_width, visible_rows, first_index)` for the command palette.
+fn command_palette_geometry(app: &App, width: u16, height: u16) -> (u16, u16, usize, usize, usize) {
+    let total = app.command_suggestions().len();
+    let panel_width = 74usize.min(width.saturating_sub(4) as usize);
+    let visible_rows = total
+        .min(COMMAND_PALETTE_ROWS)
+        .min((height as usize).saturating_sub(PALETTE_CHROME_ROWS + 2))
+        .max(1);
+    let panel_height = visible_rows + PALETTE_CHROME_ROWS;
+    let first = command_suggestion_window_start(total, app.command_suggestion_scroll, visible_rows);
+    let x = width.saturating_sub(panel_width as u16) / 2;
+    let y = height.saturating_sub(panel_height as u16) / 2;
+    (x, y, panel_width, visible_rows, first)
+}
+
 fn draw_command_palette<W: Write>(
     out: &mut W,
     app: &App,
@@ -2395,23 +2456,87 @@ fn draw_command_palette<W: Write>(
     if app.mode != Mode::Command {
         return Ok(());
     }
-    let suggestions = app.command_suggestions();
-    let rows = suggestions.len().min(8);
-    let first_suggestion =
-        command_suggestion_window_start(suggestions.len(), app.command_suggestion_scroll, rows);
-    let panel_width = 30usize.min(width.saturating_sub(2) as usize);
-    let start_row = height.saturating_sub(2 + rows as u16);
-    for (row, (index, command)) in suggestions
-        .into_iter()
+
+    let (x, y, panel_width, visible_rows, first) = command_palette_geometry(app, width, height);
+    let matches = app.command_matches();
+    let inner = panel_width.saturating_sub(4);
+    let panel_height = visible_rows + PALETTE_CHROME_ROWS;
+
+    for row in 0..panel_height {
+        queue!(
+            out,
+            MoveTo(x, y + row as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(panel_width))
+        )?;
+    }
+
+    queue!(
+        out,
+        MoveTo(x + 2, y + 1),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print(pad_or_truncate("COMMAND PALETTE", inner)),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    // The search field, styled like the prompt bar so it reads as an input.
+    // Empty shows a placeholder; the cursor sits just after the "> " prefix.
+    let empty = app.command_input.is_empty();
+    let field = if empty {
+        "> Type a command name".to_string()
+    } else {
+        format!("> {}", app.command_input)
+    };
+    queue!(
+        out,
+        MoveTo(x + 2, y + 2),
+        SetBackgroundColor(app.theme.prompt_bar),
+        SetForegroundColor(if empty {
+            app.theme.muted
+        } else {
+            app.theme.prompt_text
+        }),
+        Print(pad_or_truncate(&field, inner)),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.muted),
+        MoveTo(x + 2, y + 3),
+        Print("─".repeat(inner))
+    )?;
+
+    if matches.is_empty() {
+        queue!(
+            out,
+            MoveTo(x + 2, y + PALETTE_LIST_TOP),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.muted),
+            Print(pad_or_truncate("No commands match", inner))
+        )?;
+    }
+
+    for (row, (index, entry)) in matches
+        .iter()
         .enumerate()
-        .skip(first_suggestion)
-        .take(rows)
+        .skip(first)
+        .take(visible_rows)
         .enumerate()
     {
         let selected = index == app.command_suggestion;
+        let left = format!(
+            "{} {:<20} {}",
+            if selected { "▶" } else { " " },
+            format!(":{}", entry.name),
+            entry.description
+        );
+        let right = entry
+            .chord
+            .as_ref()
+            .map_or_else(String::new, |chord| format!("{chord} "));
+
         queue!(
             out,
-            MoveTo(1, start_row + row as u16),
+            MoveTo(x + 2, y + PALETTE_LIST_TOP + row as u16),
             SetBackgroundColor(if selected {
                 app.theme.command_mode
             } else {
@@ -2422,9 +2547,27 @@ fn draw_command_palette<W: Write>(
             } else {
                 app.theme.overlay_text
             }),
-            Print(pad_or_truncate(&format!("  :{command}"), panel_width))
+            Print(fit_bar(&left, &right, inner))
         )?;
     }
+
+    let counter = if matches.is_empty() {
+        String::new()
+    } else {
+        format!("{} of {} ", app.command_suggestion + 1, matches.len())
+    };
+    queue!(
+        out,
+        MoveTo(x + 2, y + panel_height as u16 - 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.muted),
+        Print(fit_bar(
+            "↑↓ select · Enter run · Esc cancel",
+            &counter,
+            inner
+        ))
+    )?;
+
     Ok(())
 }
 
@@ -2443,19 +2586,17 @@ pub fn command_suggestion_at(
     column: u16,
     row: u16,
 ) -> Option<usize> {
-    if app.mode != Mode::Command
-        || column == 0
-        || column as usize > 30usize.min(width.saturating_sub(2) as usize)
-    {
+    if app.mode != Mode::Command {
         return None;
     }
-    let suggestions = app.command_suggestions();
-    let rows = suggestions.len().min(8);
-    let first_suggestion =
-        command_suggestion_window_start(suggestions.len(), app.command_suggestion_scroll, rows);
-    let start = height.saturating_sub(2 + rows as u16);
-    if row >= start && row < start.saturating_add(rows as u16) {
-        Some(first_suggestion + (row - start) as usize)
+    let (x, y, panel_width, visible_rows, first) = command_palette_geometry(app, width, height);
+    if column < x || column >= x.saturating_add(panel_width as u16) {
+        return None;
+    }
+    let start = y.saturating_add(PALETTE_LIST_TOP);
+    if row >= start && row < start.saturating_add(visible_rows as u16) {
+        let index = first + (row - start) as usize;
+        (index < app.command_suggestions().len()).then_some(index)
     } else {
         None
     }
@@ -2468,8 +2609,10 @@ fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             app.theme.prompt_bar,
             app.theme.prompt_text,
         ),
+        // The palette owns the input now, so the bar carries the hint instead
+        // of repeating what is already on screen.
         Mode::Command => (
-            format!(":{}", app.command_input),
+            " Type to filter · Enter runs · Esc cancels".to_string(),
             app.theme.prompt_bar,
             app.theme.prompt_text,
         ),
@@ -2756,7 +2899,9 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
     }
 
     match (app.mode, app.keymap_profile()) {
-        (Mode::Insert, KeymapProfile::Conventional) => &[
+        // The non-modal profiles never leave Insert, so this row must not
+        // promise an Esc that returns to Normal mode.
+        (Mode::Insert, KeymapProfile::Caret | KeymapProfile::Conventional) => &[
             ("Ctrl-S", "Save"),
             ("Ctrl-F", "Find"),
             ("Ctrl-Z/Y", "Undo/Redo"),
@@ -3149,11 +3294,14 @@ fn place_cursor<W: Write>(
     }
 
     if app.mode == Mode::Command {
+        // Inside the palette's search field: panel edge, 2 columns of padding,
+        // then the "> " prefix.
+        let (panel_x, panel_y, ..) = command_palette_geometry(app, terminal_width, terminal_height);
         let typed = &app.command_input[..app.command_cursor()];
-        let x = (1 + UnicodeWidthStr::width(typed)).min(terminal_width.saturating_sub(1) as usize)
-            as u16;
+        let x = (panel_x as usize + 4 + UnicodeWidthStr::width(typed))
+            .min(terminal_width.saturating_sub(1) as usize) as u16;
 
-        return queue!(out, MoveTo(x, terminal_height - 2), Show);
+        return queue!(out, MoveTo(x, panel_y + 2), Show);
     }
 
     if app.mode == Mode::Search {
@@ -3247,6 +3395,52 @@ mod tests {
         }
     }
 
+    /// The offsets in `title_bar_targets` are hand-counted from
+    /// `title_bar_right`, so pin them to what is actually drawn -- otherwise
+    /// editing a label silently moves every click zone to its right.
+    #[test]
+    fn title_bar_controls_are_clickable_where_they_are_drawn() {
+        for root in ["caret", "a-rather-long-project-name"] {
+            for width in [80u16, 100, 200] {
+                let right = title_bar_right(root);
+                let bar = fit_bar("  CARET  │ [FILES] │  main.rs", &right, width as usize);
+                let columns: Vec<char> = bar.chars().collect();
+                assert_eq!(columns.len(), width as usize, "bar should fill the width");
+
+                let root_width = UnicodeWidthStr::width(root) as u16;
+                let targets = title_bar_targets(width, root_width);
+                assert!(!targets.is_empty(), "{width} wide should have controls");
+
+                for (target, x, label) in targets {
+                    let start = x as usize;
+                    let end = start + label.chars().count();
+                    let drawn: String = columns[start..end].iter().collect();
+                    assert_eq!(
+                        drawn, label,
+                        "{target:?} is not drawn at {x} ({width} wide, root {root:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Below this the trailing segment no longer fits, so the offsets would
+    /// point at whatever happened to land in that column.
+    #[test]
+    fn title_bar_controls_are_dropped_when_they_do_not_fit() {
+        assert!(title_bar_targets(44, 5).is_empty());
+        assert!(title_bar_targets(60, 40).is_empty());
+
+        // FILES goes first: the title is truncated before the right segment is.
+        let cramped = title_bar_targets(60, 5);
+        assert!(!cramped
+            .iter()
+            .any(|(target, _, _)| *target == HoverTarget::Files));
+        assert!(cramped
+            .iter()
+            .any(|(target, _, _)| *target == HoverTarget::Command));
+    }
+
     #[test]
     fn truncation_respects_wide_unicode_cells() {
         let rendered = pad_or_truncate("a界b", 3);
@@ -3276,8 +3470,95 @@ mod tests {
         app.command_suggestion = 8;
         app.command_suggestion_scroll = 1;
 
-        assert_eq!(command_suggestion_at(&app, 80, 24, 1, 14), Some(1));
-        assert_eq!(command_suggestion_at(&app, 80, 24, 1, 21), Some(8));
+        let (x, y, panel_width, visible_rows, first) = command_palette_geometry(&app, 80, 24);
+        assert_eq!(first, 1, "scroll should offset the window");
+        let inside = x + panel_width as u16 / 2;
+        let list_top = y + PALETTE_LIST_TOP;
+
+        assert_eq!(
+            command_suggestion_at(&app, 80, 24, inside, list_top),
+            Some(1)
+        );
+        assert_eq!(
+            command_suggestion_at(&app, 80, 24, inside, list_top + visible_rows as u16 - 1),
+            Some(first + visible_rows - 1)
+        );
+
+        // Outside the panel and above the list are both misses.
+        assert_eq!(
+            command_suggestion_at(&app, 80, 24, x.saturating_sub(1), list_top),
+            None
+        );
+        assert_eq!(
+            command_suggestion_at(&app, 80, 24, inside, list_top - 1),
+            None
+        );
+    }
+
+    #[test]
+    fn command_palette_is_centred_and_fits_the_terminal() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::Command;
+
+        for (width, height) in [(80u16, 24u16), (120, 40), (60, 14)] {
+            let (x, y, panel_width, visible_rows, _) =
+                command_palette_geometry(&app, width, height);
+            let panel_height = visible_rows + PALETTE_CHROME_ROWS;
+
+            assert!(visible_rows >= 1, "{width}x{height} should show a row");
+            assert!(
+                x as usize + panel_width <= width as usize,
+                "panel overflows {width}x{height}"
+            );
+            assert!(
+                y as usize + panel_height <= height as usize,
+                "panel is taller than {width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_palette_lists_chords_beside_the_commands_that_share_them() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::Command;
+        app.command_input = "w".to_string();
+
+        let save = app
+            .command_matches()
+            .into_iter()
+            .find(|entry| entry.name == "w")
+            .expect(":w should match the query \"w\"");
+
+        assert_eq!(save.description, "Save the current file");
+        let expected = if cfg!(target_os = "macos") {
+            "⌃S"
+        } else {
+            "Ctrl+S"
+        };
+        assert_eq!(save.chord.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn command_palette_matches_descriptions_after_names() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::Command;
+        // "quit" is the description of :q and the name of nothing.
+        app.command_input = "quit".to_string();
+
+        let matches = app.command_matches();
+        assert!(
+            matches.iter().any(|entry| entry.name == "q"),
+            "description matches should be reachable"
+        );
+
+        // A name match must outrank a description-only match.
+        app.command_input = "theme".to_string();
+        let matches = app.command_matches();
+        assert!(
+            matches[0].name.contains("theme"),
+            "name match should sort first, got {:?}",
+            matches[0].name
+        );
     }
 
     #[test]

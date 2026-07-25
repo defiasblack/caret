@@ -140,7 +140,52 @@ structure and change state remain easy to read.
 
 ## Editor keys
 
-### Normal mode
+Caret ships three keymap profiles, switched with `:keymap <name>` or the
+`:keymaps` gallery:
+
+| Profile | Input model |
+|---|---|
+| `caret` (default) | Typing always inserts text; commands are chords |
+| `conventional` | Same input model, familiar graphical-editor shortcuts |
+| `vim` | Modal; files open in Normal mode |
+
+**Normal mode belongs to the `vim` profile only.** On the default profile
+there is no mode to fall into: `Esc` clears the selection and leaves you
+typing, so a stray `o` or `i` can never open a line or swallow the rest of
+a word.
+
+### Editing keys
+
+| Key | Action |
+|---|---|
+| `Esc` | Clear the selection (`vim`: return to Normal mode) |
+| `Ctrl-s` | Save |
+| `Ctrl-q` | Quit |
+| `Ctrl-z` / `Ctrl-y` | Undo / redo |
+| `Tab` | Insert spaces using current tab width |
+| `F7` | Duplicate current line |
+| `F9` / `Shift-F9` / `Ctrl-F9` | Fold at cursor / fold all / unfold all |
+| `F4` + register | Start recording a macro (`F4` again stops) |
+| `Shift-F4` + register | Replay a recorded macro |
+| `Alt-Up` / `Alt-Down` | Move current line up / down |
+| `Ctrl-J` | Join current line with the next line |
+| `Ctrl-/` | Toggle comments using the active file's language |
+| `Ctrl-D` | Select the next occurrence of the current word or selection |
+| `(`, `[`, `{`, `'`, `"` | Insert a matching pair; typing its closer skips over it |
+| `Backspace` | Remove an empty matching pair together |
+| `Ctrl` + Left / Right | Move to previous / next word |
+| `Ctrl` + `Shift` + Left / Right | Select previous / next word |
+| `Shift` + arrows / Home / End | Select text with the keyboard |
+| Double-click | Select the clicked word |
+| Drag with left mouse button | Select text with the mouse |
+| `Ctrl-C` / `Ctrl-X` / `Ctrl-V` | Copy / cut / paste selected text |
+| `Delete` / `Backspace` | Delete selected text |
+
+The chords backed by named actions are rebindable with `:bind` and
+`:unbind`; `:keybindings` lists every binding for the active profile,
+rebindable or fixed.
+
+### Normal mode (`vim` profile)
 
 | Key | Action |
 |---|---|
@@ -170,26 +215,6 @@ structure and change state remain easy to read.
 | `:` | Command prompt |
 | `F1` | Help |
 
-### Insert mode
-
-| Key | Action |
-|---|---|
-| `Esc` | Return to Normal mode |
-| `Ctrl-s` | Save |
-| `Ctrl-q` | Quit |
-| `Tab` | Insert spaces using current tab width |
-| `F7` | Duplicate current line and remain in Insert mode |
-| `(`, `[`, `{`, `'`, `"` | Insert a matching pair; typing its closer skips over it |
-| `Backspace` | Remove an empty matching pair together |
-| `Ctrl` + Left / Right | Move to previous / next word |
-| `Ctrl` + `Shift` + Left / Right | Select previous / next word |
-| Double-click | Select the clicked word |
-| `Shift` + arrows / Home / End | Select text with the keyboard |
-| Drag with left mouse button | Select text with the mouse |
-| `Ctrl-C` / `Ctrl-X` / `Ctrl-V` | Copy / cut / paste selected text |
-| `Ctrl-D` | Select the next occurrence of the current word or selection |
-| `Delete` / `Backspace` | Delete selected text |
-
 ## Startup
 
 Running `caret` with no arguments opens the current directory's file tree.
@@ -207,6 +232,12 @@ hidden. Toggle the tree at any time with `:tree`.
 Open the welcome dashboard at any time with `:welcome`.
 
 ## Commands
+
+`Ctrl-Shift-P`, or the `[Command]` control in the title bar, opens the command
+palette: type to filter, arrows to select, Enter to run. Each row shows what
+the command does and the chord that runs the same thing directly, so the
+palette doubles as a way to learn the shortcuts. Filtering matches
+descriptions as well as names — typing `quit` finds `:q`.
 
 | Command | Action |
 |---|---|

@@ -47,6 +47,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   undo depth) now apply to every open tab and propagate to new tabs
 - Settings are never written by the test suite, protecting the user's
   real configuration file during development
+- **Breaking:** the Caret profile is no longer modal. Previously Esc left
+  Insert mode and Normal mode ran Vim's bare-letter commands, so typing an
+  ordinary word could run motions and then hit `o`, `i`, or `a` -- which
+  opened a line, switched to Insert, and silently typed the rest of the
+  word into the document. Esc now clears the selection and stays in Insert,
+  and printable keys always insert text. Normal mode is a Vim-profile
+  concept only; run :keymap vim for the previous behaviour
+- Folds and macros are rebindable actions reachable without Normal mode:
+  F9 toggles a fold, Shift-F9 folds all, Ctrl-F9 unfolds all, F4 starts
+  and stops macro recording, Shift-F4 replays. The Vim profile keeps
+  zc/zo/za/zM/zR and q/@ as well
+- The keybinding browser and help no longer advertise Vim commands
+  (dd, yy, hjkl) to the non-modal profiles, and describe Esc and Tab
+  according to the active profile
+- The command palette is a centred modal: a search field at the top, the
+  matching commands listed with a plain-English description, and the chord
+  that runs the same thing right-aligned beside each one. It filters on
+  descriptions as well as names, so "quit" finds :q, with name matches
+  always ranked first. Replaces the unlabelled 30-column strip of command
+  names that used to sit above the status bar
+- A clickable [Command] control in the title bar, beside [F1 Help],
+  opens the command palette -- previously the `:` prompt was only
+  reachable from Normal mode, which the non-modal profiles never enter.
+  The hotkey row for those profiles now shows Ctrl-Shift-P Command
+  instead of an Esc that no longer returns to Normal mode
+- Title-bar hit zones are derived from the same table that draws them,
+  and are dropped on terminals too narrow to render the controls where
+  the offsets claim
 
 ## 0.5.0
 

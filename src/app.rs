@@ -56,6 +56,20 @@ pub enum Mode {
     Dashboard,
 }
 
+/// Rows the command palette shows at once.  The drawing code and
+/// `ensure_command_suggestion_visible` must agree or the selected row scrolls
+/// out of the window it is being kept inside.
+pub const COMMAND_PALETTE_ROWS: usize = 8;
+
+/// One row in the command palette.
+#[derive(Debug, Clone)]
+pub struct CommandEntry {
+    pub name: String,
+    pub description: String,
+    /// The chord that runs the same thing without opening the palette.
+    pub chord: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoverTarget {
     Files,
@@ -1126,17 +1140,8 @@ impl App {
             return false;
         };
         let layout = crate::ui::screen_layout(self, width, height);
-        let target = if row == 0 && (9..=17).contains(&column) {
-            Some(HoverTarget::Files)
-        } else if row == 0 && column >= width.saturating_sub(8) {
-            Some(HoverTarget::Quit)
-        } else if row == 0
-            && column >= width.saturating_sub(30)
-            && column < width.saturating_sub(20)
-        {
-            Some(HoverTarget::Themes)
-        } else if row == 0 && column >= width.saturating_sub(20) {
-            Some(HoverTarget::Help)
+        let target = if row == 0 {
+            crate::ui::title_bar_target_at(self, width, column)
         } else if row == layout.hotkey_row
             && crate::ui::hotkey_action_at(self, width, column) == Some("Command")
         {
@@ -1339,27 +1344,26 @@ impl App {
             return;
         }
 
-        // The FILES item in the title bar is a clickable explorer toggle.
-        if row == 0 && (9..=17).contains(&column) {
-            self.toggle_file_tree();
-            return;
-        }
-
-        // Top-right controls are always available, including in Insert mode.
-        if row == 0 && column >= width.saturating_sub(8) {
-            self.request_quit(false);
-            return;
-        }
-
-        if row == 0 && column >= width.saturating_sub(30) && column < width.saturating_sub(20) {
-            self.explorer_focused = false;
-            self.open_theme_gallery();
-            return;
-        }
-
-        if row == 0 && column >= width.saturating_sub(20) {
-            self.explorer_focused = false;
-            self.open_help();
+        // Title-bar controls are always available, including while typing.
+        if row == 0 {
+            let target = crate::ui::title_bar_target_at(self, width, column);
+            match target {
+                Some(HoverTarget::Files) => self.toggle_file_tree(),
+                Some(HoverTarget::Themes) => {
+                    self.explorer_focused = false;
+                    self.open_theme_gallery();
+                }
+                Some(HoverTarget::Command) => {
+                    self.explorer_focused = false;
+                    self.open_command_palette();
+                }
+                Some(HoverTarget::Help) => {
+                    self.explorer_focused = false;
+                    self.open_help();
+                }
+                Some(HoverTarget::Quit) => self.request_quit(false),
+                None => {}
+            }
             return;
         }
 
@@ -2167,9 +2171,14 @@ impl App {
     }
 
     fn is_macro_stop_key(&self, key: KeyEvent) -> bool {
-        !self.replaying_macro
-            && self.recording_macro.is_some()
-            && self.is_plain_normal_key(key, 'q')
+        if self.replaying_macro || self.recording_macro.is_none() {
+            return false;
+        }
+        // Checked before the recorder appends the key, so the stop key itself
+        // never lands in the macro.  The bound chord doubles as the stop key
+        // for the non-modal profiles, which never reach Normal-mode `q`.
+        self.is_plain_normal_key(key, 'q')
+            || self.keys.action_for(key) == Some(KeyAction::RecordMacro)
     }
 
     fn handle_macro_prefix(&mut self, key: KeyEvent) -> bool {
@@ -2186,8 +2195,15 @@ impl App {
             MacroPrefix::Record => {
                 self.recording_macro = Some(register);
                 self.macros.insert(register, Vec::new());
-                self.message =
-                    format!("Recording macro @{register}; press q in Normal mode to stop");
+                let stop = if self.settings.keymap == KeymapProfile::Vim {
+                    "press q in Normal mode".to_string()
+                } else {
+                    self.keys.chord_for(KeyAction::RecordMacro).map_or_else(
+                        || "press q".to_string(),
+                        |chord| format!("press {}", chord.display()),
+                    )
+                };
+                self.message = format!("Recording macro @{register}; {stop} to stop");
             }
             MacroPrefix::Replay => {
                 if let Some(recording) = self.recording_macro.filter(|_| !self.replaying_macro) {
@@ -2428,6 +2444,19 @@ impl App {
                     self.split_views = Some(views);
                     self.activate_focused_view();
                 }
+            }
+            KeyAction::ToggleFold => self.toggle_fold(),
+            KeyAction::FoldAll => self.close_all_folds(),
+            KeyAction::UnfoldAll => self.open_all_folds(),
+            // Stopping a recording is intercepted by is_macro_stop_key before
+            // this runs, so reaching here always means "start".
+            KeyAction::RecordMacro => {
+                self.macro_prefix = Some(MacroPrefix::Record);
+                self.message = "Record macro: choose a register".to_string();
+            }
+            KeyAction::ReplayMacro => {
+                self.macro_prefix = Some(MacroPrefix::Replay);
+                self.message = "Replay macro: choose a register".to_string();
             }
         }
     }
@@ -3565,11 +3594,11 @@ impl App {
             return;
         }
 
-        // Conventional mode is intentionally non-modal. If an overlay or
-        // explorer action left the editor in Normal mode, printable input
-        // still behaves like a regular text field instead of running a Vim
-        // command by surprise.
-        if self.settings.keymap == KeymapProfile::Conventional
+        // Only the Vim profile is modal.  Everywhere else, printable input
+        // behaves like a regular text field instead of running a Vim command
+        // by surprise -- notably `o`, `i`, and `a`, which would otherwise
+        // switch to Insert mode mid-word and silently swallow the rest of it.
+        if self.settings.keymap != KeymapProfile::Vim
             && matches!(key.code, KeyCode::Char(_))
             && key.modifiers.is_empty()
         {
@@ -3796,7 +3825,7 @@ impl App {
                 self.command_selection = None;
                 self.command_anchor = None;
                 self.editor.finish_undo_group();
-                if self.settings.keymap == KeymapProfile::Conventional {
+                if self.settings.keymap != KeymapProfile::Vim {
                     self.editor.clear_selection();
                     self.mode = Mode::Insert;
                     self.message = "Selection cleared".to_string();
@@ -4776,7 +4805,7 @@ impl App {
     }
 
     fn ensure_command_suggestion_visible(&mut self) {
-        const VISIBLE_ROWS: usize = 8;
+        const VISIBLE_ROWS: usize = COMMAND_PALETTE_ROWS;
 
         let total = self.command_suggestions().len();
         if total == 0 {
@@ -4821,123 +4850,230 @@ impl App {
         }
     }
 
-    pub fn command_suggestions(&self) -> Vec<String> {
-        const COMMANDS: &[&str] = &[
-            "w",
-            "wa",
-            "q",
-            "q!",
-            "wq",
-            "e",
-            "new",
-            "tabnew",
-            "tabnext",
+    /// Every `:` command the palette offers: the text to type, what it does,
+    /// and the rebindable action that runs the same thing directly. Keeping
+    /// all three in one table stops the palette, its descriptions, and the
+    /// chords it advertises from drifting apart.
+    const COMMAND_CATALOG: &'static [(&'static str, &'static str, Option<KeyAction>)] = &[
+        ("w", "Save the current file", Some(KeyAction::Save)),
+        ("wa", "Save every modified tab", None),
+        ("q", "Quit", Some(KeyAction::Quit)),
+        ("q!", "Quit and discard unsaved changes", None),
+        ("wq", "Save and quit", None),
+        ("e", "Open a file or folder", None),
+        ("new", "Create a new buffer", None),
+        ("tabnew", "Open a new tab", Some(KeyAction::NewTab)),
+        ("tabnext", "Go to the next tab", Some(KeyAction::NextTab)),
+        (
             "tabprev",
+            "Go to the previous tab",
+            Some(KeyAction::PrevTab),
+        ),
+        (
             "tree",
-            "newfile",
-            "newdir",
-            "rename",
-            "copy",
-            "move",
-            "delete",
-            "delete!",
-            "refresh",
-            "gitrefresh",
-            "stage",
-            "unstage",
-            "diff",
-            "history",
-            "symbols",
+            "Show or hide the project tree",
+            Some(KeyAction::ToggleTree),
+        ),
+        ("newfile", "Create a file in the tree", None),
+        ("newdir", "Create a directory in the tree", None),
+        ("rename", "Rename the selected file", None),
+        ("copy", "Copy the selected file", None),
+        ("move", "Move the selected file", None),
+        ("delete", "Delete the selected file", None),
+        ("delete!", "Delete without confirmation", None),
+        ("refresh", "Refresh the project tree", None),
+        ("gitrefresh", "Refresh Git status badges", None),
+        ("stage", "Stage the current file", None),
+        ("unstage", "Unstage the current file", None),
+        ("diff", "Show the Git diff for this file", None),
+        ("history", "Browse this file's Git history", None),
+        ("symbols", "Browse document symbols", None),
+        (
             "outline",
-            "split",
-            "vsplit",
-            "only",
-            "unsplit",
-            "terminal",
-            "terminalfocus",
-            "terminalclose",
-            "plugins",
-            "doctor",
-            "copydiagnostics",
-            "recover",
-            "recovercompare",
-            "discardrecovery",
-            "plugin",
-            "pluginreload",
-            "plugindir",
-            "fold",
-            "foldopen",
-            "foldall",
-            "unfoldall",
-            "format",
-            "lsp",
-            "lspstop",
+            "Toggle the symbol outline",
+            Some(KeyAction::ToggleOutline),
+        ),
+        ("split", "Split the view horizontally", None),
+        ("vsplit", "Split the view vertically", None),
+        ("only", "Close the other split pane", None),
+        ("unsplit", "Close the split", None),
+        ("terminal", "Open the integrated shell", None),
+        ("terminalfocus", "Focus the integrated shell", None),
+        ("terminalclose", "Close the integrated shell", None),
+        ("plugins", "List installed plugins", None),
+        ("doctor", "Show the support diagnostic report", None),
+        ("copydiagnostics", "Copy the diagnostic report", None),
+        ("recover", "Restore a crash-recovery snapshot", None),
+        ("recovercompare", "Compare a recovery snapshot", None),
+        ("discardrecovery", "Discard recovery snapshots", None),
+        ("plugin", "Run a plugin command", None),
+        ("pluginreload", "Reload plugins from disk", None),
+        ("plugindir", "Show the plugin directory", None),
+        ("fold", "Fold at the cursor", Some(KeyAction::ToggleFold)),
+        ("foldopen", "Unfold at the cursor", None),
+        ("foldall", "Fold everything", Some(KeyAction::FoldAll)),
+        ("unfoldall", "Unfold everything", Some(KeyAction::UnfoldAll)),
+        ("format", "Format the document", None),
+        ("lsp", "Start the language server", None),
+        ("lspstop", "Stop the language server", None),
+        (
             "complete",
-            "hover",
+            "Filter and insert completions",
+            Some(KeyAction::Complete),
+        ),
+        ("hover", "Show type and documentation", None),
+        (
             "definition",
+            "Go to definition",
+            Some(KeyAction::Definition),
+        ),
+        (
             "references",
+            "Browse references",
+            Some(KeyAction::References),
+        ),
+        (
             "actions",
-            "diagnostics",
-            "symbolrename",
-            "find",
+            "Browse and apply code actions",
+            Some(KeyAction::CodeActions),
+        ),
+        ("diagnostics", "Browse errors and warnings", None),
+        ("symbolrename", "Rename a symbol workspace-wide", None),
+        ("find", "Find in the current file", Some(KeyAction::Find)),
+        (
             "replace",
+            "Find and replace in this file",
+            Some(KeyAction::Replace),
+        ),
+        (
             "files",
+            "Open a file by fuzzy name",
+            Some(KeyAction::OpenFile),
+        ),
+        (
             "projectsearch",
+            "Search the whole project",
+            Some(KeyAction::ProjectSearch),
+        ),
+        (
             "grep",
-            "trim",
-            "splitline",
+            "Search the whole project",
+            Some(KeyAction::ProjectSearch),
+        ),
+        ("trim", "Trim trailing whitespace", None),
+        ("splitline", "Split the line at the cursor", None),
+        (
             "selectoccurrences",
+            "Select every occurrence",
+            Some(KeyAction::SelectOccurrences),
+        ),
+        (
             "addcursorabove",
+            "Add a cursor on the line above",
+            Some(KeyAction::AddCursorAbove),
+        ),
+        (
             "addcursorbelow",
-            "set formatonsave",
-            "set noformatonsave",
-            "set hidden",
-            "set nohidden",
-            "set restoresession",
-            "set norestoresession",
-            "set reducedmotion",
-            "set noreducedmotion",
-            "set number",
-            "set nonumber",
-            "set autoindent",
-            "set noautoindent",
-            "set trimonsave",
-            "set notrimonsave",
+            "Add a cursor on the line below",
+            Some(KeyAction::AddCursorBelow),
+        ),
+        ("set formatonsave", "Format every file on save", None),
+        ("set noformatonsave", "Stop formatting on save", None),
+        ("set hidden", "Show dotfiles in the tree", None),
+        ("set nohidden", "Hide dotfiles in the tree", None),
+        ("set restoresession", "Reopen tabs on launch", None),
+        ("set norestoresession", "Start with a clean session", None),
+        ("set reducedmotion", "Disable animations", None),
+        ("set noreducedmotion", "Enable animations", None),
+        ("set number", "Show line numbers", None),
+        ("set nonumber", "Hide line numbers", None),
+        ("set autoindent", "Keep indentation on new lines", None),
+        ("set noautoindent", "Start new lines at column one", None),
+        ("set trimonsave", "Trim trailing whitespace on save", None),
+        ("set notrimonsave", "Keep trailing whitespace on save", None),
+        (
             "set finalnewline=preserve",
+            "Leave the final newline as-is",
+            None,
+        ),
+        (
             "set finalnewline=always",
-            "set finalnewline=strip",
+            "Always end files with a newline",
+            None,
+        ),
+        ("set finalnewline=strip", "Strip the final newline", None),
+        (
             "set startup=session",
-            "set startup=folder",
-            "set startup=empty",
-            "set startup=dashboard",
+            "Launch into the previous session",
+            None,
+        ),
+        ("set startup=folder", "Launch into the folder tree", None),
+        ("set startup=empty", "Launch into an empty buffer", None),
+        ("set startup=dashboard", "Launch into the dashboard", None),
+        (
             "set maxsearchresults=500",
-            "set",
-            "theme",
-            "themes",
-            "keymap",
-            "keymaps",
-            "settings",
-            "keybindings",
-            "bind",
-            "unbind",
-            "bindreset",
-            "help",
-            "welcome",
-        ];
+            "Cap project-search results",
+            None,
+        ),
+        ("set", "Change a setting", None),
+        ("theme", "Change the colour theme", None),
+        ("themes", "Browse themes with live preview", None),
+        ("keymap", "Switch keymap profile", None),
+        ("keymaps", "Browse keymap profiles", None),
+        ("settings", "Search every setting and its value", None),
+        ("keybindings", "Browse every key binding", None),
+        ("bind", "Bind a chord to an action", None),
+        ("unbind", "Remove a custom binding", None),
+        ("bindreset", "Restore the default bindings", None),
+        ("help", "Open help", None),
+        ("welcome", "Open the recent-project dashboard", None),
+    ];
+
+    /// Commands matching the current query, name matches before description
+    /// matches so typing an exact command always selects it first.
+    pub fn command_matches(&self) -> Vec<CommandEntry> {
         let query = self.command_input.trim().to_ascii_lowercase();
-        let mut commands = COMMANDS
+        let chord_for = |action: Option<KeyAction>| {
+            action
+                .and_then(|action| self.keys.chord_for(action))
+                .map(|chord| chord.display())
+        };
+
+        let catalog = Self::COMMAND_CATALOG
             .iter()
-            .map(|command| (*command).to_string())
+            .map(|(name, description, action)| CommandEntry {
+                name: (*name).to_string(),
+                description: (*description).to_string(),
+                chord: chord_for(*action),
+            })
+            .chain(
+                self.plugins
+                    .command_names()
+                    .into_iter()
+                    .map(|name| CommandEntry {
+                        name: format!("plugin {name}"),
+                        description: "Provided by a plugin".to_string(),
+                        chord: None,
+                    }),
+            )
             .collect::<Vec<_>>();
-        commands.extend(
-            self.plugins
-                .command_names()
-                .into_iter()
-                .map(|name| format!("plugin {name}")),
-        );
-        commands
+
+        let (mut named, described): (Vec<_>, Vec<_>) = catalog
             .into_iter()
-            .filter(|command| command.to_ascii_lowercase().contains(&query))
+            .filter(|entry| {
+                entry.name.to_ascii_lowercase().contains(&query)
+                    || entry.description.to_ascii_lowercase().contains(&query)
+            })
+            .partition(|entry| entry.name.to_ascii_lowercase().contains(&query));
+
+        named.extend(described);
+        named
+    }
+
+    pub fn command_suggestions(&self) -> Vec<String> {
+        self.command_matches()
+            .into_iter()
+            .map(|entry| entry.name)
             .collect()
     }
 
@@ -7167,6 +7303,7 @@ mod tests {
     fn records_and_replays_a_macro() {
         let mut app = App::new(None).expect("create app");
         app.explorer_focused = false;
+        app.settings.keymap = KeymapProfile::Vim;
         app.mode = Mode::Normal;
 
         for key in [
@@ -7208,6 +7345,93 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Insert);
         assert_eq!(app.editor.line_text(0), "i");
+    }
+
+    /// The original bug: on the default profile, typing an ordinary word in
+    /// Normal mode ran `h`/`e`/`l`/`l` as motions and then `o` opened a line
+    /// and switched to Insert, so " world" was typed into the document.
+    #[test]
+    fn caret_profile_never_turns_printable_input_into_normal_commands() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.settings.keymap = KeymapProfile::Caret;
+        app.mode = Mode::Normal;
+
+        type_text(&mut app, "hello world");
+
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.editor.line_text(0), "hello world");
+        assert_eq!(app.editor.line_count(), 1, "`o` must not open a line");
+    }
+
+    #[test]
+    fn caret_profile_esc_does_not_leave_insert_mode() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.settings.keymap = KeymapProfile::Caret;
+        app.mode = Mode::Insert;
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn vim_profile_keeps_modal_normal_mode_commands() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.settings.keymap = KeymapProfile::Vim;
+        app.mode = Mode::Insert;
+        app.editor.insert_text("alpha");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.handle_key(key('o'));
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.editor.line_count(), 2);
+    }
+
+    #[test]
+    fn fold_chord_works_without_normal_mode() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.settings.keymap = KeymapProfile::Caret;
+        app.mode = Mode::Insert;
+
+        app.message.clear();
+        app.handle_key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE));
+
+        assert_eq!(
+            app.message, "No fold at cursor",
+            "F9 should reach the fold handler, not be swallowed"
+        );
+    }
+
+    #[test]
+    fn macro_chord_records_and_stops_without_normal_mode() {
+        let mut app = App::new(None).expect("create app");
+        app.explorer_focused = false;
+        app.settings.keymap = KeymapProfile::Caret;
+        app.mode = Mode::Insert;
+
+        let record = KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE);
+
+        app.handle_key(record);
+        assert_eq!(app.macro_prefix, Some(MacroPrefix::Record));
+
+        app.handle_key(key('a'));
+        assert_eq!(app.recording_macro, Some('a'));
+
+        type_text(&mut app, "hi");
+        app.handle_key(record);
+
+        assert_eq!(app.recording_macro, None, "the chord should stop recording");
+        assert_eq!(
+            app.macros.get(&'a').map(Vec::len),
+            Some(2),
+            "the stop chord itself must not be recorded"
+        );
     }
 
     #[test]

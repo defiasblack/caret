@@ -43,10 +43,15 @@ pub enum Action {
     Definition,
     References,
     SwitchSplit,
+    ToggleFold,
+    FoldAll,
+    UnfoldAll,
+    RecordMacro,
+    ReplayMacro,
 }
 
 impl Action {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 36] = [
         Self::Save,
         Self::Quit,
         Self::Find,
@@ -78,6 +83,11 @@ impl Action {
         Self::Definition,
         Self::References,
         Self::SwitchSplit,
+        Self::ToggleFold,
+        Self::FoldAll,
+        Self::UnfoldAll,
+        Self::RecordMacro,
+        Self::ReplayMacro,
     ];
 
     /// Stable identifier used in the config file and :bind commands.
@@ -114,6 +124,11 @@ impl Action {
             Self::Definition => "definition",
             Self::References => "references",
             Self::SwitchSplit => "switchsplit",
+            Self::ToggleFold => "togglefold",
+            Self::FoldAll => "foldall",
+            Self::UnfoldAll => "unfoldall",
+            Self::RecordMacro => "recordmacro",
+            Self::ReplayMacro => "replaymacro",
         }
     }
 
@@ -150,6 +165,11 @@ impl Action {
             Self::Definition => "Go to definition",
             Self::References => "Find references",
             Self::SwitchSplit => "Switch between split panes",
+            Self::ToggleFold => "Fold or unfold at the cursor",
+            Self::FoldAll => "Fold everything",
+            Self::UnfoldAll => "Unfold everything",
+            Self::RecordMacro => "Start or stop recording a macro",
+            Self::ReplayMacro => "Replay a macro",
         }
     }
 
@@ -346,6 +366,16 @@ fn default_bindings() -> Vec<(KeyChord, Action)> {
         (chord("f12"), Action::Definition),
         (chord("shift+f12"), Action::References),
         (chord("ctrl+\\"), Action::SwitchSplit),
+        // Folds and macros were previously reachable only through Vim-style
+        // bare-letter commands in Normal mode (zc/zo/za/zM/zR, q/@), which the
+        // non-modal profiles never enter.  Chords keep them available there.
+        (chord("f9"), Action::ToggleFold),
+        (chord("shift+f9"), Action::FoldAll),
+        (chord("ctrl+f9"), Action::UnfoldAll),
+        // F-keys rather than Ctrl-Shift chords: terminals that collapse Shift
+        // would turn Ctrl-Shift-Q into Ctrl-Q, which is Quit.
+        (chord("f4"), Action::RecordMacro),
+        (chord("shift+f4"), Action::ReplayMacro),
     ]
 }
 
@@ -441,10 +471,23 @@ impl KeyBindings {
 
 /// Non-rebindable keys, listed in the browser for the current profile.
 pub fn fixed_keys(profile: KeymapProfile) -> Vec<(&'static str, &'static str)> {
+    let modal = profile == KeymapProfile::Vim;
     let mut keys: Vec<(&'static str, &'static str)> = vec![
-        ("F1 / ?", "Open help"),
-        ("Esc", "Leave insert mode / close panels"),
-        ("Tab / Shift+Tab", "Indent / outdent (Normal mode)"),
+        if modal {
+            ("F1 / ?", "Open help")
+        } else {
+            ("F1", "Open help")
+        },
+        if modal {
+            ("Esc", "Leave insert mode / close panels")
+        } else {
+            ("Esc", "Clear the selection / close panels")
+        },
+        if modal {
+            ("Tab / Shift+Tab", "Indent / outdent (Normal mode)")
+        } else {
+            ("Tab", "Insert an indent")
+        },
         ("Alt+Up / Alt+Down", "Move the current line"),
         ("Alt+Shift+Arrows", "Column (rectangle) selection"),
         ("Ctrl+D", "Select the next occurrence"),
@@ -459,7 +502,7 @@ pub fn fixed_keys(profile: KeymapProfile) -> Vec<(&'static str, &'static str)> {
         (". (in file tree)", "Show hidden and ignored files"),
     ];
     match profile {
-        KeymapProfile::Vim | KeymapProfile::Caret => {
+        KeymapProfile::Vim => {
             keys.extend([
                 ("i / a / o / O", "Enter Insert mode"),
                 ("h j k l", "Move the cursor (Normal mode)"),
@@ -474,7 +517,10 @@ pub fn fixed_keys(profile: KeymapProfile) -> Vec<(&'static str, &'static str)> {
                 ("zc zo za zM zR", "Close/open/toggle/all folds"),
             ]);
         }
-        KeymapProfile::Conventional => {
+        // Caret and Conventional share one input contract: typing always
+        // types.  Every command is a chord or an F-key, listed by the
+        // keybinding browser rather than here.
+        KeymapProfile::Caret | KeymapProfile::Conventional => {
             keys.extend([
                 ("Typing", "Always inserts text"),
                 ("Shift+Arrows", "Select text"),
@@ -501,6 +547,59 @@ mod tests {
         assert!(KeyChord::parse("cmd+s").is_err());
         assert!(KeyChord::parse("ctrl+f99").is_err());
         assert!(KeyChord::parse("ctrl+").is_err());
+    }
+
+    #[test]
+    fn no_two_default_bindings_share_a_chord() {
+        let defaults = default_bindings();
+        for (index, (chord, action)) in defaults.iter().enumerate() {
+            if let Some((_, other)) = defaults
+                .iter()
+                .skip(index + 1)
+                .find(|(candidate, _)| candidate == chord)
+            {
+                panic!(
+                    "{} is bound to both {} and {}",
+                    chord.display(),
+                    action.id(),
+                    other.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_action_has_a_default_binding() {
+        let bindings = KeyBindings::from_custom(&BTreeMap::new());
+        for action in Action::ALL {
+            assert!(
+                bindings.chord_for(action).is_some(),
+                "{} has no default chord",
+                action.id()
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_vim_profile_advertises_normal_mode_commands() {
+        let vim = fixed_keys(KeymapProfile::Vim);
+        assert!(vim.iter().any(|(keys, _)| *keys == "dd / yy / p"));
+
+        for profile in [KeymapProfile::Caret, KeymapProfile::Conventional] {
+            let keys = fixed_keys(profile);
+            assert!(
+                keys.iter().any(|(keys, _)| *keys == "Typing"),
+                "{} should document that typing always inserts",
+                profile.name()
+            );
+            assert!(
+                !keys.iter().any(|(_, description)| description
+                    .to_ascii_lowercase()
+                    .contains("normal mode")),
+                "{} must not advertise Normal-mode commands: {keys:?}",
+                profile.name()
+            );
+        }
     }
 
     #[test]
