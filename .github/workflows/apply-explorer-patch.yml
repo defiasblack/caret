@@ -48,15 +48,19 @@ jobs:
               "sync::mpsc::{self, Receiver, Sender}",
               1,
           )
-          old = '''    fn try_recv(&self) -> Option<ExplorerEvent> {
-              match self.events.try_recv() {
-                  Ok(event) => Some(event),
-                  Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-              }
-          }'''
-          new = '''    fn try_recv(&self) -> Option<ExplorerEvent> {
-              self.events.try_recv().ok()
-          }'''
+          old = (
+              "    fn try_recv(&self) -> Option<ExplorerEvent> {\n"
+              "        match self.events.try_recv() {\n"
+              "            Ok(event) => Some(event),\n"
+              "            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,\n"
+              "        }\n"
+              "    }"
+          )
+          new = (
+              "    fn try_recv(&self) -> Option<ExplorerEvent> {\n"
+              "        self.events.try_recv().ok()\n"
+              "    }"
+          )
           if old not in text:
               raise SystemExit("expected try_recv implementation not found")
           path.write_text(text.replace(old, new, 1))
