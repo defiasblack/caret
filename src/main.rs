@@ -4,6 +4,7 @@ mod config;
 mod diagnostics;
 mod document;
 mod editor;
+mod explorer;
 mod fuzzy;
 mod keys;
 mod lsp;
@@ -123,11 +124,13 @@ fn run<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     ui::draw(out, app)?;
 
     while !app.should_quit {
-        let changed = if event::poll(Duration::from_millis(50))? {
+        let mut changed = if event::poll(Duration::from_millis(50))? {
             app.handle_event(event::read()?)
         } else {
             app.poll_background()
         };
+        changed |= app.project.poll_background();
+
         if changed && !app.should_quit {
             ui::draw(out, app)?;
         }
