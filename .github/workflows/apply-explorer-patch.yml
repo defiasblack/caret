@@ -47,7 +47,18 @@ jobs:
         run: cargo fmt --all
 
       - name: Lint
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clippy --locked --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/explorer-clippy.log
+
+      - name: Upload Clippy diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: explorer-clippy-diagnostics
+          path: /tmp/explorer-clippy.log
+          if-no-files-found: warn
 
       - name: Test
         run: cargo test --locked --all-targets --all-features
