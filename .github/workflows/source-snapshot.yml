@@ -1,0 +1,32 @@
+name: Source Snapshot
+
+on:
+  push:
+    branches:
+      - agent/explorer-foundation
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/explorer-foundation
+
+      - name: Upload source tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: caret-source
+          path: |
+            Cargo.toml
+            Cargo.lock
+            src
+            docs
+            tests
+            examples
+            .github/workflows/ci.yml
+          if-no-files-found: warn
