@@ -35,6 +35,33 @@ jobs:
       - name: Apply patch
         run: git apply /tmp/explorer-upgrade.patch
 
+      - name: Apply Clippy correction
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("src/explorer.rs")
+          text = path.read_text()
+          text = text.replace(
+              "sync::mpsc::{self, Receiver, Sender, TryRecvError}",
+              "sync::mpsc::{self, Receiver, Sender}",
+              1,
+          )
+          old = '''    fn try_recv(&self) -> Option<ExplorerEvent> {
+              match self.events.try_recv() {
+                  Ok(event) => Some(event),
+                  Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+              }
+          }'''
+          new = '''    fn try_recv(&self) -> Option<ExplorerEvent> {
+              self.events.try_recv().ok()
+          }'''
+          if old not in text:
+              raise SystemExit("expected try_recv implementation not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+
       - name: Verify synchronous tree Git refresh was removed
         shell: bash
         run: |
