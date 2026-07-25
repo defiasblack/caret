@@ -591,12 +591,20 @@ fn draw_project_tree<W: Write>(
             } else {
                 format!(" · filter: {}", app.project.filter)
             };
+            let git_marker = if app.project.git_refreshing {
+                " · git…"
+            } else if app.project.git_error.is_some() {
+                " · git!"
+            } else {
+                ""
+            };
             let root = format!(
-                " PROJECT ▾ {} · {} items{}{}",
+                " PROJECT ▾ {} · {} items{}{}{}",
                 app.project.root_name(),
                 app.project.entries.len(),
                 hidden_marker,
-                filter_marker
+                filter_marker,
+                git_marker
             );
             queue!(
                 out,
@@ -645,25 +653,26 @@ fn draw_project_tree<W: Write>(
             "·"
         };
         let git = match entry.git_status {
-            Some(GitStatus::Modified) => "M",
-            Some(GitStatus::Added) => "A",
-            Some(GitStatus::Deleted) => "D",
-            Some(GitStatus::Untracked) => "?",
-            None => " ",
+            Some(GitStatus::Modified) => " M ",
+            Some(GitStatus::Added) => " A ",
+            Some(GitStatus::Deleted) => " D ",
+            Some(GitStatus::Untracked) => " ? ",
+            None => "",
         };
-        let indent = "│  ".repeat(entry.depth);
-        let branch = "├─";
+        let indent = entry
+            .guides
+            .iter()
+            .map(|continued| if *continued { "│  " } else { "   " })
+            .collect::<String>();
+        let branch = if entry.is_last { "└─" } else { "├─" };
         let suffix = match (entry.is_dir, entry.is_symlink) {
             (true, true) => "/@",
             (true, false) => "/",
             (false, true) => "@",
             (false, false) => "",
         };
-        let kind = if entry.is_dir { "DIR" } else { "   " };
-        let label = format!(
-            " {indent}{branch}{icon} {git} {kind} {}{suffix}",
-            entry.name
-        );
+        let left = format!(" {indent}{branch}{icon} {}{suffix}", entry.name);
+        let label = fit_bar(&left, git, width);
 
         queue!(
             out,
@@ -675,7 +684,7 @@ fn draw_project_tree<W: Write>(
             } else {
                 Attribute::Reset
             }),
-            Print(pad_or_truncate(&label, width)),
+            Print(label),
             SetAttribute(Attribute::Reset)
         )?;
     }
@@ -3243,6 +3252,13 @@ mod tests {
         let rendered = pad_or_truncate("a界b", 3);
         assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 3);
         assert!(rendered.starts_with("a界"));
+    }
+
+    #[test]
+    fn fitted_tree_rows_keep_status_badges_right_aligned() {
+        let rendered = fit_bar(" ├─▸ a very long directory name/", " M ", 20);
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 20);
+        assert!(rendered.ends_with(" M "));
     }
 
     #[test]

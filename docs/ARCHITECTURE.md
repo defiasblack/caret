@@ -16,6 +16,10 @@ responsibilities live behind focused boundaries:
 - `src/diagnostics.rs` owns structured JSONL logging, diagnostic reports, and
   support paths.
 - `src/lsp.rs` owns LSP framing, URI/path conversion, and server stderr capture.
+- `src/explorer.rs` owns background explorer requests, stale-result rejection,
+  Git-status snapshots, refresh throttling, and application of completed work on
+  the UI thread. `src/project.rs` remains the synchronous in-memory tree model
+  and only requests background refreshes; it never launches Git itself.
 - `src/app/persistence.rs` owns application save/quit policy, while
   `src/app/settings.rs` owns settings inspection and validated `:set` changes.
 - `src/ui.rs` renders state and does not perform persistence itself.
