@@ -1,0 +1,737 @@
+name: Apply Explorer Upgrade
+
+on:
+  push:
+    branches:
+      - agent/explorer-foundation
+
+permissions:
+  contents: write
+
+jobs:
+  apply-upgrade:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/explorer-foundation
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply reviewed explorer changes
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+
+          def replace(path: str, old: str, new: str, count: int = -1) -> None:
+              file = root / path
+              text = file.read_text()
+              if old not in text:
+                  raise SystemExit(f"expected text not found in {path}: {old[:100]!r}")
+              file.write_text(text.replace(old, new, count))
+
+          # ProjectTree becomes a pure in-memory model. It requests Git work,
+          # exposes background state for the UI, and carries accurate connector
+          # metadata without launching processes itself.
+          replace(
+              'src/project.rs',
+              '''use std::{
+              collections::HashSet,
+              fs, io,
+              path::{Path, PathBuf},
+              process::Command,
+          };''',
+              '''use std::{
+              collections::HashSet,
+              fs, io,
+              path::{Path, PathBuf},
+          };''',
+          )
+          replace(
+              'src/project.rs',
+              '''    pub expanded: bool,
+              pub git_status: Option<GitStatus>,
+          }''',
+              '''    pub expanded: bool,
+              pub git_status: Option<GitStatus>,
+              /// Whether each ancestor has a later sibling and therefore needs a guide.
+              pub guides: Vec<bool>,
+              pub is_last: bool,
+          }''',
+          )
+          replace(
+              'src/project.rs',
+              '''    pub filter: String,
+              pub width: usize,
+              expanded: HashSet<PathBuf>,
+              ignore_rules: Option<Gitignore>,
+          }''',
+              '''    pub filter: String,
+              pub width: usize,
+              pub git_refreshing: bool,
+              pub git_error: Option<String>,
+              expanded: HashSet<PathBuf>,
+              ignore_rules: Option<Gitignore>,
+              git_refresh_requested: bool,
+          }''',
+          )
+          replace(
+              'src/project.rs',
+              '''            filter: String::new(),
+              width: 40,
+              expanded,
+          };''',
+              '''            filter: String::new(),
+              width: 40,
+              git_refreshing: false,
+              git_error: None,
+              expanded,
+              git_refresh_requested: true,
+          };''',
+          )
+          replace(
+              'src/project.rs',
+              '''        if self.filter.trim().is_empty() {
+              collect_entries(&self.root, 0, &self.expanded, view, &mut entries)?;
+          } else {''',
+              '''        if self.filter.trim().is_empty() {
+              let mut guides = Vec::new();
+              collect_entries(
+                  &self.root,
+                  0,
+                  &self.expanded,
+                  view,
+                  &mut guides,
+                  &mut entries,
+              )?;
+          } else {''',
+          )
+          replace(
+              'src/project.rs',
+              '''            collect_filtered_entries(
+                  &self.root,
+                  &self.root,
+                  &self.filter.to_lowercase(),
+                  view,
+                  0,
+                  &mut entries,
+              );
+          }
+
+          self.entries = entries;''',
+              '''            collect_filtered_entries(
+                  &self.root,
+                  &self.root,
+                  &self.filter.to_lowercase(),
+                  view,
+                  0,
+                  &mut entries,
+              );
+              let length = entries.len();
+              for (index, entry) in entries.iter_mut().enumerate() {
+                  entry.is_last = index + 1 == length;
+              }
+          }
+
+          self.entries = entries;''',
+          )
+
+          project_path = root / 'src/project.rs'
+          project = project_path.read_text()
+          start = project.index('    pub fn refresh_git_status(&mut self) {')
+          end = project.index('\n    pub fn set_root', start)
+          project = (
+              project[:start]
+              + '''    pub fn request_git_refresh(&mut self) {
+              self.git_refresh_requested = true;
+          }
+
+          pub(crate) fn take_git_refresh_request(&mut self) -> bool {
+              std::mem::take(&mut self.git_refresh_requested)
+          }
+
+          '''
+              + project[end + 1:]
+          )
+          project_path.write_text(project)
+
+          replace(
+              'src/project.rs',
+              '''        self.scroll = 0;
+              self.filter.clear();
+              self.refresh()
+          }''',
+              '''        self.scroll = 0;
+              self.filter.clear();
+              self.git_refreshing = false;
+              self.git_error = None;
+              self.git_refresh_requested = true;
+              self.refresh()
+          }''',
+              1,
+          )
+          replace(
+              'src/project.rs',
+              '''fn collect_entries(
+              directory: &Path,
+              depth: usize,
+              expanded: &HashSet<PathBuf>,
+              view: TreeView,
+              output: &mut Vec<ProjectEntry>,
+          ) -> io::Result<()> {''',
+              '''fn collect_entries(
+              directory: &Path,
+              depth: usize,
+              expanded: &HashSet<PathBuf>,
+              view: TreeView,
+              guides: &mut Vec<bool>,
+              output: &mut Vec<ProjectEntry>,
+          ) -> io::Result<()> {''',
+          )
+          replace(
+              'src/project.rs',
+              '''    for child in children {
+              let is_expanded = child.is_dir && expanded.contains(&child.path);
+              output.push(ProjectEntry {
+                  path: child.path.clone(),
+                  name: child.name,
+                  depth,
+                  is_dir: child.is_dir,
+                  is_symlink: child.is_symlink,
+                  expanded: is_expanded,
+                  git_status: None,
+              });
+
+              if is_expanded {
+                  collect_entries(&child.path, depth + 1, expanded, view, output)?;
+              }
+          }''',
+              '''    let child_count = children.len();
+              for (index, child) in children.into_iter().enumerate() {
+                  let is_last = index + 1 == child_count;
+                  let is_expanded = child.is_dir && expanded.contains(&child.path);
+                  output.push(ProjectEntry {
+                      path: child.path.clone(),
+                      name: child.name,
+                      depth,
+                      is_dir: child.is_dir,
+                      is_symlink: child.is_symlink,
+                      expanded: is_expanded,
+                      git_status: None,
+                      guides: guides.clone(),
+                      is_last,
+                  });
+
+                  if is_expanded {
+                      guides.push(!is_last);
+                      collect_entries(&child.path, depth + 1, expanded, view, guides, output)?;
+                      guides.pop();
+                  }
+              }''',
+          )
+          replace(
+              'src/project.rs',
+              '''                expanded: false,
+                  git_status: None,
+              });''',
+              '''                expanded: false,
+                  git_status: None,
+                  guides: Vec::new(),
+                  is_last: false,
+              });''',
+          )
+          replace(
+              'src/project.rs',
+              '''        assert_eq!(tree.entries.len(), 1);
+              assert!(tree.entries[0].name.contains("main.rs"));''',
+              '''        assert_eq!(tree.entries.len(), 1);
+              assert!(tree.entries[0].name.contains("main.rs"));
+              assert!(tree.entries[0].is_last);''',
+          )
+          replace(
+              'src/project.rs',
+              '''    #[cfg(unix)]
+              #[test]
+              fn symlinked_directories_are_marked_and_not_auto_expanded() {''',
+              '''    #[test]
+              fn git_refresh_requests_are_edge_triggered() {
+                  let root = temp_root("git-request");
+                  let mut tree = ProjectTree::new(root.clone()).unwrap();
+
+                  assert!(tree.take_git_refresh_request());
+                  assert!(!tree.take_git_refresh_request());
+                  tree.request_git_refresh();
+                  assert!(tree.take_git_refresh_request());
+                  let _ = fs::remove_dir_all(root);
+              }
+
+              #[test]
+              fn connector_metadata_tracks_last_children() {
+                  let root = temp_root("guides");
+                  fs::create_dir_all(root.join("src/nested")).unwrap();
+                  fs::write(root.join("src/a.rs"), "a").unwrap();
+                  fs::write(root.join("src/z.rs"), "z").unwrap();
+
+                  let mut tree = ProjectTree::new(root.clone()).unwrap();
+                  let src_index = tree
+                      .entries
+                      .iter()
+                      .position(|entry| entry.name == "src")
+                      .unwrap();
+                  tree.selected = src_index;
+                  tree.expand_selected().unwrap();
+
+                  let children = tree
+                      .entries
+                      .iter()
+                      .filter(|entry| entry.depth == 1)
+                      .collect::<Vec<_>>();
+                  assert!(!children.is_empty());
+                  assert!(children.last().unwrap().is_last);
+                  assert!(children
+                      .iter()
+                      .all(|entry| entry.guides.len() == 1 && !entry.guides[0]));
+                  let _ = fs::remove_dir_all(root);
+              }
+
+              #[cfg(unix)]
+              #[test]
+              fn symlinked_directories_are_marked_and_not_auto_expanded() {''',
+          )
+
+          # The service consumes explicit requests, queues another pass when an
+          # operation happens during an in-flight refresh, and synchronizes its
+          # state back to the project model for rendering.
+          replace(
+              'src/explorer.rs',
+              '''    request_pending: bool,
+              last_request: Option<Instant>,
+              last_error: Option<String>,''',
+              '''    request_pending: bool,
+              refresh_queued: bool,
+              last_request: Option<Instant>,
+              last_error: Option<String>,''',
+          )
+          replace(
+              'src/explorer.rs',
+              '''    pub fn new(root: PathBuf) -> io::Result<Self> {
+              let mut service = Self {
+                  worker: ExplorerWorker::new()?,
+                  root,
+                  statuses: HashMap::new(),
+                  generation: 0,
+                  request_pending: false,
+                  last_request: None,
+                  last_error: None,
+              };
+              service.schedule_refresh(true, true);
+              Ok(service)
+          }''',
+              '''    pub fn new(root: PathBuf) -> io::Result<Self> {
+              Ok(Self {
+                  worker: ExplorerWorker::new()?,
+                  root,
+                  statuses: HashMap::new(),
+                  generation: 0,
+                  request_pending: false,
+                  refresh_queued: false,
+                  last_request: None,
+                  last_error: None,
+              })
+          }''',
+          )
+          replace(
+              'src/explorer.rs',
+              '''        if project.root != self.root {
+              self.reset_for_root(project.root.clone());
+          }
+
+          let mut changed = false;''',
+              '''        let root_changed = project.root != self.root;
+              if root_changed {
+                  self.reset_for_root(project.root.clone());
+              }
+
+              let refresh_requested = project.take_git_refresh_request();
+              if root_changed || refresh_requested {
+                  if self.request_pending {
+                      self.refresh_queued = true;
+                  } else {
+                      self.schedule_refresh(true, true);
+                  }
+              }
+
+              let mut changed = false;''',
+          )
+          replace(
+              'src/explorer.rs',
+              '''        // Tree refreshes rebuild rows with empty status fields. Reapply the
+              // cached snapshot even if no new worker event arrived this tick.
+              changed |= self.apply_statuses(project);
+              self.schedule_refresh(false, project.visible);
+              changed
+          }''',
+              '''        if self.refresh_queued && !self.request_pending {
+              self.refresh_queued = false;
+              self.schedule_refresh(true, true);
+          } else {
+              self.schedule_refresh(false, project.visible);
+          }
+
+          // Tree refreshes rebuild rows with empty status fields. Reapply the
+          // cached snapshot even if no new worker event arrived this tick.
+          changed |= self.apply_statuses(project);
+          changed |= self.sync_project_state(project);
+          changed
+          }''',
+          )
+          replace(
+              'src/explorer.rs',
+              '''        self.request_pending = false;
+              self.generation = self.generation.wrapping_add(1);
+              self.schedule_refresh(true, true);''',
+              '''        self.request_pending = false;
+              self.refresh_queued = false;
+              self.generation = self.generation.wrapping_add(1);''',
+          )
+          replace(
+              'src/explorer.rs',
+              '''    fn schedule_refresh(&mut self, force: bool, visible: bool) {''',
+              '''    fn sync_project_state(&self, project: &mut ProjectTree) -> bool {
+              let mut changed = false;
+              if project.git_refreshing != self.request_pending {
+                  project.git_refreshing = self.request_pending;
+                  changed = true;
+              }
+              if project.git_error != self.last_error {
+                  project.git_error.clone_from(&self.last_error);
+                  changed = true;
+              }
+              changed
+          }
+
+          fn schedule_refresh(&mut self, force: bool, visible: bool) {''',
+          )
+          replace(
+              'src/explorer.rs',
+              '''fn scan_git_status(root: &Path) -> io::Result<HashMap<PathBuf, GitStatus>> {
+              let output = Command::new("git")
+                  .arg("-C")
+                  .arg(root)
+                  .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+                  .output()?;''',
+              '''fn scan_git_status(root: &Path) -> io::Result<HashMap<PathBuf, GitStatus>> {
+              let output = match Command::new("git")
+                  .arg("-C")
+                  .arg(root)
+                  .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+                  .env("LC_ALL", "C")
+                  .env("GIT_OPTIONAL_LOCKS", "0")
+                  .output()
+              {
+                  Ok(output) => output,
+                  Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+                  Err(error) => return Err(error),
+              };''',
+          )
+          replace(
+              'src/explorer.rs',
+              '''    #[test]
+              fn stronger_status_wins_for_directory_summary() {''',
+              '''    #[test]
+              fn scans_a_real_repository_with_spaces_in_paths() {
+                  let unique = std::time::SystemTime::now()
+                      .duration_since(std::time::UNIX_EPOCH)
+                      .unwrap()
+                      .as_nanos();
+                  let root = std::env::temp_dir().join(format!(
+                      "caret-explorer-git-{}-{unique}",
+                      std::process::id()
+                  ));
+                  let _ = std::fs::remove_dir_all(&root);
+                  std::fs::create_dir_all(root.join("folder with spaces")).unwrap();
+
+                  let initialized = Command::new("git")
+                      .arg("init")
+                      .arg("--quiet")
+                      .arg(&root)
+                      .status()
+                      .is_ok_and(|status| status.success());
+                  if !initialized {
+                      let _ = std::fs::remove_dir_all(&root);
+                      return;
+                  }
+
+                  std::fs::write(root.join("folder with spaces/new file.txt"), "content").unwrap();
+                  let statuses = scan_git_status(&root).unwrap();
+                  assert_eq!(
+                      statuses.get(&root.join("folder with spaces/new file.txt")),
+                      Some(&GitStatus::Untracked)
+                  );
+                  assert_eq!(
+                      statuses.get(&root.join("folder with spaces")),
+                      Some(&GitStatus::Untracked)
+                  );
+                  let _ = std::fs::remove_dir_all(&root);
+              }
+
+              #[test]
+              fn stronger_status_wins_for_directory_summary() {''',
+          )
+
+          # Every existing status refresh request now enters the non-blocking
+          # service, including saves, project edits, staging, and explicit
+          # refresh commands.
+          app = root / 'src/app.rs'
+          text = app.read_text()
+          startup = '        project.refresh_git_status();\n'
+          if startup not in text:
+              raise SystemExit('startup refresh call not found')
+          text = text.replace(startup, '', 1)
+          text = text.replace('self.project.refresh_git_status();', 'self.project.request_git_refresh();')
+          text = text.replace(
+              'self.message = "Git status and gutter refreshed".to_string();',
+              'self.message = "Git status refresh requested · gutter refreshed".to_string();',
+          )
+          app.write_text(text)
+
+          for old, new in [
+              (
+                  '''            Ok(()) => {
+                  let _ = self.project.refresh();
+                  self.message = format!("Created {}", path.display());
+              }''',
+                  '''            Ok(()) => {
+                  let _ = self.project.refresh();
+                  self.project.request_git_refresh();
+                  self.message = format!("Created {}", path.display());
+              }''',
+              ),
+              (
+                  '''            Ok(()) => {
+                  let _ = self.project.refresh();
+                  self.message = format!("Renamed to {}", destination.display());
+              }''',
+                  '''            Ok(()) => {
+                  let _ = self.project.refresh();
+                  self.project.request_git_refresh();
+                  self.message = format!("Renamed to {}", destination.display());
+              }''',
+              ),
+              (
+                  '''            Ok(_) => {
+                  let _ = self.project.refresh();
+                  self.message = format!("Duplicated to {}", destination.display());
+              }''',
+                  '''            Ok(_) => {
+                  let _ = self.project.refresh();
+                  self.project.request_git_refresh();
+                  self.message = format!("Duplicated to {}", destination.display());
+              }''',
+              ),
+              (
+                  '''            Ok(()) => {
+                  let _ = self.project.refresh();
+                  self.message = format!("Moved to {}", destination.display());
+              }''',
+                  '''            Ok(()) => {
+                  let _ = self.project.refresh();
+                  self.project.request_git_refresh();
+                  self.message = format!("Moved to {}", destination.display());
+              }''',
+              ),
+              (
+                  '''            Ok(()) => {
+                  let _ = self.project.refresh();
+                  self.message = format!("Deleted {}", path.display());
+              }''',
+                  '''            Ok(()) => {
+                  let _ = self.project.refresh();
+                  self.project.request_git_refresh();
+                  self.message = format!("Deleted {}", path.display());
+              }''',
+              ),
+              (
+                  '''            KeyCode::Char('r') => match self.project.refresh() {
+                  Ok(()) => self.message = "File tree refreshed".to_string(),''',
+                  '''            KeyCode::Char('r') => match self.project.refresh() {
+                  Ok(()) => {
+                      self.project.request_git_refresh();
+                      self.message = "File tree refreshed".to_string();
+                  }''',
+              ),
+          ]:
+              replace('src/app.rs', old, new)
+
+          persistence = root / 'src/app/persistence.rs'
+          text = persistence.read_text().replace(
+              'self.project.refresh_git_status();',
+              'self.project.request_git_refresh();',
+          )
+          old = '''        let (saved, errors) = self.editor.save_all();
+          let _ = self.project.refresh();'''
+          new = '''        let (saved, errors) = self.editor.save_all();
+          let _ = self.project.refresh();
+          self.project.request_git_refresh();'''
+          if old not in text:
+              raise SystemExit('save_all refresh block not found')
+          persistence.write_text(text.replace(old, new, 1))
+
+          # Polish the existing sidebar without changing its interaction model.
+          replace(
+              'src/ui.rs',
+              '''            let root = format!(
+                  " PROJECT ▾ {} · {} items{}{}",
+                  app.project.root_name(),
+                  app.project.entries.len(),
+                  hidden_marker,
+                  filter_marker
+              );''',
+              '''            let git_marker = if app.project.git_refreshing {
+                  " · git…"
+              } else if app.project.git_error.is_some() {
+                  " · git!"
+              } else {
+                  ""
+              };
+              let root = format!(
+                  " PROJECT ▾ {} · {} items{}{}{}",
+                  app.project.root_name(),
+                  app.project.entries.len(),
+                  hidden_marker,
+                  filter_marker,
+                  git_marker
+              );''',
+          )
+          replace(
+              'src/ui.rs',
+              '''        let git = match entry.git_status {
+              Some(GitStatus::Modified) => "M",
+              Some(GitStatus::Added) => "A",
+              Some(GitStatus::Deleted) => "D",
+              Some(GitStatus::Untracked) => "?",
+              None => " ",
+          };
+          let indent = "│  ".repeat(entry.depth);
+          let branch = "├─";
+          let suffix = match (entry.is_dir, entry.is_symlink) {
+              (true, true) => "/@",
+              (true, false) => "/",
+              (false, true) => "@",
+              (false, false) => "",
+          };
+          let kind = if entry.is_dir { "DIR" } else { "   " };
+          let label = format!(
+              " {indent}{branch}{icon} {git} {kind} {}{suffix}",
+              entry.name
+          );''',
+              '''        let git = match entry.git_status {
+              Some(GitStatus::Modified) => " M ",
+              Some(GitStatus::Added) => " A ",
+              Some(GitStatus::Deleted) => " D ",
+              Some(GitStatus::Untracked) => " ? ",
+              None => "",
+          };
+          let indent = entry
+              .guides
+              .iter()
+              .map(|continued| if *continued { "│  " } else { "   " })
+              .collect::<String>();
+          let branch = if entry.is_last { "└─" } else { "├─" };
+          let suffix = match (entry.is_dir, entry.is_symlink) {
+              (true, true) => "/@",
+              (true, false) => "/",
+              (false, true) => "@",
+              (false, false) => "",
+          };
+          let left = format!(" {indent}{branch}{icon} {}{suffix}", entry.name);
+          let label = fit_bar(&left, git, width);''',
+          )
+          replace(
+              'src/ui.rs',
+              '            Print(pad_or_truncate(&label, width)),',
+              '            Print(label),',
+              1,
+          )
+          replace(
+              'src/ui.rs',
+              '''    #[test]
+              fn command_suggestion_window_clamps_to_the_available_results() {''',
+              '''    #[test]
+              fn fitted_tree_rows_keep_status_badges_right_aligned() {
+                  let rendered = fit_bar(" ├─▸ a very long directory name/", " M ", 20);
+                  assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 20);
+                  assert!(rendered.ends_with(" M "));
+              }
+
+              #[test]
+              fn command_suggestion_window_clamps_to_the_available_results() {''',
+          )
+
+          replace(
+              'docs/ARCHITECTURE.md',
+              '''- `src/lsp.rs` owns LSP framing, URI/path conversion, and server stderr capture.
+          - `src/app/persistence.rs` owns application save/quit policy, while''',
+              '''- `src/lsp.rs` owns LSP framing, URI/path conversion, and server stderr capture.
+          - `src/explorer.rs` owns background explorer requests, stale-result rejection,
+            Git-status snapshots, refresh throttling, and application of completed work on
+            the UI thread. `src/project.rs` remains the synchronous in-memory tree model
+            and only requests background refreshes; it never launches Git itself.
+          - `src/app/persistence.rs` owns application save/quit policy, while''',
+          )
+          smoke = root / 'docs/SMOKE_TEST_0.7.md'
+          text = smoke.read_text()
+          old = '''6. Open `Ctrl-P` / `:files`, filter by a partial path, open a result, and verify
+             recently opened files rank ahead of ordinary matches.'''
+          new = '''6. Open a Git project with modified, added, deleted, and untracked files. Confirm
+             the tree appears immediately, the header briefly shows `git…`, status badges
+             update without blocking typing, collapsed folders summarize descendant
+             changes, `:gitrefresh` queues another refresh, and a non-Git folder remains
+             usable. Expand nested folders and verify `├─`, `└─`, and `│` guides terminate
+             correctly.
+          7. Open `Ctrl-P` / `:files`, filter by a partial path, open a result, and verify
+             recently opened files rank ahead of ordinary matches.'''
+          if old not in text:
+              raise SystemExit('smoke-test navigation step not found')
+          text = text.replace(old, new, 1)
+          for old_number, new_number in [(12, 13), (11, 12), (10, 11), (9, 10), (8, 9), (7, 8)]:
+              text = text.replace(f'\n{old_number}. ', f'\n{new_number}. ', 1)
+          smoke.write_text(text)
+
+          readme = root / 'README.md'
+          text = readme.read_text()
+          old = '''The folder tree uses wider indentation, connector guides, explicit `DIR`
+          markers, and trailing `/` characters so nested folder structure is easier to
+          read.'''
+          new = '''The folder tree uses terminating connector guides, compact file and directory
+          markers, trailing `/` characters, and right-aligned Git badges so nested
+          structure and change state remain easy to read.'''
+          if old not in text:
+              raise SystemExit('README project-tree description not found')
+          readme.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Commit validated changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md src/project.rs src/explorer.rs src/app.rs src/app/persistence.rs src/ui.rs docs/ARCHITECTURE.md docs/SMOKE_TEST_0.7.md
+          git commit -m "explorer: finish async refresh and polish tree UI"
+          git push origin HEAD:agent/explorer-foundation
