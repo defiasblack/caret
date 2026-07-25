@@ -16,10 +16,7 @@ const GIT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 enum ExplorerRequest {
-    RefreshGit {
-        generation: u64,
-        root: PathBuf,
-    },
+    RefreshGit { generation: u64, root: PathBuf },
 }
 
 #[derive(Debug)]
@@ -229,12 +226,7 @@ fn scan_git_status(root: &Path) -> io::Result<HashMap<PathBuf, GitStatus>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-        ])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()?;
 
     if output.status.success() {
@@ -258,7 +250,9 @@ fn scan_git_status(root: &Path) -> io::Result<HashMap<PathBuf, GitStatus>> {
 
 fn parse_git_status(root: &Path, output: &[u8]) -> HashMap<PathBuf, GitStatus> {
     let mut statuses = HashMap::new();
-    let mut records = output.split(|byte| *byte == 0).filter(|record| !record.is_empty());
+    let mut records = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
 
     while let Some(record) = records.next() {
         if record.len() < 4 || record[2] != b' ' {
@@ -290,9 +284,7 @@ fn status_from_code(code: &[u8]) -> Option<GitStatus> {
         return None;
     }
 
-    if code.contains(&b'U')
-        || matches!(code, b"AA" | b"DD" | b"AU" | b"UA" | b"DU" | b"UD")
-    {
+    if code.contains(&b'U') || matches!(code, b"AA" | b"DD" | b"AU" | b"UA" | b"DU" | b"UD") {
         return Some(GitStatus::Modified);
     }
     if code.contains(&b'D') {
@@ -301,10 +293,7 @@ fn status_from_code(code: &[u8]) -> Option<GitStatus> {
     if code.contains(&b'A') {
         return Some(GitStatus::Added);
     }
-    if code.contains(&b'M')
-        || code.contains(&b'T')
-        || code.contains(&b'R')
-        || code.contains(&b'C')
+    if code.contains(&b'M') || code.contains(&b'T') || code.contains(&b'R') || code.contains(&b'C')
     {
         return Some(GitStatus::Modified);
     }
@@ -384,8 +373,14 @@ mod tests {
             statuses.get(&root.join("docs/new file.md")),
             Some(&GitStatus::Untracked)
         );
-        assert_eq!(statuses.get(&root.join("docs")), Some(&GitStatus::Untracked));
-        assert_eq!(statuses.get(&root.join("Cargo.lock")), Some(&GitStatus::Added));
+        assert_eq!(
+            statuses.get(&root.join("docs")),
+            Some(&GitStatus::Untracked)
+        );
+        assert_eq!(
+            statuses.get(&root.join("Cargo.lock")),
+            Some(&GitStatus::Added)
+        );
     }
 
     #[test]
