@@ -6,12 +6,16 @@ use std::{
     process::Command,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
+    time::{Duration, Instant},
 };
 
-use crate::project::GitStatus;
+use crate::project::{GitStatus, ProjectTree};
+
+const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+const GIT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
-pub enum ExplorerRequest {
+enum ExplorerRequest {
     RefreshGit {
         generation: u64,
         root: PathBuf,
@@ -19,7 +23,7 @@ pub enum ExplorerRequest {
 }
 
 #[derive(Debug)]
-pub enum ExplorerEvent {
+enum ExplorerEvent {
     GitStatusReady {
         generation: u64,
         root: PathBuf,
@@ -32,7 +36,7 @@ pub enum ExplorerEvent {
     },
 }
 
-pub struct ExplorerWorker {
+struct ExplorerWorker {
     requests: Sender<ExplorerRequest>,
     events: Receiver<ExplorerEvent>,
 }
@@ -48,7 +52,7 @@ impl fmt::Debug for ExplorerWorker {
 }
 
 impl ExplorerWorker {
-    pub fn new() -> io::Result<Self> {
+    fn new() -> io::Result<Self> {
         let (request_sender, request_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
 
@@ -85,16 +89,138 @@ impl ExplorerWorker {
         })
     }
 
-    pub fn refresh_git(&self, generation: u64, root: PathBuf) -> bool {
+    fn refresh_git(&self, generation: u64, root: PathBuf) -> bool {
         self.requests
             .send(ExplorerRequest::RefreshGit { generation, root })
             .is_ok()
     }
 
-    pub fn try_recv(&self) -> Option<ExplorerEvent> {
+    fn try_recv(&self) -> Option<ExplorerEvent> {
         match self.events.try_recv() {
             Ok(event) => Some(event),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        }
+    }
+}
+
+/// Owns background explorer work independently of the editor's application
+/// state. The service intentionally applies completed snapshots only on the UI
+/// thread, so worker code never mutates `ProjectTree` directly.
+#[derive(Debug)]
+pub struct ExplorerService {
+    worker: ExplorerWorker,
+    root: PathBuf,
+    statuses: HashMap<PathBuf, GitStatus>,
+    generation: u64,
+    request_pending: bool,
+    last_request: Option<Instant>,
+    last_error: Option<String>,
+}
+
+impl ExplorerService {
+    pub fn new(root: PathBuf) -> io::Result<Self> {
+        let mut service = Self {
+            worker: ExplorerWorker::new()?,
+            root,
+            statuses: HashMap::new(),
+            generation: 0,
+            request_pending: false,
+            last_request: None,
+            last_error: None,
+        };
+        service.schedule_refresh(true, true);
+        Ok(service)
+    }
+
+    /// Applies finished background work to the current tree and schedules the
+    /// next refresh. Returns true when visible rows changed.
+    pub fn poll(&mut self, project: &mut ProjectTree) -> bool {
+        if project.root != self.root {
+            self.reset_for_root(project.root.clone());
+        }
+
+        let mut changed = false;
+        while let Some(event) = self.worker.try_recv() {
+            match event {
+                ExplorerEvent::GitStatusReady {
+                    generation,
+                    root,
+                    statuses,
+                } if generation == self.generation && root == self.root => {
+                    self.request_pending = false;
+                    self.last_error = None;
+                    if statuses != self.statuses {
+                        self.statuses = statuses;
+                    }
+                    changed |= self.apply_statuses(project);
+                }
+                ExplorerEvent::GitStatusFailed {
+                    generation,
+                    root,
+                    message,
+                } if generation == self.generation && root == self.root => {
+                    self.request_pending = false;
+                    self.last_error = Some(message);
+                }
+                // The project changed, or a newer request superseded this one.
+                // Stale results must never overwrite the active project.
+                _ => {}
+            }
+        }
+
+        // Tree refreshes rebuild rows with empty status fields. Reapply the
+        // cached snapshot even if no new worker event arrived this tick.
+        changed |= self.apply_statuses(project);
+        self.schedule_refresh(false, project.visible);
+        changed
+    }
+
+    fn reset_for_root(&mut self, root: PathBuf) {
+        self.root = root;
+        self.statuses.clear();
+        self.last_error = None;
+        self.last_request = None;
+        self.request_pending = false;
+        self.generation = self.generation.wrapping_add(1);
+        self.schedule_refresh(true, true);
+    }
+
+    fn apply_statuses(&self, project: &mut ProjectTree) -> bool {
+        let mut changed = false;
+        for entry in &mut project.entries {
+            let status = self.statuses.get(&entry.path).copied();
+            if entry.git_status != status {
+                entry.git_status = status;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn schedule_refresh(&mut self, force: bool, visible: bool) {
+        if self.request_pending || (!force && !visible) {
+            return;
+        }
+
+        let interval = if self.last_error.is_some() {
+            GIT_RETRY_INTERVAL
+        } else {
+            GIT_REFRESH_INTERVAL
+        };
+        if !force
+            && self
+                .last_request
+                .is_some_and(|last_request| last_request.elapsed() < interval)
+        {
+            return;
+        }
+
+        self.generation = self.generation.wrapping_add(1);
+        if self.worker.refresh_git(self.generation, self.root.clone()) {
+            self.request_pending = true;
+            self.last_request = Some(Instant::now());
+        } else {
+            self.last_error = Some("explorer background worker stopped".to_string());
         }
     }
 }
@@ -146,10 +272,8 @@ fn parse_git_status(root: &Path, output: &[u8]) -> HashMap<PathBuf, GitStatus> {
         let relative = path_from_git_bytes(&record[3..]);
         insert_status(&mut statuses, root, &relative, status);
 
-        // In porcelain v1's NUL-delimited format, rename and copy records have
-        // a second path field. The first path is the destination, which is the
-        // path present in the current project tree; consume the source field so
-        // it is not mistaken for another status record.
+        // NUL-delimited rename/copy records contain a second source path. The
+        // first path is the destination visible in the current project tree.
         if code.contains(&b'R') || code.contains(&b'C') {
             let _ = records.next();
         }
@@ -197,9 +321,8 @@ fn insert_status(
     let path = root.join(relative);
     merge_status(statuses, path.clone(), status);
 
-    // Bubble a summary marker up through loaded directories. This lets a
-    // collapsed folder communicate that it contains changes without scanning
-    // or mutating the UI tree on the worker thread.
+    // Bubble a summary marker through parent folders so collapsed directories
+    // can communicate that they contain changes.
     let mut parent = path.parent();
     while let Some(directory) = parent {
         if directory == root || !directory.starts_with(root) {
