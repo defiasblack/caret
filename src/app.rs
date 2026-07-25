@@ -482,7 +482,6 @@ impl App {
         project.width = settings.tree_width.clamp(22, 80);
         project.show_hidden = settings.show_hidden_files;
         let _ = project.refresh();
-        project.refresh_git_status();
         let show_dashboard = path.is_none() && settings.startup == StartupView::Dashboard;
         let mode = if show_dashboard {
             Mode::Dashboard
@@ -2700,6 +2699,7 @@ impl App {
         {
             Ok(()) => {
                 let _ = self.project.refresh();
+                self.project.request_git_refresh();
                 self.message = format!("Created {}", path.display());
             }
             Err(error) => self.message = format!("Create failed: {error}"),
@@ -2714,6 +2714,7 @@ impl App {
         match fs::create_dir(&path) {
             Ok(()) => {
                 let _ = self.project.refresh();
+                self.project.request_git_refresh();
                 self.message = format!("Created {}", path.display());
             }
             Err(error) => self.message = format!("Create failed: {error}"),
@@ -2735,6 +2736,7 @@ impl App {
         match fs::rename(&source, &destination) {
             Ok(()) => {
                 let _ = self.project.refresh();
+                self.project.request_git_refresh();
                 self.message = format!("Renamed to {}", destination.display());
             }
             Err(error) => self.message = format!("Rename failed: {error}"),
@@ -2800,6 +2802,7 @@ impl App {
         match fs::copy(&source, &destination) {
             Ok(_) => {
                 let _ = self.project.refresh();
+                self.project.request_git_refresh();
                 self.message = format!("Duplicated to {}", destination.display());
             }
             Err(error) => self.message = format!("Duplicate failed: {error}"),
@@ -2818,6 +2821,7 @@ impl App {
         match fs::rename(&source, &destination) {
             Ok(()) => {
                 let _ = self.project.refresh();
+                self.project.request_git_refresh();
                 self.message = format!("Moved to {}", destination.display());
             }
             Err(error) => self.message = format!("Move failed: {error}"),
@@ -2841,6 +2845,7 @@ impl App {
         match result {
             Ok(()) => {
                 let _ = self.project.refresh();
+                self.project.request_git_refresh();
                 self.message = format!("Deleted {}", path.display());
             }
             Err(error) => self.message = format!("Delete failed: {error}"),
@@ -2863,7 +2868,7 @@ impl App {
         }
         match command.output() {
             Ok(output) if output.status.success() => {
-                self.project.refresh_git_status();
+                self.project.request_git_refresh();
                 self.refresh_git_line_changes();
                 self.message = if stage {
                     "Staged selected file"
@@ -3423,7 +3428,10 @@ impl App {
             },
             KeyCode::Enter => self.activate_project_entry(),
             KeyCode::Char('r') => match self.project.refresh() {
-                Ok(()) => self.message = "File tree refreshed".to_string(),
+                Ok(()) => {
+                    self.project.request_git_refresh();
+                    self.message = "File tree refreshed".to_string();
+                }
                 Err(error) => self.message = format!("Refresh failed: {error}"),
             },
             KeyCode::Char('.') => match self.project.toggle_hidden() {
@@ -4656,7 +4664,7 @@ impl App {
         }
 
         self.refresh_git_line_changes();
-        self.project.refresh_git_status();
+        self.project.request_git_refresh();
         let mut summary = format!("Replaced {replaced} match(es) in {changed_files} file(s)");
         if skipped_dirty > 0 {
             summary.push_str(&format!(
@@ -5124,15 +5132,15 @@ impl App {
             "delete!" | "rm!" => self.delete_selected_project_entry(true),
             "refresh" | "reloadtree" => match self.project.refresh() {
                 Ok(()) => {
-                    self.project.refresh_git_status();
+                    self.project.request_git_refresh();
                     self.message = "File tree refreshed".to_string()
                 }
                 Err(error) => self.message = format!("Refresh failed: {error}"),
             },
             "gitrefresh" => {
-                self.project.refresh_git_status();
+                self.project.request_git_refresh();
                 self.refresh_git_line_changes();
-                self.message = "Git status and gutter refreshed".to_string();
+                self.message = "Git status refresh requested · gutter refreshed".to_string();
             }
             "stage" => self.git_selected(true),
             "unstage" => self.git_selected(false),
@@ -5804,7 +5812,7 @@ impl App {
             applied += 1;
         }
         let _ = self.project.refresh();
-        self.project.refresh_git_status();
+        self.project.request_git_refresh();
         self.refresh_git_line_changes();
         Ok(applied)
     }

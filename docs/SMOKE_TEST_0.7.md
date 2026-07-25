@@ -15,23 +15,29 @@ result for each platform.
 5. Use `Ctrl-F` and `Ctrl-H` with case, whole-word, regex, selection scope,
    history, replace-one, and replace-all. Confirm `Ctrl-Shift-F` / `:grep`
    searches the project and supports excluded-match replacement previews.
-6. Open `Ctrl-P` / `:files`, filter by a partial path, open a result, and verify
+6. Open a Git project with modified, added, deleted, and untracked files. Confirm
+   the tree appears immediately, the header briefly shows `git…`, status badges
+   update without blocking typing, collapsed folders summarize descendant
+   changes, `:gitrefresh` queues another refresh, and a non-Git folder remains
+   usable. Expand nested folders and verify `├─`, `└─`, and `│` guides terminate
+   correctly.
+7. Open `Ctrl-P` / `:files`, filter by a partial path, open a result, and verify
    recently opened files rank ahead of ordinary matches.
-7. Open `:settings`, search for `undo`, inspect a row, and verify each row shows
+8. Open `:settings`, search for `undo`, inspect a row, and verify each row shows
    current value, default, validation, and live/next-launch scope. Change a
    setting through `:set` and confirm the value updates in the browser.
-8. Open `:themes`; navigate with arrows, mouse hover, and the mouse wheel.
+9. Open `:themes`; navigate with arrows, mouse hover, and the mouse wheel.
    Apply a theme, cancel a preview, and confirm the large theme catalog remains
    scrollable in a normal terminal window.
-9. Open `:keybindings`, search for an action, rebind it with `:bind`, verify
+10. Open `:keybindings`, search for an action, rebind it with `:bind`, verify
    conflict warnings, then restore it with `:unbind` or `:bindreset`.
-10. Open the dashboard, project search, context menus, terminal pane, LSP
+11. Open the dashboard, project search, context menus, terminal pane, LSP
     panels, and Help. Confirm every panel closes with Esc and that the F1 pages
     describe the current 0.7 workflows.
-11. Quit with dirty tabs and verify save/discard/cancel behavior. Restart with
+12. Quit with dirty tabs and verify save/discard/cancel behavior. Restart with
     session restoration enabled and confirm tabs, splits, cursors, scroll, and
     sidebar state return.
-12. Run `caret doctor`, then run `cargo test --all-targets --all-features` and
+13. Run `caret doctor`, then run `cargo test --all-targets --all-features` and
     `cargo build --release` from the repository root.
 
 The CI matrix covers release builds, tests, formatting, Clippy, and diagnostics

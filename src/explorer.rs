@@ -4,7 +4,7 @@ use std::{
     fmt, io,
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
 };
@@ -93,10 +93,7 @@ impl ExplorerWorker {
     }
 
     fn try_recv(&self) -> Option<ExplorerEvent> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+        self.events.try_recv().ok()
     }
 }
 
@@ -110,30 +107,40 @@ pub struct ExplorerService {
     statuses: HashMap<PathBuf, GitStatus>,
     generation: u64,
     request_pending: bool,
+    refresh_queued: bool,
     last_request: Option<Instant>,
     last_error: Option<String>,
 }
 
 impl ExplorerService {
     pub fn new(root: PathBuf) -> io::Result<Self> {
-        let mut service = Self {
+        Ok(Self {
             worker: ExplorerWorker::new()?,
             root,
             statuses: HashMap::new(),
             generation: 0,
             request_pending: false,
+            refresh_queued: false,
             last_request: None,
             last_error: None,
-        };
-        service.schedule_refresh(true, true);
-        Ok(service)
+        })
     }
 
     /// Applies finished background work to the current tree and schedules the
     /// next refresh. Returns true when visible rows changed.
     pub fn poll(&mut self, project: &mut ProjectTree) -> bool {
-        if project.root != self.root {
+        let root_changed = project.root != self.root;
+        if root_changed {
             self.reset_for_root(project.root.clone());
+        }
+
+        let refresh_requested = project.take_git_refresh_request();
+        if root_changed || refresh_requested {
+            if self.request_pending {
+                self.refresh_queued = true;
+            } else {
+                self.schedule_refresh(true, true);
+            }
         }
 
         let mut changed = false;
@@ -165,10 +172,17 @@ impl ExplorerService {
             }
         }
 
+        if self.refresh_queued && !self.request_pending {
+            self.refresh_queued = false;
+            self.schedule_refresh(true, true);
+        } else {
+            self.schedule_refresh(false, project.visible);
+        }
+
         // Tree refreshes rebuild rows with empty status fields. Reapply the
         // cached snapshot even if no new worker event arrived this tick.
         changed |= self.apply_statuses(project);
-        self.schedule_refresh(false, project.visible);
+        changed |= self.sync_project_state(project);
         changed
     }
 
@@ -178,8 +192,8 @@ impl ExplorerService {
         self.last_error = None;
         self.last_request = None;
         self.request_pending = false;
+        self.refresh_queued = false;
         self.generation = self.generation.wrapping_add(1);
-        self.schedule_refresh(true, true);
     }
 
     fn apply_statuses(&self, project: &mut ProjectTree) -> bool {
@@ -190,6 +204,19 @@ impl ExplorerService {
                 entry.git_status = status;
                 changed = true;
             }
+        }
+        changed
+    }
+
+    fn sync_project_state(&self, project: &mut ProjectTree) -> bool {
+        let mut changed = false;
+        if project.git_refreshing != self.request_pending {
+            project.git_refreshing = self.request_pending;
+            changed = true;
+        }
+        if project.git_error != self.last_error {
+            project.git_error.clone_from(&self.last_error);
+            changed = true;
         }
         changed
     }
@@ -223,11 +250,18 @@ impl ExplorerService {
 }
 
 fn scan_git_status(root: &Path) -> io::Result<HashMap<PathBuf, GitStatus>> {
-    let output = Command::new("git")
+    let output = match Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-        .output()?;
+        .env("LC_ALL", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
+    };
 
     if output.status.success() {
         return Ok(parse_git_status(root, &output.stdout));
@@ -238,14 +272,11 @@ fn scan_git_status(root: &Path) -> io::Result<HashMap<PathBuf, GitStatus>> {
         return Ok(HashMap::new());
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        if message.is_empty() {
-            "git status failed without an error message".to_string()
-        } else {
-            message
-        },
-    ))
+    Err(io::Error::other(if message.is_empty() {
+        "git status failed without an error message".to_string()
+    } else {
+        message
+    }))
 }
 
 fn parse_git_status(root: &Path, output: &[u8]) -> HashMap<PathBuf, GitStatus> {
@@ -397,6 +428,43 @@ mod tests {
             statuses.get(&root.join("README.md")),
             Some(&GitStatus::Modified)
         );
+    }
+
+    #[test]
+    fn scans_a_real_repository_with_spaces_in_paths() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "caret-explorer-git-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("folder with spaces")).unwrap();
+
+        let initialized = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(&root)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !initialized {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+
+        std::fs::write(root.join("folder with spaces/new file.txt"), "content").unwrap();
+        let statuses = scan_git_status(&root).unwrap();
+        assert_eq!(
+            statuses.get(&root.join("folder with spaces/new file.txt")),
+            Some(&GitStatus::Untracked)
+        );
+        assert_eq!(
+            statuses.get(&root.join("folder with spaces")),
+            Some(&GitStatus::Untracked)
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

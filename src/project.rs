@@ -2,7 +2,6 @@ use std::{
     collections::HashSet,
     fs, io,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use ignore::gitignore::Gitignore;
@@ -20,6 +19,9 @@ pub struct ProjectEntry {
     pub is_symlink: bool,
     pub expanded: bool,
     pub git_status: Option<GitStatus>,
+    /// Whether each ancestor has a later sibling and therefore needs a guide.
+    pub guides: Vec<bool>,
+    pub is_last: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,8 +43,11 @@ pub struct ProjectTree {
     /// Substring filter over project-relative paths; empty shows the tree.
     pub filter: String,
     pub width: usize,
+    pub git_refreshing: bool,
+    pub git_error: Option<String>,
     expanded: HashSet<PathBuf>,
     ignore_rules: Option<Gitignore>,
+    git_refresh_requested: bool,
 }
 
 impl ProjectTree {
@@ -61,7 +66,10 @@ impl ProjectTree {
             show_hidden: false,
             filter: String::new(),
             width: 40,
+            git_refreshing: false,
+            git_error: None,
             expanded,
+            git_refresh_requested: true,
         };
         tree.refresh()?;
         Ok(tree)
@@ -90,7 +98,15 @@ impl ProjectTree {
             ignore_rules: self.ignore_rules.as_ref(),
         };
         if self.filter.trim().is_empty() {
-            collect_entries(&self.root, 0, &self.expanded, view, &mut entries)?;
+            let mut guides = Vec::new();
+            collect_entries(
+                &self.root,
+                0,
+                &self.expanded,
+                view,
+                &mut guides,
+                &mut entries,
+            )?;
         } else {
             collect_filtered_entries(
                 &self.root,
@@ -100,6 +116,10 @@ impl ProjectTree {
                 0,
                 &mut entries,
             );
+            let length = entries.len();
+            for (index, entry) in entries.iter_mut().enumerate() {
+                entry.is_last = index + 1 == length;
+            }
         }
 
         self.entries = entries;
@@ -118,42 +138,12 @@ impl ProjectTree {
         Ok(())
     }
 
-    pub fn refresh_git_status(&mut self) {
-        let Ok(output) = Command::new("git")
-            .args(["-C"])
-            .arg(&self.root)
-            .args(["status", "--porcelain"])
-            .output()
-        else {
-            return;
-        };
-        if !output.status.success() {
-            return;
-        }
-        for entry in &mut self.entries {
-            entry.git_status = None;
-        }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if line.len() < 4 {
-                continue;
-            }
-            let code = &line[..2];
-            let path = self.root.join(&line[3..]);
-            let status = if code == "??" {
-                Some(GitStatus::Untracked)
-            } else if code.contains('D') {
-                Some(GitStatus::Deleted)
-            } else if code.contains('A') {
-                Some(GitStatus::Added)
-            } else if code.contains('M') {
-                Some(GitStatus::Modified)
-            } else {
-                None
-            };
-            if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
-                entry.git_status = status;
-            }
-        }
+    pub fn request_git_refresh(&mut self) {
+        self.git_refresh_requested = true;
+    }
+
+    pub(crate) fn take_git_refresh_request(&mut self) -> bool {
+        std::mem::take(&mut self.git_refresh_requested)
     }
 
     pub fn set_root(&mut self, root: PathBuf) -> io::Result<()> {
@@ -164,6 +154,9 @@ impl ProjectTree {
         self.selected = 0;
         self.scroll = 0;
         self.filter.clear();
+        self.git_refreshing = false;
+        self.git_error = None;
+        self.git_refresh_requested = true;
         self.refresh()
     }
 
@@ -494,6 +487,7 @@ fn collect_entries(
     depth: usize,
     expanded: &HashSet<PathBuf>,
     view: TreeView,
+    guides: &mut Vec<bool>,
     output: &mut Vec<ProjectEntry>,
 ) -> io::Result<()> {
     if depth > MAX_TREE_DEPTH {
@@ -508,7 +502,9 @@ fn collect_entries(
         Err(error) => return Err(error),
     };
 
-    for child in children {
+    let child_count = children.len();
+    for (index, child) in children.into_iter().enumerate() {
+        let is_last = index + 1 == child_count;
         let is_expanded = child.is_dir && expanded.contains(&child.path);
         output.push(ProjectEntry {
             path: child.path.clone(),
@@ -518,10 +514,14 @@ fn collect_entries(
             is_symlink: child.is_symlink,
             expanded: is_expanded,
             git_status: None,
+            guides: guides.clone(),
+            is_last,
         });
 
         if is_expanded {
-            collect_entries(&child.path, depth + 1, expanded, view, output)?;
+            guides.push(!is_last);
+            collect_entries(&child.path, depth + 1, expanded, view, guides, output)?;
+            guides.pop();
         }
     }
 
@@ -570,6 +570,8 @@ fn collect_filtered_entries(
                 is_symlink: child.is_symlink,
                 expanded: false,
                 git_status: None,
+                guides: Vec::new(),
+                is_last: false,
             });
         }
     }
@@ -649,9 +651,51 @@ mod tests {
         tree.set_filter("main".to_string()).unwrap();
         assert_eq!(tree.entries.len(), 1);
         assert!(tree.entries[0].name.contains("main.rs"));
+        assert!(tree.entries[0].is_last);
 
         tree.set_filter(String::new()).unwrap();
         assert!(tree.entries.len() > 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn git_refresh_requests_are_edge_triggered() {
+        let root = temp_root("git-request");
+        let mut tree = ProjectTree::new(root.clone()).unwrap();
+
+        assert!(tree.take_git_refresh_request());
+        assert!(!tree.take_git_refresh_request());
+        tree.request_git_refresh();
+        assert!(tree.take_git_refresh_request());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn connector_metadata_tracks_last_children() {
+        let root = temp_root("guides");
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::write(root.join("src/a.rs"), "a").unwrap();
+        fs::write(root.join("src/z.rs"), "z").unwrap();
+
+        let mut tree = ProjectTree::new(root.clone()).unwrap();
+        let src_index = tree
+            .entries
+            .iter()
+            .position(|entry| entry.name == "src")
+            .unwrap();
+        tree.selected = src_index;
+        tree.expand_selected().unwrap();
+
+        let children = tree
+            .entries
+            .iter()
+            .filter(|entry| entry.depth == 1)
+            .collect::<Vec<_>>();
+        assert!(!children.is_empty());
+        assert!(children.last().unwrap().is_last);
+        assert!(children
+            .iter()
+            .all(|entry| entry.guides.len() == 1 && !entry.guides[0]));
         let _ = fs::remove_dir_all(root);
     }
 

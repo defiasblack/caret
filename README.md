@@ -134,9 +134,9 @@ The sidebar now defaults to 40 columns and can be resized from 22 to 80 columns.
 | `r` | Refresh the tree |
 | `Esc` | Return focus to the editor |
 
-The folder tree uses wider indentation, connector guides, explicit `DIR`
-markers, and trailing `/` characters so nested folder structure is easier to
-read.
+The folder tree uses terminating connector guides, compact file and directory
+markers, trailing `/` characters, and right-aligned Git badges so nested
+structure and change state remain easy to read.
 
 ## Editor keys
 

@@ -22,6 +22,7 @@ impl App {
     pub(super) fn save_all_internal(&mut self) -> bool {
         let (saved, errors) = self.editor.save_all();
         let _ = self.project.refresh();
+        self.project.request_git_refresh();
 
         if errors.is_empty() {
             self.message = if saved == 0 {
@@ -55,7 +56,7 @@ impl App {
                     }
                 };
                 let _ = self.project.refresh();
-                self.project.refresh_git_status();
+                self.project.request_git_refresh();
                 self.refresh_git_line_changes();
                 self.message = if hooks == 0 {
                     format!("Saved {}", path.display())
@@ -85,7 +86,7 @@ impl App {
                     }
                 };
                 let _ = self.project.refresh();
-                self.project.refresh_git_status();
+                self.project.request_git_refresh();
                 self.refresh_git_line_changes();
                 let name = self
                     .editor
