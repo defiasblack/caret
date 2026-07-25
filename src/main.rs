@@ -38,6 +38,7 @@ use crossterm::{
         LeaveAlternateScreen,
     },
 };
+use explorer::ExplorerService;
 
 struct TerminalGuard;
 
@@ -121,6 +122,7 @@ fn parse_args() -> Option<PathBuf> {
 }
 
 fn run<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
+    let mut explorer = ExplorerService::new(app.project.root.clone())?;
     ui::draw(out, app)?;
 
     while !app.should_quit {
@@ -129,7 +131,7 @@ fn run<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         } else {
             app.poll_background()
         };
-        changed |= app.project.poll_background();
+        changed |= explorer.poll(&mut app.project);
 
         if changed && !app.should_quit {
             ui::draw(out, app)?;
