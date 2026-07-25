@@ -7,6 +7,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/source-snapshot.yml"
+      - ".github/workflows/apply-explorer-upgrade.yml"
 
 permissions:
   contents: read
@@ -23,6 +24,7 @@ jobs:
         with:
           name: caret-source
           path: |
+            README.md
             Cargo.toml
             Cargo.lock
             src
@@ -30,4 +32,6 @@ jobs:
             tests
             examples
             .github/workflows/ci.yml
+            .github/workflows/source-snapshot.yml
+            .github/workflows/apply-explorer-upgrade.yml
           if-no-files-found: warn
