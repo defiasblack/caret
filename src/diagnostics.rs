@@ -1,5 +1,6 @@
 use std::{
-    fs, io,
+    fs,
+    io::{self, IsTerminal},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -46,11 +47,28 @@ pub fn report(version: &str) -> String {
         .or_else(|_| std::env::var("COMSPEC"))
         .unwrap_or_else(|_| "not detected".to_string());
     let color = std::env::var("COLORTERM").unwrap_or_else(|_| "not reported".to_string());
-    let clipboard = if arboard::Clipboard::new().is_ok() {
+    let desktop_clipboard = if arboard::Clipboard::new().is_ok() {
         "available"
     } else {
-        "unavailable (internal clipboard remains available)"
+        "unavailable"
     };
+    let ansi = terminal != "dumb" && terminal != "not set";
+    let color_mode = if std::env::var_os("NO_COLOR").is_some() {
+        "disabled by NO_COLOR"
+    } else if color.to_ascii_lowercase().contains("truecolor")
+        || color.to_ascii_lowercase().contains("24bit")
+    {
+        "truecolor reported"
+    } else if terminal.contains("256color") {
+        "256-color reported"
+    } else {
+        "not reported"
+    };
+    let ssh = std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some();
+    let tmux = std::env::var_os("TMUX").is_some();
+    let osc52 = ssh || desktop_clipboard == "unavailable";
     let (settings, config_error) = crate::config::load();
     let configuration = config_error.map_or_else(
         || {
@@ -64,9 +82,11 @@ pub fn report(version: &str) -> String {
         |error| format!("invalid · {error}"),
     );
     format!(
-        "Caret diagnostic report\nversion: {version}\nos: {} {}\nterminal: {terminal}\nterminal color: {color}\nshell: {shell}\nconfig: {} ({configuration})\nrecovery: {}\nlog: {}\nlsp stderr: structured records in log\nclipboard: {clipboard}",
+        "Caret diagnostic report\nversion: {version}\nos: {} {}\nterminal: {terminal}\nterminal color: {color}\nterminal capabilities: stdin_tty={} stdout_tty={} ansi={ansi} color={color_mode} ssh={ssh} tmux={tmux}\nshell: {shell}\nconfig: {} ({configuration})\nrecovery: {}\nlog: {}\nlsp stderr: structured records in log\nfilesystem background: explorer failures are recorded in log\nwatcher: not enabled in 0.6\npreview service: not enabled in 0.6\nclipboard: desktop={desktop_clipboard} osc52_fallback={osc52} internal=available",
         std::env::consts::OS,
         std::env::consts::ARCH,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
         crate::config::config_path().display(),
         crate::document::recovery_dir().display(),
         log_path().display(),
@@ -82,7 +102,11 @@ mod tests {
         let report = report("test");
         assert!(report.contains("version: test"));
         assert!(report.contains("os:"));
-        assert!(report.contains("clipboard:"));
+        assert!(report.contains("terminal capabilities:"));
+        assert!(report.contains("filesystem background:"));
+        assert!(report.contains("watcher:"));
+        assert!(report.contains("preview service:"));
+        assert!(report.contains("clipboard: desktop="));
         assert!(report.contains("configuration") || report.contains("config:"));
     }
 

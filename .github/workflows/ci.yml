@@ -33,7 +33,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
@@ -66,3 +66,12 @@ jobs:
 
       - name: Smoke-test command-line diagnostics
         run: cargo run --locked -- doctor
+
+      - name: Smoke-test Unix installer
+        if: runner.os == 'Linux'
+        env:
+          CARET_INSTALL_DIR: ${{ runner.temp }}/caret-install/bin
+        run: |
+          ./install.sh
+          "$CARET_INSTALL_DIR/caret" --version
+          "$CARET_INSTALL_DIR/caret" doctor

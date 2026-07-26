@@ -4,6 +4,9 @@ Milestone 0.6 is not complete until Caret has been used for sustained real
 editing with no unresolved data-loss defect. Automated PTY and failure-path
 tests are prerequisites, not substitutes for this gate.
 
+Release-candidate version: **0.6.0-rc.1**. Record the exact candidate commit
+after its complete CI matrix passes, before beginning timed sessions.
+
 ## Entry requirements
 
 - Record the exact release-candidate commit.

@@ -16,9 +16,11 @@ differences that automation can miss.
    BOM, CRLF endings, and final-newline state are unchanged.
 2. Start editing a named file, wait at least two seconds, then forcibly stop
    Caret (Task Manager on Windows, `kill -9` on macOS/Linux). Restart Caret and
-   confirm the recovery notice lists the filename and timestamp. Use
-   `:recovercompare 1`, then `:recover 1`; verify the unsaved text and cursor
-   position return. Run `:discardrecovery` after verification.
+   confirm the recovery notice lists the filename and timestamp. Open a
+   different file, use `:recovercompare 1`, then `:recover 1`; verify Caret
+   switches to the snapshot's recorded file and restores its unsaved text and
+   cursor without modifying the unrelated file. Run `:discardrecovery` after
+   verification.
 3. Edit a file in Caret, modify or delete it from another program, then return
    to Caret. Confirm that save is blocked until you explicitly choose Reload,
    Keep/Overwrite, or Compare. Verify Compare does not modify either version.

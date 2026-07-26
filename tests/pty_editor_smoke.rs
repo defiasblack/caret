@@ -184,6 +184,12 @@ fn edits_saves_and_exits_cleanly_in_a_real_pty() {
         recovery_journals, 0,
         "clean exit left a crash-recovery journal"
     );
+    let session: serde_json::Value = serde_json::from_slice(
+        &fs::read(data_dir.join("session.json")).expect("clean exit did not save session state"),
+    )
+    .expect("saved session is invalid");
+    assert_eq!(session["tabs"][0]["path"], file.to_string_lossy().as_ref());
+    assert_eq!(session["tabs"][0]["cursor"]["column"], 5);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -191,10 +197,12 @@ fn edits_saves_and_exits_cleanly_in_a_real_pty() {
 fn forced_termination_is_reported_by_the_next_real_pty_session() {
     let root = temp_root();
     let file = root.join("recovery.txt");
+    let unrelated = root.join("unrelated.txt");
     let data_dir = root.join("data");
     let config_dir = root.join("config");
     fs::create_dir_all(&root).expect("create smoke directory");
     fs::write(&file, "original").expect("create smoke file");
+    fs::write(&unrelated, "must remain unchanged").expect("create unrelated file");
 
     let mut first = PtyProcess::start(&file, &data_dir, &config_dir);
     first.wait_for_output(b"-- INSERT --", Duration::from_secs(10));
@@ -236,7 +244,9 @@ fn forced_termination_is_reported_by_the_next_real_pty_session() {
     );
     fs::write(&config_path, vim_config).expect("select Vim profile for command input");
 
-    let mut second = PtyProcess::start(&file, &data_dir, &config_dir);
+    // Start on a different file: recovery must honor the path recorded in the
+    // snapshot instead of replacing whichever tab happens to be active.
+    let mut second = PtyProcess::start(&unrelated, &data_dir, &config_dir);
     second.wait_for_output(b"Recovery:", Duration::from_secs(10));
     second.send(b":recover 1\r");
     second.wait_for_output(b"Recovered", Duration::from_secs(10));
@@ -247,6 +257,10 @@ fn forced_termination_is_reported_by_the_next_real_pty_session() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(fs::read_to_string(&file).unwrap(), "unsaved original");
+    assert_eq!(
+        fs::read_to_string(&unrelated).unwrap(),
+        "must remain unchanged"
+    );
     second.send(&[0x11]); // Ctrl-Q
     assert!(second.wait_for_exit(Duration::from_secs(10)).success());
 

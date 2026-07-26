@@ -112,6 +112,22 @@ fn atomic_write_impl<F>(path: &Path, bytes: &[u8], before_replace: F) -> io::Res
 where
     F: FnOnce(&Path) -> io::Result<()>,
 {
+    atomic_write_impl_with_writer(path, bytes, before_replace, |file, bytes| {
+        use std::io::Write;
+        file.write_all(bytes)
+    })
+}
+
+fn atomic_write_impl_with_writer<F, W>(
+    path: &Path,
+    bytes: &[u8],
+    before_replace: F,
+    write: W,
+) -> io::Result<()>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+    W: FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
+{
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -124,7 +140,7 @@ where
     let (temp, mut file) = create_temporary_file(parent, name)?;
     let result = (|| {
         use std::io::Write;
-        file.write_all(bytes)?;
+        write(&mut file, bytes)?;
         file.flush()?;
         file.sync_all()?;
         if let Ok(metadata) = fs::metadata(path) {
@@ -275,6 +291,44 @@ mod tests {
     }
 
     #[test]
+    fn simulated_disk_full_removes_partial_temp_and_preserves_original() {
+        use std::io::Write;
+
+        let path = temp("disk-full");
+        fs::write(&path, b"important original").unwrap();
+        let error = atomic_write_impl_with_writer(
+            &path,
+            b"complete replacement",
+            |_| Ok(()),
+            |file, bytes| {
+                file.write_all(&bytes[..5])?;
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "simulated disk full",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(fs::read(&path).unwrap(), b"important original");
+        let parent = path.parent().unwrap();
+        let name = path.file_name().unwrap().to_string_lossy();
+        let partial_temps = fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(".{name}.caret-"))
+            })
+            .count();
+        assert_eq!(partial_temps, 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn fingerprint_changes_when_same_length_content_changes() {
         let path = temp("fingerprint");
         fs::write(&path, b"one").unwrap();
@@ -336,6 +390,25 @@ mod tests {
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_readonly(false);
         fs::set_permissions(&path, permissions).unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_preserves_a_destination_locked_against_replacement() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = temp("locked");
+        fs::write(&path, b"important original").unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        assert!(atomic_write(&path, b"replacement").is_err());
+        drop(lock);
+        assert_eq!(fs::read(&path).unwrap(), b"important original");
         let _ = fs::remove_file(path);
     }
 }

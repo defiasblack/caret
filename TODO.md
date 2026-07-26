@@ -38,16 +38,19 @@ It was reconciled against the repository on 2026-07-25.
   metadata.
 - [x] Periodic crash-recovery journal with discovery, compare, recover, and
   discard workflows in the platform application-data directory, with unique
-  per-process-instance journals and partial recovery when another journal is
-  corrupt.
+  per-process-instance journals, partial recovery when another journal is
+  corrupt, path-targeted recovery, and dirty-target refusal.
 - [x] Session restoration for projects, tabs, active tab, cursor and scroll
-  positions, split layout, and sidebar state; terminal processes are excluded.
+  positions, split layout, and sidebar state; clean exit forces a final durable
+  checkpoint, missing tabs cannot shift the active surviving tab, stale view
+  positions are clamped, and terminal processes are excluded.
 - [x] External-change reload, overwrite, compare, and defer protection,
   including deleted and same-size replaced files, Save All, Save As, project
   replacement, plugins, and LSP/formatting save paths.
 - [x] Structured diagnostics and panic logs, terminal restoration,
   `caret doctor`, `:doctor`, `:copydiagnostics`, LSP stderr capture, terminal
-  capability reporting, and clipboard capability reporting.
+  capability reporting, clipboard capability reporting, background explorer
+  failure logging, and explicit watcher/preview-service status.
 - [x] Headless SSH clipboard fallback through OSC 52.
 - [x] Focused reliability modules for documents, platform replacement,
   recovery, sessions, diagnostics, LSP transport, persistence, settings, tabs,
@@ -55,7 +58,8 @@ It was reconciled against the repository on 2026-07-25.
   `docs/ARCHITECTURE.md`.
 - [x] Automated recovery, interrupted/write-failure save, encoding, Unicode,
   external-change, session, configuration, platform-path, shell, and PTY
-  regression coverage, including forced process termination, broken symlinks,
+  regression coverage, including simulated disk exhaustion, Windows
+  replacement locks, forced process termination, broken symlinks,
   permission-denied/disappearing directories, unsafe path traversal, and
   destructive-operation guards.
 - [x] End-to-end real-PTY release tests for edit/save/clean exit, repeated
@@ -63,7 +67,7 @@ It was reconciled against the repository on 2026-07-25.
   forced termination, recovery discovery, restore, and re-save on every CI
   platform.
 - [x] Windows, macOS, and Linux CI build/test/diagnostic matrix plus Ubuntu
-  install and PTY startup smoke coverage.
+  locked-install and PTY startup smoke coverage, with warnings denied.
 
 ### Remaining release work
 

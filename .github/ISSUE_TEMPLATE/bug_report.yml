@@ -14,7 +14,7 @@ body:
     attributes:
       label: Caret version
       description: Run `caret --version`, or provide the commit SHA if building from source.
-      placeholder: "caret 0.5.0"
+      placeholder: "caret 0.6.0-rc.1"
     validations:
       required: true
 

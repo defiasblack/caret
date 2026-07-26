@@ -722,40 +722,51 @@ impl App {
             }
             self.last_recovery_checkpoint = Instant::now();
         }
-        if self.settings.restore_session
-            && self.last_session_checkpoint.elapsed() >= Duration::from_secs(2)
-        {
-            let session = crate::session::SessionState {
-                project_root: self.project.root.clone(),
-                tabs: self.editor.session_tabs(),
-                active_tab: self.editor.active_index(),
-                sidebar_visible: self.project.visible,
-                sidebar_outline: self.sidebar_view == SidebarView::Outline,
-                split: self.split_views.map(|split| crate::session::SplitState {
-                    primary: crate::session::ViewState {
-                        tab_index: split.primary.tab_index,
-                        cursor: split.primary.cursor.into(),
-                        scroll_line: split.primary.scroll_line,
-                        scroll_column: split.primary.scroll_column,
-                    },
-                    secondary: crate::session::ViewState {
-                        tab_index: split.secondary.tab_index,
-                        cursor: split.secondary.cursor.into(),
-                        scroll_line: split.secondary.scroll_line,
-                        scroll_column: split.secondary.scroll_column,
-                    },
-                    secondary_active: split.secondary_active,
-                    vertical: split.vertical,
-                }),
-            };
-            if self.last_session_state.as_ref() != Some(&session) {
-                match crate::session::save(&session) {
-                    Ok(()) => self.last_session_state = Some(session),
-                    Err(error) => self.message = format!("Session checkpoint failed: {error}"),
-                }
-            }
-            self.last_session_checkpoint = Instant::now();
+        if let Err(error) = self.checkpoint_session(false) {
+            self.message = format!("Session checkpoint failed: {error}");
         }
+    }
+
+    fn current_session_state(&self) -> crate::session::SessionState {
+        crate::session::SessionState {
+            project_root: self.project.root.clone(),
+            tabs: self.editor.session_tabs(),
+            active_tab: self.editor.active_index(),
+            sidebar_visible: self.project.visible,
+            sidebar_outline: self.sidebar_view == SidebarView::Outline,
+            split: self.split_views.map(|split| crate::session::SplitState {
+                primary: crate::session::ViewState {
+                    tab_index: split.primary.tab_index,
+                    cursor: split.primary.cursor.into(),
+                    scroll_line: split.primary.scroll_line,
+                    scroll_column: split.primary.scroll_column,
+                },
+                secondary: crate::session::ViewState {
+                    tab_index: split.secondary.tab_index,
+                    cursor: split.secondary.cursor.into(),
+                    scroll_line: split.secondary.scroll_line,
+                    scroll_column: split.secondary.scroll_column,
+                },
+                secondary_active: split.secondary_active,
+                vertical: split.vertical,
+            }),
+        }
+    }
+
+    pub(super) fn checkpoint_session(&mut self, force: bool) -> io::Result<()> {
+        if !self.settings.restore_session
+            || (!force && self.last_session_checkpoint.elapsed() < Duration::from_secs(2))
+        {
+            return Ok(());
+        }
+
+        let session = self.current_session_state();
+        if self.last_session_state.as_ref() != Some(&session) {
+            crate::session::save(&session)?;
+            self.last_session_state = Some(session);
+        }
+        self.last_session_checkpoint = Instant::now();
+        Ok(())
     }
 
     fn dispatch_event(&mut self, event: Event) -> bool {
@@ -1974,7 +1985,7 @@ impl App {
                     self.mode = Mode::Command;
                     self.message = "Enter a file or folder path".to_string();
                 }
-                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('q') => self.finish_quit(),
                 KeyCode::F(1) | KeyCode::Char('?') => self.open_help(),
                 _ => {}
             }
@@ -2265,12 +2276,11 @@ impl App {
                 self.message = "Quit cancelled".to_string();
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                let _ = crate::recovery::discard_current();
-                self.should_quit = true;
+                self.finish_quit();
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 if self.save_all_internal() {
-                    self.should_quit = true;
+                    self.finish_quit();
                 } else {
                     // A common reason is an unnamed tab that needs a filename.
                     // Return to the editor and preserve the detailed save error.
@@ -5554,20 +5564,20 @@ impl App {
                         self.message = "Recovery snapshot index is out of range".to_string();
                         return;
                     };
-                    self.editor.replace_text(&entry.text);
-                    self.editor.cursor = Cursor {
-                        line: entry.cursor_line,
-                        column: entry.cursor_column,
-                    };
-                    self.message = format!(
-                        "Recovered {} from {}",
-                        entry
-                            .path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "untitled buffer".to_string()),
-                        entry.saved_unix_secs
-                    );
+                    match self.apply_recovery_entry(entry) {
+                        Ok(()) => {
+                            self.message = format!(
+                                "Recovered {} from {}",
+                                entry
+                                    .path
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "untitled buffer".to_string()),
+                                entry.saved_unix_secs
+                            );
+                        }
+                        Err(error) => self.message = format!("Recovery failed: {error}"),
+                    }
                 }
                 Err(error) => self.message = format!("Recovery load failed: {error}"),
             },
@@ -5578,10 +5588,27 @@ impl App {
                         self.message = "Recovery snapshot index is out of range".to_string();
                         return;
                     };
-                    let current = self.editor.text();
+                    let current = match self.recovery_comparison_text(entry) {
+                        Ok(current) => current,
+                        Err(error) => {
+                            self.message = format!("Recovery comparison failed: {error}");
+                            return;
+                        }
+                    };
                     self.git_diff_lines = recovery_diff_lines(&current, &entry.text);
                     self.git_diff_scroll = 0;
-                    self.git_diff_title = format!("RECOVERY SNAPSHOT {}", index + 1);
+                    self.git_diff_title = entry.path.as_ref().map_or_else(
+                        || format!("RECOVERY SNAPSHOT {}", index + 1),
+                        |path| {
+                            format!(
+                                "RECOVERY {} · {}",
+                                index + 1,
+                                path.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("file")
+                            )
+                        },
+                    );
                     self.git_diff_return_mode = self.preferred_editor_mode();
                     self.mode = Mode::GitDiff;
                 }
@@ -5616,6 +5643,59 @@ impl App {
             "format" => self.request_formatting(),
             "help" | "h" => self.open_help(),
             _ => self.message = format!("Unknown command: {command}"),
+        }
+    }
+
+    fn apply_recovery_entry(
+        &mut self,
+        entry: &crate::recovery::RecoveryEntry,
+    ) -> Result<(), String> {
+        if let Some(path) = &entry.path {
+            if self
+                .editor
+                .editor_for_path_mut(path)
+                .is_some_and(|editor| editor.dirty)
+            {
+                return Err(format!(
+                    "{} already has unsaved changes; use :recovercompare before replacing it",
+                    path.display()
+                ));
+            }
+            self.editor
+                .open_or_switch(path)
+                .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+        } else {
+            self.editor.new_buffer();
+        }
+
+        self.editor.replace_text(&entry.text);
+        self.editor.cursor.line = entry
+            .cursor_line
+            .min(self.editor.line_count().saturating_sub(1));
+        self.editor.cursor.column = entry
+            .cursor_column
+            .min(self.editor.line_len_chars(self.editor.cursor.line));
+        self.explorer_focused = false;
+        self.mode = self.preferred_editor_mode();
+        self.pending_key = None;
+        self.search_origin = self.editor.cursor;
+        Ok(())
+    }
+
+    fn recovery_comparison_text(
+        &mut self,
+        entry: &crate::recovery::RecoveryEntry,
+    ) -> Result<String, String> {
+        let Some(path) = &entry.path else {
+            return Ok(self.editor.text());
+        };
+        if let Some(editor) = self.editor.editor_for_path_mut(path) {
+            return Ok(editor.text());
+        }
+        match crate::document::read_text(path) {
+            Ok((text, _)) => Ok(text),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(format!("could not read {}: {error}", path.display())),
         }
     }
 
@@ -7134,6 +7214,131 @@ mod tests {
             .expect("start recovery verifier");
         assert!(verifier.success(), "recovery was not discovered on startup");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_save_and_quit_checkpoints_the_latest_session_and_removes_its_journal() {
+        let root =
+            std::env::temp_dir().join(format!("caret-app-clean-exit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("important.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::clean_save_and_quit_child_process",
+                "--nocapture",
+            ])
+            .env("CARET_DATA_DIR", root.join("data"))
+            .env("CARET_CONFIG_DIR", root.join("config"))
+            .env("CARET_CLEAN_EXIT_CHILD", &file)
+            .status()
+            .expect("start clean-exit child");
+
+        assert!(status.success(), "clean-exit child failed");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unsaved original");
+        let session: crate::session::SessionState = serde_json::from_slice(
+            &std::fs::read(root.join("data/session.json")).expect("final session checkpoint"),
+        )
+        .unwrap();
+        assert_eq!(session.tabs.len(), 1);
+        assert_eq!(session.tabs[0].path, file);
+        assert_eq!(session.tabs[0].cursor.column, "unsaved ".len());
+
+        let journals = std::fs::read_dir(root.join("data/recovery"))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("journal-"))
+            .count();
+        assert_eq!(journals, 0, "clean exit left a stale recovery journal");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_save_and_quit_child_process() {
+        let Some(path) = std::env::var_os("CARET_CLEAN_EXIT_CHILD").map(PathBuf::from) else {
+            return;
+        };
+        let mut app = App::new(Some(&path)).expect("create clean-exit child app");
+        app.settings.restore_session = true;
+        app.mode = Mode::Insert;
+        app.editor.insert_text("unsaved ");
+        app.last_recovery_checkpoint = Instant::now() - Duration::from_secs(3);
+        app.checkpoint_persistence();
+
+        let journal_exists = std::fs::read_dir(crate::document::recovery_dir())
+            .expect("recovery directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("journal-"));
+        assert!(journal_exists, "dirty work was not checkpointed");
+
+        app.request_quit(false);
+        assert_eq!(app.mode, Mode::QuitConfirm);
+        app.handle_quit_confirmation(key('s'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn recovery_targets_its_recorded_file_instead_of_the_active_tab() {
+        let root =
+            std::env::temp_dir().join(format!("caret-app-recovery-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.txt");
+        let unrelated = root.join("unrelated.txt");
+        std::fs::write(&target, "disk target").unwrap();
+        std::fs::write(&unrelated, "leave alone").unwrap();
+        let mut app = App::new(Some(&unrelated)).unwrap();
+        let entry = crate::recovery::RecoveryEntry {
+            path: Some(target.clone()),
+            text: "recovered target".to_string(),
+            cursor_line: 0,
+            cursor_column: 999,
+            saved_unix_secs: 1,
+        };
+
+        app.apply_recovery_entry(&entry).unwrap();
+
+        assert_eq!(
+            app.editor
+                .path
+                .as_deref()
+                .and_then(|path| std::fs::canonicalize(path).ok()),
+            std::fs::canonicalize(&target).ok()
+        );
+        assert_eq!(app.editor.text(), "recovered target");
+        assert_eq!(app.editor.cursor.column, "recovered target".len());
+        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "leave alone");
+        assert_eq!(
+            app.recovery_comparison_text(&entry).unwrap(),
+            "recovered target"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_refuses_to_replace_an_already_dirty_target() {
+        let path =
+            std::env::temp_dir().join(format!("caret-app-recovery-dirty-{}", std::process::id()));
+        std::fs::write(&path, "disk").unwrap();
+        let mut app = App::new(Some(&path)).unwrap();
+        app.editor.insert_text("local ");
+        let entry = crate::recovery::RecoveryEntry {
+            path: Some(path.clone()),
+            text: "recovered".to_string(),
+            cursor_line: 0,
+            cursor_column: 0,
+            saved_unix_secs: 1,
+        };
+
+        let error = app.apply_recovery_entry(&entry).unwrap_err();
+
+        assert!(error.contains("already has unsaved changes"));
+        assert_eq!(app.editor.text(), "local disk");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

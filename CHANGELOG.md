@@ -6,8 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Unreleased
 
+## 0.6.0-rc.1 - 2026-07-25
+
 ### Added
 
+- Release-grade failure coverage for simulated disk exhaustion, Windows
+  replacement locks, clean-exit session durability, missing session tabs, and
+  recovery into the snapshot's recorded file.
+- Expanded `caret doctor` terminal, SSH, tmux, color, clipboard, background
+  filesystem, watcher, and preview-service capability reporting.
+- An isolated Ubuntu installer smoke test in CI; the installer now honors
+  `CARET_INSTALL_DIR` and builds from the locked dependency graph.
 - Complete find-and-replace panel (Ctrl-F to find, Ctrl-H or :replace to
   replace): case-sensitivity, whole-word, and regex toggles, replace
   one/all, search within a multi-line selection, recallable search
@@ -50,6 +59,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   edit/save/quit, repeated-save, external-conflict, forced-termination, startup
   discovery, recovery, and re-save workflows. Unchanged session snapshots are
   not rewritten during idle polling.
+- Every successful or explicitly discarded quit now forces the latest session
+  state to durable storage and removes the current process's recovery journal.
+  Session restore skips missing tabs without shifting the selected surviving
+  tab and clamps stale cursor and scroll positions.
+- Recovery opens the path recorded in the selected snapshot instead of
+  replacing an unrelated active tab, refuses to replace a dirty target, and
+  compares against the recorded target. Path matching remains correct across
+  canonical, recased, and Windows extended-path forms.
 - Existing project-tree mutations now refuse destination replacement at the
   filesystem boundary, reject project-root traversal, and block permanent
   deletion of an open dirty file.

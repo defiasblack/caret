@@ -65,11 +65,21 @@ impl ExplorerWorker {
                                     root,
                                     statuses,
                                 },
-                                Err(error) => ExplorerEvent::GitStatusFailed {
-                                    generation,
-                                    root,
-                                    message: error.to_string(),
-                                },
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    let _ = crate::diagnostics::append(
+                                        "filesystem",
+                                        &format!(
+                                            "background Git status failed for {}: {message}",
+                                            root.display()
+                                        ),
+                                    );
+                                    ExplorerEvent::GitStatusFailed {
+                                        generation,
+                                        root,
+                                        message,
+                                    }
+                                }
                             };
 
                             if event_sender.send(event).is_err() {

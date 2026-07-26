@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 
 echo "Building Caret in release mode..."
-cargo build --release
+cargo build --release --locked
 
-INSTALL_DIR="${HOME}/.local/bin"
+INSTALL_DIR="${CARET_INSTALL_DIR:-${HOME}/.local/bin}"
 mkdir -p "$INSTALL_DIR"
 install -m 0755 target/release/caret "$INSTALL_DIR/caret"
 

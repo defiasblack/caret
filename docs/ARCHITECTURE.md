@@ -14,11 +14,14 @@ responsibilities live behind focused boundaries:
   external-file fingerprints, and save-format behavior.
 - `src/recovery.rs` owns crash-journal serialization and per-process-instance
   journals. One corrupt journal is reported without hiding valid snapshots
-  written by another Caret process.
+  written by another Caret process. Recovery application targets the path
+  recorded in the snapshot and refuses to replace an already-dirty target.
 - `src/session.rs` owns workspace/session serialization and deliberately has no
-  terminal-process state.
+  terminal-process state. The coordinator forces a final session checkpoint on
+  every completed quit, rather than relying only on the idle timer.
 - `src/diagnostics.rs` owns structured JSONL logging, diagnostic reports, and
-  support paths.
+  support paths. Background explorer failures are recorded from the worker
+  thread.
 - `src/lsp.rs` owns LSP framing, URI/path conversion, and server stderr capture.
 - `src/explorer.rs` owns background explorer requests, stale-result rejection,
   Git-status snapshots, refresh throttling, and application of completed work on

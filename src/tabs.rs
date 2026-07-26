@@ -49,24 +49,37 @@ impl Tabs {
         states: &[crate::session::TabState],
         active: usize,
     ) -> io::Result<Option<Self>> {
-        let mut tabs = Vec::new();
-        for state in states {
+        let mut restored = Vec::new();
+        for (original_index, state) in states.iter().enumerate() {
             let Ok(mut editor) = Editor::from_file(&state.path) else {
                 continue;
             };
-            editor.cursor = state.cursor.into();
-            editor.scroll_line = state.scroll_line;
+            editor.cursor.line = state.cursor.line.min(editor.line_count().saturating_sub(1));
+            editor.cursor.column = state
+                .cursor
+                .column
+                .min(editor.line_len_chars(editor.cursor.line));
+            editor.scroll_line = state.scroll_line.min(editor.line_count().saturating_sub(1));
             editor.scroll_column = state.scroll_column;
             editor.checkpoint();
-            tabs.push(BufferTab {
-                editor,
-                untitled_id: 0,
-            });
+            restored.push((
+                original_index,
+                BufferTab {
+                    editor,
+                    untitled_id: 0,
+                },
+            ));
         }
-        if tabs.is_empty() {
+        if restored.is_empty() {
             return Ok(None);
         }
-        let active = active.min(tabs.len() - 1);
+        let active = restored
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (original_index, _))| original_index.abs_diff(active))
+            .map(|(restored_index, _)| restored_index)
+            .unwrap_or(0);
+        let tabs = restored.into_iter().map(|(_, tab)| tab).collect();
         Ok(Some(Self {
             tabs,
             active,
@@ -104,11 +117,12 @@ impl Tabs {
     }
 
     pub fn editor_for_path_mut(&mut self, path: &Path) -> Option<&mut Editor> {
+        let path = normalized_path(path);
         self.tabs.iter_mut().find_map(|tab| {
             tab.editor
                 .path
                 .as_deref()
-                .filter(|candidate| *candidate == path)?;
+                .filter(|candidate| normalized_path(candidate) == path)?;
             Some(&mut tab.editor)
         })
     }
@@ -453,5 +467,50 @@ mod tests {
         );
         assert_eq!(tabs.len(), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn session_restore_skips_missing_tabs_without_shifting_the_active_file() {
+        let root =
+            std::env::temp_dir().join(format!("caret-tabs-session-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let active_file = root.join("active.txt");
+        let later_file = root.join("later.txt");
+        std::fs::write(&active_file, "short").unwrap();
+        std::fs::write(&later_file, "later").unwrap();
+        let states = vec![
+            crate::session::TabState {
+                path: root.join("missing.txt"),
+                cursor: crate::session::CursorState { line: 0, column: 0 },
+                scroll_line: 0,
+                scroll_column: 0,
+            },
+            crate::session::TabState {
+                path: active_file.clone(),
+                cursor: crate::session::CursorState {
+                    line: 99,
+                    column: 99,
+                },
+                scroll_line: 99,
+                scroll_column: 0,
+            },
+            crate::session::TabState {
+                path: later_file,
+                cursor: crate::session::CursorState { line: 0, column: 0 },
+                scroll_line: 0,
+                scroll_column: 0,
+            },
+        ];
+
+        let tabs = Tabs::from_session(&states, 1)
+            .unwrap()
+            .expect("restore surviving tabs");
+
+        assert_eq!(tabs.path.as_deref(), Some(active_file.as_path()));
+        assert_eq!(tabs.cursor.line, 0);
+        assert_eq!(tabs.cursor.column, "short".len());
+        assert_eq!(tabs.scroll_line, 0);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

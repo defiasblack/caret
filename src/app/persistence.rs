@@ -122,8 +122,7 @@ impl App {
 
     pub(super) fn request_quit(&mut self, force: bool) {
         if force || !self.editor.any_dirty() {
-            let _ = crate::recovery::discard_current();
-            self.should_quit = true;
+            self.finish_quit();
             return;
         }
 
@@ -131,5 +130,21 @@ impl App {
         self.explorer_focused = false;
         self.mode = Mode::QuitConfirm;
         self.message = format!("{} unsaved tab(s): {}", dirty.len(), dirty.join(", "));
+    }
+
+    pub(super) fn finish_quit(&mut self) {
+        if let Err(error) = self.checkpoint_session(true) {
+            let _ = crate::diagnostics::append(
+                "session",
+                &format!("final session checkpoint failed: {error}"),
+            );
+        }
+        if let Err(error) = crate::recovery::discard_current() {
+            let _ = crate::diagnostics::append(
+                "recovery",
+                &format!("clean-exit journal cleanup failed: {error}"),
+            );
+        }
+        self.should_quit = true;
     }
 }

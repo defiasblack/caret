@@ -8,14 +8,14 @@ for real-terminal validation.
 
 | Requirement | Evidence | Status |
 |---|---|---|
-| Atomic save never exposes a partial replacement | Same-directory temporary file, flush/sync, permission copy, platform replacement, interrupted-save and write-failure tests | Pass |
+| Atomic save never exposes a partial replacement | Same-directory temporary file, flush/sync, permission copy, platform replacement, interrupted-save, partial-write/disk-full, read-only, and Windows replacement-lock tests | Pass |
 | External changes are never overwritten implicitly | Conditional fingerprint check immediately before replacement; normal save, Save All, Save As, project replace, plugin, workspace-edit, and formatting paths share protection tests | Pass |
-| Forced termination leaves recoverable work | A real PTY session types unsaved work, becomes idle, is forcibly terminated, and a new PTY session discovers, restores, saves, and cleanly exits; a lower-level process test independently checks journal contents | Pass |
+| Forced termination leaves recoverable work | A real PTY session types unsaved work, becomes idle, is forcibly terminated, and a new PTY session—started on an unrelated file—discovers the snapshot, restores it into its recorded path, saves, and cleanly exits; dirty recovery targets are refused; a lower-level process test independently checks journal contents | Pass |
 | Concurrent Caret instances preserve recovery | Unique process-instance journals are combined; corrupt-journal isolation and legacy-journal tests | Pass |
 | File formats remain stable | BOM, LF/CRLF, final-newline, unsupported UTF-8, binary, empty-file, and long-line tests | Pass |
-| Sessions restore safe workspace state | Project, tabs, active view, cursor/scroll, split, and sidebar serialization tests; terminal processes are excluded | Pass |
+| Sessions restore safe workspace state | Project, tabs, active view, cursor/scroll, split, and sidebar serialization tests; clean exit forces the final checkpoint and removes its journal; missing tabs preserve the intended surviving active tab; stale positions are clamped; terminal processes are excluded | Pass |
 | Platform and filesystem failures are recoverable | Windows replacement, application paths, shell/PTY, symlink loop/broken link, permission-denied, disappearing-root, read-only, deleted-file, and no-replace operation tests | Pass |
-| Diagnostics are actionable | Structured log, configuration/OS/terminal/shell/recovery/clipboard report, LSP stderr, and panic-terminal restoration coverage | Pass |
+| Diagnostics are actionable | Structured log, configuration/OS/terminal/shell/recovery/clipboard report, explicit terminal/SSH/tmux/color capability report, background explorer failure logging, watcher/preview status, LSP stderr, and panic-terminal restoration coverage | Pass |
 | Supported-platform automation passes | GitHub Actions format, Clippy, full tests, release build, and `caret doctor` on Windows, macOS, and Linux | Must pass on the release-candidate commit |
 | Real-terminal core safety paths work | Cross-platform PTY tests cover edit/save/quit, 25 consecutive complete saves, external-change refusal and explicit confirmation, idle checkpointing, forced termination, recovery discovery, restore, and re-save | Must pass on the release-candidate commit |
 
@@ -29,7 +29,7 @@ cargo build --release --locked
 target\release\caret.exe doctor
 ```
 
-Result on 2026-07-25: pass — formatting and Clippy were clean, 182 tests
+Result on 2026-07-25: pass — formatting and Clippy were clean, 189 tests
 passed with one environment-dependent `rust-analyzer` integration test skipped,
 the release build completed, and the release binary produced a valid diagnostic
 report. The build used `target\verification` because another running Caret
