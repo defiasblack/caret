@@ -364,6 +364,7 @@ pub struct App {
     lsp: Option<LspClient>,
     lsp_version: i64,
     lsp_requests: HashMap<u64, String>,
+    lsp_format_requests: HashMap<u64, (PathBuf, String)>,
     lsp_initialized: bool,
     lsp_workspace_ready: bool,
     lsp_status: LspStatus,
@@ -597,6 +598,7 @@ impl App {
             lsp: None,
             lsp_version: 1,
             lsp_requests: HashMap::new(),
+            lsp_format_requests: HashMap::new(),
             lsp_initialized: false,
             lsp_workspace_ready: false,
             lsp_status: LspStatus::Off,
@@ -707,7 +709,7 @@ impl App {
         if self.last_recovery_checkpoint.elapsed() >= Duration::from_secs(2) {
             let entries = self.editor.dirty_recovery_entries();
             if entries.is_empty() {
-                let _ = crate::recovery::discard();
+                let _ = crate::recovery::discard_current();
             } else if let Err(error) = crate::recovery::save(entries) {
                 self.message = format!("Recovery checkpoint failed: {error}");
             }
@@ -2249,6 +2251,7 @@ impl App {
                 self.message = "Quit cancelled".to_string();
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
+                let _ = crate::recovery::discard_current();
                 self.should_quit = true;
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -2707,8 +2710,23 @@ impl App {
     }
 
     fn project_target_path(&self, value: &str) -> Option<PathBuf> {
-        let path = self.resolve_project_path(value);
+        let path = lexically_normalized_path(&self.resolve_project_path(value))?;
         path.starts_with(&self.project.root).then_some(path)
+    }
+
+    fn block_operation_for_dirty_path(&mut self, path: &Path, operation: &str) -> bool {
+        let dirty = self.editor.dirty_paths_under(path);
+        if dirty.is_empty() {
+            return false;
+        }
+        let names = dirty
+            .iter()
+            .take(3)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.message = format!("Cannot {operation}; save or close dirty file(s) first: {names}");
+        true
     }
 
     fn create_project_file(&mut self, value: &str) {
@@ -2724,7 +2742,7 @@ impl App {
             .parent()
             .map(fs::create_dir_all)
             .transpose()
-            .and_then(|_| fs::File::create(&path).map(|_| ()))
+            .and_then(|_| crate::file_ops::create_file(&path))
         {
             Ok(()) => {
                 let _ = self.project.refresh();
@@ -2740,7 +2758,7 @@ impl App {
             self.message = "Path must be inside the project".to_string();
             return;
         };
-        match fs::create_dir(&path) {
+        match crate::file_ops::create_directory(&path) {
             Ok(()) => {
                 let _ = self.project.refresh();
                 self.project.request_git_refresh();
@@ -2762,7 +2780,10 @@ impl App {
             self.message = "Usage: :rename new-name".to_string();
             return;
         };
-        match fs::rename(&source, &destination) {
+        if self.block_operation_for_dirty_path(&source, "rename") {
+            return;
+        }
+        match crate::file_ops::rename_without_replace(&source, &destination) {
             Ok(()) => {
                 let _ = self.project.refresh();
                 self.project.request_git_refresh();
@@ -2828,7 +2849,7 @@ impl App {
         } else {
             source.parent().unwrap_or(&self.project.root).join(value)
         };
-        match fs::copy(&source, &destination) {
+        match crate::file_ops::copy_file_without_replace(&source, &destination) {
             Ok(_) => {
                 let _ = self.project.refresh();
                 self.project.request_git_refresh();
@@ -2847,7 +2868,10 @@ impl App {
             self.message = "Path must be inside the project".to_string();
             return;
         };
-        match fs::rename(&source, &destination) {
+        if self.block_operation_for_dirty_path(&source, "move") {
+            return;
+        }
+        match crate::file_ops::rename_without_replace(&source, &destination) {
             Ok(()) => {
                 let _ = self.project.refresh();
                 self.project.request_git_refresh();
@@ -2866,11 +2890,10 @@ impl App {
             self.message = format!("Delete {} permanently? :delete! confirms", path.display());
             return;
         }
-        let result = if path.is_dir() {
-            fs::remove_dir_all(&path)
-        } else {
-            fs::remove_file(&path)
-        };
+        if self.block_operation_for_dirty_path(&path, "delete") {
+            return;
+        }
+        let result = crate::file_ops::delete_permanently(&path);
         match result {
             Ok(()) => {
                 let _ = self.project.refresh();
@@ -4856,6 +4879,7 @@ impl App {
     /// chords it advertises from drifting apart.
     const COMMAND_CATALOG: &'static [(&'static str, &'static str, Option<KeyAction>)] = &[
         ("w", "Save the current file", Some(KeyAction::Save)),
+        ("w!", "Explicitly overwrite a file", None),
         ("wa", "Save every modified tab", None),
         ("q", "Quit", Some(KeyAction::Quit)),
         ("q!", "Quit and discard unsaved changes", None),
@@ -5116,12 +5140,20 @@ impl App {
         let argument = parts.collect::<Vec<_>>().join(" ");
 
         match action {
-            "w" => {
+            "w" | "w!" => {
                 if argument.is_empty() {
-                    self.save();
+                    if action == "w!" {
+                        let Some(path) = self.editor.path.clone() else {
+                            self.message = "No filename; use :w! filename".to_string();
+                            return;
+                        };
+                        self.save_as(path, true);
+                    } else {
+                        self.save();
+                    }
                 } else {
                     let path = self.resolve_project_path(&argument);
-                    self.save_as(path);
+                    self.save_as(path, action == "w!");
                 }
             }
             "wa" | "wall" => self.save_all(),
@@ -5541,7 +5573,7 @@ impl App {
                 }
                 Err(error) => self.message = format!("Recovery load failed: {error}"),
             },
-            "discardrecovery" => match crate::recovery::discard() {
+            "discardrecovery" => match crate::recovery::discard_all() {
                 Ok(()) => self.message = "Recovery snapshots discarded".to_string(),
                 Err(error) => self.message = format!("Could not discard recovery: {error}"),
             },
@@ -5656,6 +5688,8 @@ impl App {
 
     fn start_lsp(&mut self) {
         self.lsp = None;
+        self.lsp_requests.clear();
+        self.lsp_format_requests.clear();
         self.lsp_panel = None;
         self.lsp_status = LspStatus::Off;
         self.diagnostic_count = 0;
@@ -5938,12 +5972,23 @@ impl App {
                     .ok_or_else(|| format!("Invalid text edits for {}", path.display()))?;
                 editor.replace_text(&text);
             } else {
-                let text = fs::read_to_string(&path)
+                let expected_fingerprint = crate::document::fingerprint(&path)
+                    .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+                let (text, format) = crate::document::read_text(&path)
                     .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
                 let text = apply_lsp_text_edits(&text, &edits)
                     .ok_or_else(|| format!("Invalid text edits for {}", path.display()))?;
-                fs::write(&path, text)
-                    .map_err(|error| format!("Could not update {}: {error}", path.display()))?;
+                let mut bytes = Vec::with_capacity(text.len() + 3);
+                if format.utf8_bom {
+                    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+                }
+                bytes.extend_from_slice(text.as_bytes());
+                crate::document::atomic_write_if_unchanged(
+                    &path,
+                    Some(expected_fingerprint),
+                    &bytes,
+                )
+                .map_err(|error| format!("Could not update {}: {error}", path.display()))?;
             }
             applied += 1;
         }
@@ -6088,11 +6133,12 @@ impl App {
             self.message = "Start LSP first with :lsp and wait until it is ready".to_string();
             return;
         }
-        let Some(path) = self.editor.path.as_ref() else {
+        let Some(path) = self.editor.path.clone() else {
             self.message = "Save the buffer before formatting".to_string();
             return;
         };
-        let params = json!({ "textDocument": { "uri": lsp::file_uri(path) }, "options": { "tabSize": self.editor.tab_width, "insertSpaces": true } });
+        let requested_text = self.editor.text();
+        let params = json!({ "textDocument": { "uri": lsp::file_uri(&path) }, "options": { "tabSize": self.editor.tab_width, "insertSpaces": true } });
         match self
             .lsp
             .as_mut()
@@ -6105,6 +6151,7 @@ impl App {
             Ok(id) => {
                 self.lsp_requests
                     .insert(id, "textDocument/formatting".to_string());
+                self.lsp_format_requests.insert(id, (path, requested_text));
                 self.message = "LSP formatting requested".to_string();
             }
             Err(error) => self.message = error,
@@ -6181,10 +6228,9 @@ impl App {
             }
             return;
         }
-        let request = message
-            .get("id")
-            .and_then(|id| id.as_u64())
-            .and_then(|id| self.lsp_requests.remove(&id));
+        let response_id = message.get("id").and_then(|id| id.as_u64());
+        let request = response_id.and_then(|id| self.lsp_requests.remove(&id));
+        let format_request = response_id.and_then(|id| self.lsp_format_requests.remove(&id));
         if message.get("id").and_then(|id| id.as_u64()) == Some(1) {
             if message.get("error").is_some() {
                 self.lsp_status = LspStatus::Error;
@@ -6348,14 +6394,16 @@ impl App {
             return;
         }
         if request.as_deref() == Some("textDocument/formatting") {
-            if self.apply_formatting_edits(&message["result"]) {
-                match self.editor.save() {
-                    Ok(()) => self.message = "Formatted and saved".to_string(),
-                    Err(error) => self.message = format!("Formatted but save failed: {error}"),
-                }
-            } else {
-                self.message = "No formatting changes".to_string();
-            }
+            let Some((path, requested_text)) = format_request else {
+                self.message = "Formatting response had no document context".to_string();
+                return;
+            };
+            self.message =
+                match self.apply_formatting_edits(&message["result"], &path, &requested_text) {
+                    Ok(true) => "Formatted and saved".to_string(),
+                    Ok(false) => "No formatting changes".to_string(),
+                    Err(error) => error,
+                };
             return;
         }
         if message.get("method").and_then(|value| value.as_str())
@@ -6392,11 +6440,28 @@ impl App {
         }
     }
 
-    fn apply_formatting_edits(&mut self, result: &serde_json::Value) -> bool {
+    fn apply_formatting_edits(
+        &mut self,
+        result: &serde_json::Value,
+        path: &Path,
+        requested_text: &str,
+    ) -> Result<bool, String> {
         let Some(edits) = result.as_array() else {
-            return false;
+            return Ok(false);
         };
-        let mut text = self.editor.text();
+        let Some(editor) = self.editor.editor_for_path_mut(path) else {
+            return Err(format!(
+                "Formatting result ignored; {} is no longer open",
+                path.display()
+            ));
+        };
+        if editor.text() != requested_text {
+            return Err(format!(
+                "Formatting result ignored; {} changed while formatting",
+                path.display()
+            ));
+        }
+        let mut text = requested_text.to_string();
         let mut changes = Vec::new();
         for edit in edits {
             let Some(replacement) = edit["newText"].as_str() else {
@@ -6427,18 +6492,21 @@ impl App {
         }
         changes.sort_by_key(|(start, _, _)| *start);
         if changes.is_empty() {
-            return false;
+            return Ok(false);
         }
         for (start, end, replacement) in changes.into_iter().rev() {
             if start <= end && end <= text.len() {
                 text.replace_range(start..end, &replacement);
             }
         }
-        if text == self.editor.text() {
-            return false;
+        if text == requested_text {
+            return Ok(false);
         }
-        self.editor.replace_text(&text);
-        true
+        editor.replace_text(&text);
+        editor
+            .save()
+            .map_err(|error| format!("Formatted but save failed: {error}"))?;
+        Ok(true)
     }
 
     fn plugin_context(&self, arguments: Vec<String>, event: &str) -> PluginContext {
@@ -6887,6 +6955,24 @@ fn next_char_boundary(text: &str, index: usize) -> usize {
         .map_or(text.len(), |character| index + character.len_utf8())
 }
 
+fn lexically_normalized_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
 fn lsp_language_id(language: crate::syntax::Language) -> &'static str {
     match language {
         crate::syntax::Language::CSharp => "csharp",
@@ -6963,12 +7049,26 @@ mod tests {
     }
 
     #[test]
+    fn save_all_does_not_bypass_external_change_protection() {
+        let path = std::env::temp_dir().join(format!("caret-app-save-all-{}", std::process::id()));
+        std::fs::write(&path, "original").unwrap();
+        let mut app = App::new(Some(&path)).expect("create app");
+        app.editor.insert_text("buffer");
+        std::fs::write(&path, "external").unwrap();
+
+        assert!(!app.save_all_internal());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external");
+        assert!(app.editor.dirty);
+        assert!(app.message.contains("changed on disk"), "{}", app.message);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn forced_termination_preserves_a_recovery_journal_across_processes() {
         let root =
             std::env::temp_dir().join(format!("caret-app-recovery-process-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let journal = root.join("recovery").join("journal.json");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -6980,14 +7080,30 @@ mod tests {
             .env("CARET_RECOVERY_CHILD", "1")
             .spawn()
             .expect("spawn recovery child");
-
+        let recovery_directory = root.join("recovery");
+        let recovery_prefix = format!("journal-{}-", child.id());
+        let mut journal = None;
         for _ in 0..100 {
-            if journal.exists() {
+            journal = std::fs::read_dir(&recovery_directory)
+                .ok()
+                .and_then(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| {
+                                    name.starts_with(&recovery_prefix) && name.ends_with(".json")
+                                })
+                        })
+                });
+            if journal.is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(journal.exists(), "recovery child did not checkpoint");
+        let journal = journal.expect("recovery child did not checkpoint");
         child.kill().expect("terminate recovery child");
         let _ = child.wait();
 
@@ -7582,6 +7698,53 @@ mod tests {
     }
 
     #[test]
+    fn stale_formatting_response_cannot_replace_newer_edits() {
+        let path =
+            std::env::temp_dir().join(format!("caret-format-stale-{}.rs", std::process::id()));
+        fs::write(&path, "old").unwrap();
+        let mut app = App::new(Some(&path)).unwrap();
+        let requested_text = app.editor.text();
+        app.editor.insert_text("new ");
+        let edits = json!([
+            { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } }, "newText": "formatted" }
+        ]);
+
+        let error = app
+            .apply_formatting_edits(&edits, &path, &requested_text)
+            .unwrap_err();
+
+        assert!(error.contains("changed while formatting"));
+        assert_eq!(app.editor.text(), "new old");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn formatting_response_updates_its_originating_tab_after_a_tab_switch() {
+        let root = std::env::temp_dir().join(format!("caret-format-tab-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        fs::write(&first, "old").unwrap();
+        fs::write(&second, "other").unwrap();
+        let mut app = App::new(Some(&first)).unwrap();
+        let requested_text = app.editor.text();
+        app.editor.open_or_switch(&second).unwrap();
+        let edits = json!([
+            { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } }, "newText": "formatted" }
+        ]);
+
+        assert!(app
+            .apply_formatting_edits(&edits, &first, &requested_text)
+            .unwrap());
+
+        assert_eq!(fs::read_to_string(&first).unwrap(), "formatted");
+        assert_eq!(app.editor.text(), "other");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn completion_panel_inserts_selected_item() {
         let mut app = App::new(None).expect("create app");
         app.mode = Mode::Insert;
@@ -7644,5 +7807,45 @@ mod tests {
         assert!(app.explorer_focused);
         assert!(app.project.visible);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn project_targets_cannot_escape_through_parent_components() {
+        let root =
+            std::env::temp_dir().join(format!("caret-project-target-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let app = App::new(Some(&root)).expect("create app");
+
+        assert!(app.project_target_path("inside.txt").is_some());
+        assert!(app.project_target_path("../outside.txt").is_none());
+        assert!(app
+            .project_target_path(&root.join("../outside.txt").display().to_string())
+            .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn permanent_delete_refuses_to_remove_an_open_dirty_file() {
+        let root = std::env::temp_dir().join(format!("caret-dirty-delete-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("important.txt");
+        fs::write(&path, "original").unwrap();
+        let mut app = App::new(Some(&root)).expect("create app");
+        app.editor.open_or_switch(&path).unwrap();
+        app.editor.insert_text("unsaved");
+        app.project.selected = app
+            .project
+            .entries
+            .iter()
+            .position(|entry| entry.name == "important.txt")
+            .unwrap();
+
+        app.delete_selected_project_entry(true);
+
+        assert!(path.exists());
+        assert!(app.message.contains("dirty file"), "{}", app.message);
+        let _ = fs::remove_dir_all(root);
     }
 }

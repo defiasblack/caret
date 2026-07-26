@@ -39,6 +39,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Every save entry point now shares the same last-moment external-change check.
+  Save All, Save As, project replacement, plugin/LSP saves, and formatting can
+  no longer bypass conflict protection; `:w!` is the explicit overwrite path.
+- Recovery journals are unique per Caret process instance, are discovered
+  together, and a damaged journal no longer hides valid recovery data from
+  another instance.
+- Existing project-tree mutations now refuse destination replacement at the
+  filesystem boundary, reject project-root traversal, and block permanent
+  deletion of an open dirty file.
+- LSP formatting responses are tied to their originating tab and requested
+  document version, while closed-file workspace edits use atomic conditional
+  writes instead of truncate-in-place writes.
+- CI uses the Node 24-based `actions/checkout` v6 action.
 - Undo and redo are operation-based instead of whole-document
   snapshots: typing runs coalesce into single steps, selections and
   multi-cursors are restored on undo, empty steps are dropped, and the

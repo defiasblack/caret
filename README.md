@@ -243,6 +243,7 @@ descriptions as well as names — typing `quit` finds `:q`.
 |---|---|
 | `:w` | Save |
 | `:w file.txt` | Save as, relative to project root |
+| `:w! [file.txt]` | Explicitly overwrite a changed file or existing Save As destination |
 | `:q` / `:q!` | Quit / force quit |
 | `:wq` or `:x` | Save and quit |
 | `:e path` | Open a file or folder |
@@ -341,6 +342,8 @@ themes, and save hooks. See [Caret plugins](docs/PLUGINS.md) and the
 
 The release smoke checklist for atomic saves, recovery, external changes, and
 session restoration is in [Milestone 0.6 smoke tests](docs/SMOKE_TEST_0.6.md).
+The requirement-by-requirement automated and manual status is in
+[Milestone 0.6 release evidence](docs/RELEASE_0.6_EVIDENCE.md).
 The everyday-editing release checklist is in
 [Milestone 0.7 smoke tests](docs/SMOKE_TEST_0.7.md).
 The module boundaries are documented in [the architecture guide](docs/ARCHITECTURE.md).

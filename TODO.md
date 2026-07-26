@@ -1,7 +1,7 @@
 # Caret Work Tracker
 
 This checklist is the implementation companion to [`ROADMAP.md`](ROADMAP.md).
-It was reconciled against the repository on 2026-07-25 at commit `ea6b7a5`.
+It was reconciled against the repository on 2026-07-25.
 
 - `[x]` means the behavior exists in the codebase and has supporting tests or
   documentation where practical.
@@ -13,8 +13,8 @@ It was reconciled against the repository on 2026-07-25 at commit `ea6b7a5`.
 
 ## Current priorities
 
-1. Finish the 0.6 cross-platform release sign-off and remaining reliability
-   boundaries.
+1. Finish the 0.6 cross-platform release sign-off and sustained dogfooding
+   gate.
 2. Replace the synchronous project tree with the non-blocking explorer
    foundation.
 3. Complete the polished project explorer on that foundation.
@@ -30,42 +30,42 @@ It was reconciled against the repository on 2026-07-25 at commit `ea6b7a5`.
 
 - [x] Atomic same-directory document and configuration saves with durable
   temporary files, permission preservation, Windows replacement/write-through,
-  and Unix rename boundaries.
+  Unix rename boundaries, last-moment fingerprint validation, and collision-
+  resistant temporary names.
 - [x] UTF-8 BOM, LF/CRLF, final-newline, binary, unsupported-encoding, empty
   file, long-line, and read-only handling.
 - [x] Content fingerprints protect against delayed or coarse filesystem
   metadata.
 - [x] Periodic crash-recovery journal with discovery, compare, recover, and
-  discard workflows in the platform application-data directory.
+  discard workflows in the platform application-data directory, with unique
+  per-process-instance journals and partial recovery when another journal is
+  corrupt.
 - [x] Session restoration for projects, tabs, active tab, cursor and scroll
   positions, split layout, and sidebar state; terminal processes are excluded.
 - [x] External-change reload, overwrite, compare, and defer protection,
-  including deleted and same-size replaced files.
+  including deleted and same-size replaced files, Save All, Save As, project
+  replacement, plugins, and LSP/formatting save paths.
 - [x] Structured diagnostics and panic logs, terminal restoration,
   `caret doctor`, `:doctor`, `:copydiagnostics`, LSP stderr capture, terminal
   capability reporting, and clipboard capability reporting.
 - [x] Headless SSH clipboard fallback through OSC 52.
 - [x] Focused reliability modules for documents, platform replacement,
-  recovery, sessions, diagnostics, LSP transport, persistence, and settings,
-  documented in `docs/ARCHITECTURE.md`.
+  recovery, sessions, diagnostics, LSP transport, persistence, settings, tabs,
+  and no-replace filesystem operations, documented in
+  `docs/ARCHITECTURE.md`.
 - [x] Automated recovery, interrupted/write-failure save, encoding, Unicode,
   external-change, session, configuration, platform-path, shell, and PTY
-  regression coverage.
+  regression coverage, including forced process termination, broken symlinks,
+  permission-denied/disappearing directories, unsafe path traversal, and
+  destructive-operation guards.
 - [x] Windows, macOS, and Linux CI build/test/diagnostic matrix plus Ubuntu
   install and PTY startup smoke coverage.
 
 ### Remaining release work
 
 - [ ] Complete and record the interactive forced-termination and core-workflow
-  sign-off on Windows, macOS, and Linux using `docs/SMOKE_TEST_0.6.md`.
-- [ ] Continue decomposing the oversized `App` coordinator and `ui.rs` into
-  focused event/update, command-registry, workspace, input, layout, and widget
-  boundaries without weakening the reliability modules already extracted.
-- [ ] Add the remaining reliability cases from the roadmap: broken symlinks,
-  permission-denied directories, paths disappearing during reads, and slow or
-  network-mounted directories where practical.
-- [ ] Add structured diagnostics for the future watcher, preview, and
-  filesystem-operation services as those services are introduced.
+  sign-off on Windows, macOS, and Linux, including a slow/network-mounted
+  directory where practical, using `docs/SMOKE_TEST_0.6.md`.
 - [ ] Complete a sustained dogfooding pass with no unresolved data-loss defect;
   any data-loss issue blocks the release.
 

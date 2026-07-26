@@ -226,10 +226,40 @@ impl Editor {
             ));
         };
 
-        self.save_as(&path)
+        self.save_to(&path, false)
     }
 
     pub fn save_as(&mut self, path: &Path) -> io::Result<()> {
+        self.save_to(path, false)
+    }
+
+    /// Explicitly replaces `path`, bypassing the existing-file and
+    /// external-change guards. Callers must only use this after the user has
+    /// clearly confirmed an overwrite.
+    pub fn save_as_overwrite(&mut self, path: &Path) -> io::Result<()> {
+        self.save_to(path, true)
+    }
+
+    fn save_to(&mut self, path: &Path, overwrite_confirmed: bool) -> io::Result<()> {
+        let saving_current_path = self
+            .path
+            .as_deref()
+            .is_some_and(|current| paths_refer_to_same_file(current, path));
+
+        if !overwrite_confirmed {
+            if saving_current_path && (self.external_change_pending || self.changed_on_disk()) {
+                return Err(io::Error::other(
+                    "file changed on disk; reload, compare, or confirm overwrite",
+                ));
+            }
+            if !saving_current_path && path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination already exists; use :w! to overwrite it",
+                ));
+            }
+        }
+
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
@@ -269,7 +299,14 @@ impl Editor {
         for chunk in self.buffer.chunks() {
             bytes.extend_from_slice(chunk.as_bytes());
         }
-        document::atomic_write(path, &bytes)?;
+        if overwrite_confirmed {
+            document::atomic_write(path, &bytes)?;
+        } else {
+            let expected_fingerprint = saving_current_path
+                .then_some(self.disk_fingerprint)
+                .flatten();
+            document::atomic_write_if_unchanged(path, expected_fingerprint, &bytes)?;
+        }
 
         self.path = Some(path.to_path_buf());
         self.dirty = false;
@@ -2201,6 +2238,22 @@ impl Editor {
     }
 }
 
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 fn is_word_character(character: char) -> bool {
     character == '_' || character.is_alphanumeric()
 }
@@ -2472,6 +2525,60 @@ mod tests {
         fs::write(&path, "two").unwrap();
         assert!(editor.changed_on_disk());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_refuses_an_unpolled_external_change() {
+        let path = std::env::temp_dir().join(format!("caret-save-race-{}", std::process::id()));
+        fs::write(&path, "original").unwrap();
+        let mut editor = Editor::from_file(&path).unwrap();
+        editor.insert_text("buffer");
+        fs::write(&path, "external").unwrap();
+
+        let error = editor.save().unwrap_err();
+        assert!(error.to_string().contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        assert!(editor.dirty);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn acknowledged_external_changes_still_require_explicit_overwrite() {
+        let path = std::env::temp_dir().join(format!("caret-save-pending-{}", std::process::id()));
+        fs::write(&path, "original").unwrap();
+        let mut editor = Editor::from_file(&path).unwrap();
+        editor.insert_text("buffer");
+        fs::write(&path, "external").unwrap();
+        editor.keep_disk_change();
+
+        assert!(editor.save().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        editor.save_as_overwrite(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "bufferoriginal");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_as_requires_confirmation_before_replacing_another_file() {
+        let source =
+            std::env::temp_dir().join(format!("caret-save-as-source-{}", std::process::id()));
+        let destination =
+            std::env::temp_dir().join(format!("caret-save-as-target-{}", std::process::id()));
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "important target").unwrap();
+        let mut editor = Editor::from_file(&source).unwrap();
+        editor.insert_text(" changed");
+
+        let error = editor.save_as(&destination).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "important target"
+        );
+        editor.save_as_overwrite(&destination).unwrap();
+        assert_eq!(fs::read_to_string(&destination).unwrap(), " changedsource");
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_file(destination);
     }
 
     #[test]

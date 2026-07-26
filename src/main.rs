@@ -5,6 +5,7 @@ mod diagnostics;
 mod document;
 mod editor;
 mod explorer;
+mod file_ops;
 mod fuzzy;
 mod keys;
 mod lsp;

@@ -151,6 +151,17 @@ impl Tabs {
             .collect()
     }
 
+    pub fn dirty_paths_under(&self, target: &Path) -> Vec<PathBuf> {
+        let target = normalized_path(target);
+        self.tabs
+            .iter()
+            .filter(|tab| tab.editor.dirty)
+            .filter_map(|tab| tab.editor.path.as_deref())
+            .map(normalized_path)
+            .filter(|path| path == &target || path.starts_with(&target))
+            .collect()
+    }
+
     pub fn select(&mut self, index: usize) -> bool {
         if index >= self.tabs.len() {
             return false;

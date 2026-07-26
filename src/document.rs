@@ -86,6 +86,28 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     atomic_write_impl(path, bytes, |_| Ok(()))
 }
 
+/// Atomically replaces `path` only if its contents still match the fingerprint
+/// the caller observed. `None` means the caller expects the destination not to
+/// exist. The comparison happens after the complete temporary file is durable
+/// and immediately before replacement.
+pub fn atomic_write_if_unchanged(
+    path: &Path,
+    expected_fingerprint: Option<u64>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    atomic_write_impl(path, bytes, |_| {
+        let actual = match fingerprint(path) {
+            Ok(value) => Some(value),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if actual != expected_fingerprint {
+            return Err(io::Error::other("file changed on disk before replacement"));
+        }
+        Ok(())
+    })
+}
+
 fn atomic_write_impl<F>(path: &Path, bytes: &[u8], before_replace: F) -> io::Result<()>
 where
     F: FnOnce(&Path) -> io::Result<()>,
@@ -99,22 +121,16 @@ where
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("untitled");
-    let temp = parent.join(format!(
-        ".{name}.caret-{}-{}.tmp",
-        std::process::id(),
-        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
+    let (temp, mut file) = create_temporary_file(parent, name)?;
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
         use std::io::Write;
         file.write_all(bytes)?;
         file.flush()?;
         file.sync_all()?;
         if let Ok(metadata) = fs::metadata(path) {
             fs::set_permissions(&temp, metadata.permissions())?;
+            // Permission metadata is part of the durable replacement too.
+            file.sync_all()?;
         }
         drop(file);
         before_replace(&temp)?;
@@ -127,6 +143,33 @@ where
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+fn create_temporary_file(parent: &Path, name: &str) -> io::Result<(PathBuf, fs::File)> {
+    // A previous process may have been killed after creating its temporary
+    // file. Retry unique names so a stale file or recycled PID can never make
+    // all future saves fail.
+    for _ in 0..128 {
+        let path = parent.join(format!(
+            ".{name}.caret-{}-{}.tmp",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary save file",
+    ))
 }
 
 pub fn recovery_dir() -> PathBuf {
@@ -238,6 +281,30 @@ mod tests {
         let first = fingerprint(&path).unwrap();
         fs::write(&path, b"two").unwrap();
         assert_ne!(first, fingerprint(&path).unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn conditional_atomic_write_preserves_a_changed_destination() {
+        let path = temp("conditional-conflict");
+        fs::write(&path, b"observed").unwrap();
+        let expected = fingerprint(&path).unwrap();
+        fs::write(&path, b"external").unwrap();
+
+        let error = atomic_write_if_unchanged(&path, Some(expected), b"replacement").unwrap_err();
+        assert!(error.to_string().contains("changed on disk"));
+        assert_eq!(fs::read(&path).unwrap(), b"external");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn conditional_atomic_write_protects_a_newly_created_destination() {
+        let path = temp("conditional-created");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, b"external").unwrap();
+
+        assert!(atomic_write_if_unchanged(&path, None, b"replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"external");
         let _ = fs::remove_file(path);
     }
 

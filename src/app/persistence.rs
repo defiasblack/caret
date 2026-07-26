@@ -45,8 +45,13 @@ impl App {
         self.save_internal();
     }
 
-    pub(super) fn save_as(&mut self, path: PathBuf) {
-        match self.editor.save_as(&path) {
+    pub(super) fn save_as(&mut self, path: PathBuf, overwrite_confirmed: bool) {
+        let result = if overwrite_confirmed {
+            self.editor.save_as_overwrite(&path)
+        } else {
+            self.editor.save_as(&path)
+        };
+        match result {
             Ok(()) => {
                 let hooks = match self.run_save_hooks() {
                     Ok(count) => count,
@@ -70,6 +75,12 @@ impl App {
     }
 
     pub(super) fn save_internal(&mut self) -> bool {
+        if !self.editor.has_pending_external_change() && self.editor.changed_on_disk() {
+            // Check again at the point of saving instead of relying only on
+            // the background poll. This closes the race where a file changes
+            // immediately before Ctrl-S.
+            self.editor.keep_disk_change();
+        }
         if self.editor.has_pending_external_change() {
             self.pending_save_after_disk_change = true;
             self.mode = Mode::ReloadConfirm;
@@ -111,6 +122,7 @@ impl App {
 
     pub(super) fn request_quit(&mut self, force: bool) {
         if force || !self.editor.any_dirty() {
+            let _ = crate::recovery::discard_current();
             self.should_quit = true;
             return;
         }

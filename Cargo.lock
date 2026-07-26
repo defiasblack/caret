@@ -97,6 +97,7 @@ dependencies = [
  "crossterm",
  "directories",
  "ignore",
+ "libc",
  "portable-pty",
  "regex",
  "ropey",

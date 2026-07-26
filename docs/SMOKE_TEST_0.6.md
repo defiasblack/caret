@@ -20,13 +20,37 @@ remains the release sign-off for real terminals and filesystems.
 3. Edit a file in Caret, modify or delete it from another program, then return
    to Caret. Confirm that save is blocked until you explicitly choose Reload,
    Keep/Overwrite, or Compare. Verify Compare does not modify either version.
-4. Edit a file, begin saving a large change, and forcibly stop Caret. Confirm
+4. Repeat the conflict test with multiple dirty tabs and `:wa`. Confirm the
+   changed disk file is not overwritten. Run `:w other-existing-file` and
+   confirm Save As refuses to replace it; use `:w! other-existing-file` only
+   after checking the destination and confirm the explicit overwrite succeeds.
+5. Start two Caret processes, create unsaved work in both, wait for both to
+   checkpoint, then forcibly stop both. Start a third Caret process and confirm
+   both recovery snapshots are listed and recoverable.
+6. Edit a file, begin saving a large change, and forcibly stop Caret. Confirm
    the original file is either intact or the complete replacement—not a
    truncated or partial file.
-5. Open two files, set a split, move both cursors, hide/show the sidebar, then
+7. Open two files, set a split, move both cursors, hide/show the sidebar, then
    quit normally. Restart Caret and verify tabs, active tab, cursors, scroll
    positions, split, sidebar state, and project root restore. Confirm no
    terminal process is restored.
-6. Run `caret doctor`, then run `:doctor` and `:copydiagnostics`; confirm the
+8. In the project tree, attempt to create, copy, move, or rename onto an
+   existing destination. Confirm the destination is unchanged. Attempt to
+   permanently delete an open dirty file and confirm Caret refuses.
+9. Open a project through a slow or network-mounted directory where practical.
+   Expand directories, edit a file externally, and save. Confirm the UI remains
+   usable and delayed metadata never causes an implicit overwrite.
+10. Run `caret doctor`, then run `:doctor` and `:copydiagnostics`; confirm the
    report includes OS, terminal, shell, configuration, recovery, log, and
    clipboard capability information.
+
+## Sign-off
+
+Record the exact release-candidate commit. A blank or failed row keeps milestone
+0.6 open.
+
+| Platform | OS version | Terminal/filesystem | Commit | Tester/date | Result |
+|---|---|---|---|---|---|
+| Windows |  |  |  |  | Pending |
+| macOS |  |  |  |  | Pending |
+| Linux |  |  |  |  | Pending |

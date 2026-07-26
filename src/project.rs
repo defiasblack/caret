@@ -715,4 +715,59 @@ mod tests {
         tree.expand_all().unwrap();
         let _ = fs::remove_dir_all(root);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlinks_are_visible_without_being_followed() {
+        let root = temp_root("broken-symlink");
+        let link = root.join("missing-link");
+        std::os::unix::fs::symlink(root.join("does-not-exist"), &link).unwrap();
+
+        let mut tree = ProjectTree::new(root.clone()).unwrap();
+        let entry = tree
+            .entries
+            .iter()
+            .find(|entry| entry.path == link)
+            .expect("broken symlink should remain visible");
+        assert!(entry.is_symlink);
+        assert!(!entry.is_dir);
+        tree.expand_all().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_child_does_not_break_the_project_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("permission-denied");
+        let denied = root.join("denied");
+        fs::create_dir_all(&denied).unwrap();
+        fs::write(denied.join("private.txt"), "private").unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut tree = ProjectTree::new(root.clone()).unwrap();
+        let index = tree
+            .entries
+            .iter()
+            .position(|entry| entry.path == denied)
+            .expect("denied directory should still be listed");
+        tree.selected = index;
+        assert!(tree.expand_selected().is_ok());
+
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disappearing_project_root_returns_a_recoverable_error() {
+        let root = temp_root("disappearing-root");
+        let mut tree = ProjectTree::new(root.clone()).unwrap();
+        let normalized_root = tree.root.clone();
+        fs::remove_dir_all(&root).unwrap();
+
+        let error = tree.refresh().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(tree.root, normalized_root);
+    }
 }
