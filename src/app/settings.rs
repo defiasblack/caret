@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, Mode};
-use crate::{config, document::FinalNewline};
+use crate::{config, config::IconMode, document::FinalNewline};
 
 impl App {
     pub(super) fn open_settings_browser(&mut self) {
@@ -114,6 +114,8 @@ impl App {
             "hidden" | "showhidden" => {
                 self.settings.show_hidden_files = true;
                 self.project.show_hidden = true;
+                self.file_manager.show_hidden = true;
+                self.file_manager.refresh();
                 match self.project.refresh() {
                     Ok(()) => {
                         self.persist_settings();
@@ -125,6 +127,8 @@ impl App {
             "nohidden" | "noshowhidden" => {
                 self.settings.show_hidden_files = false;
                 self.project.show_hidden = false;
+                self.file_manager.show_hidden = false;
+                self.file_manager.refresh();
                 match self.project.refresh() {
                     Ok(()) => {
                         self.persist_settings();
@@ -162,6 +166,109 @@ impl App {
                 self.settings.reduced_motion = false;
                 self.persist_settings();
                 self.message = "Reduced motion disabled".to_string();
+            }
+            "directoriesfirst" => {
+                self.settings.directories_first = true;
+                self.file_manager.directories_first = true;
+                self.file_manager.refresh();
+                self.persist_settings();
+                self.message = "Directories sort first".to_string();
+            }
+            "nodirectoriesfirst" => {
+                self.settings.directories_first = false;
+                self.file_manager.directories_first = false;
+                self.file_manager.refresh();
+                self.persist_settings();
+                self.message = "Directories use the active sort order".to_string();
+            }
+            "managerpreview" => {
+                self.settings.manager_preview = true;
+                self.file_manager.preview_enabled = true;
+                self.file_manager.refresh();
+                self.persist_settings();
+                self.message = "File-manager previews enabled".to_string();
+            }
+            "nomanagerpreview" => {
+                self.settings.manager_preview = false;
+                self.file_manager.preview_enabled = false;
+                self.file_manager.refresh();
+                self.persist_settings();
+                self.message = "File-manager previews disabled".to_string();
+            }
+            "confirmtrash" => {
+                self.settings.confirm_trash = true;
+                self.persist_settings();
+                self.message = "Trash confirmation enabled".to_string();
+            }
+            "noconfirmtrash" => {
+                self.settings.confirm_trash = false;
+                self.persist_settings();
+                self.message = "Trash confirmation disabled".to_string();
+            }
+            value if value.starts_with("icons=") => {
+                let mode = match value.split_once('=').map(|(_, value)| value) {
+                    Some("unicode") => Some(IconMode::Unicode),
+                    Some("ascii") => Some(IconMode::Ascii),
+                    Some("nerd") => Some(IconMode::Nerd),
+                    _ => None,
+                };
+                match mode {
+                    Some(mode) => {
+                        self.settings.icon_mode = mode;
+                        self.persist_settings();
+                        self.message = format!("Icon mode: {}", mode.name());
+                    }
+                    None => self.message = "Icons must be unicode, ascii, or nerd".to_string(),
+                }
+            }
+            value if value.starts_with("previewmaxbytes=") => {
+                let number = value
+                    .split_once('=')
+                    .and_then(|(_, value)| value.parse::<usize>().ok());
+                match number {
+                    Some(number @ 4_096..=8_388_608) => {
+                        self.settings.preview_max_bytes = number;
+                        self.file_manager.configure(
+                            self.settings.show_hidden_files,
+                            self.settings.directories_first,
+                            self.settings.manager_preview,
+                            number,
+                        );
+                        self.persist_settings();
+                        self.message = format!("Preview read limit: {number} bytes");
+                    }
+                    _ => {
+                        self.message =
+                            "Preview limit must be between 4096 and 8388608 bytes".to_string()
+                    }
+                }
+            }
+            value if value.starts_with("managerpanes=") => {
+                let ratios = value.split_once('=').and_then(|(_, value)| {
+                    let (parent, current) = value.split_once(',')?;
+                    Some((
+                        parent.trim().parse::<u8>().ok()?,
+                        current.trim().parse::<u8>().ok()?,
+                    ))
+                });
+                match ratios {
+                    Some((parent, current))
+                        if (15..=65).contains(&parent)
+                            && (15..=65).contains(&current)
+                            && (45..=85).contains(&(u16::from(parent) + u16::from(current))) =>
+                    {
+                        self.settings.manager_parent_percent = parent;
+                        self.settings.manager_current_percent = current;
+                        self.persist_settings();
+                        self.message =
+                            format!("Manager panes: {parent}% parent, {current}% current");
+                    }
+                    _ => {
+                        self.message =
+                            "Manager panes must be parent,current; each 15-65, total 45-85"
+                                .to_string()
+                    }
+                }
             }
             "autoindent" | "ai" => {
                 self.settings.auto_indent = true;

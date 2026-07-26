@@ -1,4 +1,7 @@
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    path::{Component, Path, Prefix, MAIN_SEPARATOR},
+};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -11,9 +14,13 @@ use crossterm::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, BackgroundState, HoverTarget, Mode, SidebarView, COMMAND_PALETTE_ROWS},
-    config::KeymapProfile,
+    app::{
+        App, BackgroundState, HoverTarget, ManagerConfirmation, ManagerInputKind, Mode,
+        SidebarView, COMMAND_PALETTE_ROWS,
+    },
+    config::{IconMode, KeymapProfile},
     editor::display_width,
+    file_manager::{human_size, unix_time_label, FileEntry, Preview},
     project::GitStatus,
     syntax::{self, Language},
     theme::ThemeKind,
@@ -32,6 +39,61 @@ pub struct ScreenLayout {
     pub status_row: u16,
     pub prompt_row: u16,
     pub hotkey_row: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileManagerLayout {
+    parent_x: usize,
+    parent_width: usize,
+    current_x: usize,
+    current_width: usize,
+    preview_x: usize,
+    preview_width: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManagerPanel {
+    top: u16,
+    rows: usize,
+    x: usize,
+    width: usize,
+}
+
+impl FileManagerLayout {
+    fn calculate(width: usize, parent_percent: u8, current_percent: u8) -> Self {
+        if width >= 110 {
+            let parent_width = (width * usize::from(parent_percent) / 100).clamp(22, width / 3);
+            let current_width = (width * usize::from(current_percent) / 100).clamp(34, width / 2);
+            let preview_x = parent_width + current_width + 2;
+            Self {
+                parent_x: 0,
+                parent_width,
+                current_x: parent_width + 1,
+                current_width,
+                preview_x,
+                preview_width: width.saturating_sub(preview_x),
+            }
+        } else if width >= 68 {
+            let current_width = (width * 54 / 100).max(34);
+            Self {
+                parent_x: 0,
+                parent_width: 0,
+                current_x: 0,
+                current_width,
+                preview_x: current_width + 1,
+                preview_width: width.saturating_sub(current_width + 1),
+            }
+        } else {
+            Self {
+                parent_x: 0,
+                parent_width: 0,
+                current_x: 0,
+                current_width: width,
+                preview_x: width,
+                preview_width: 0,
+            }
+        }
+    }
 }
 
 pub fn screen_layout(app: &App, width: u16, height: u16) -> ScreenLayout {
@@ -219,6 +281,11 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if layout.terminal_height > 0 {
         draw_terminal(out, app, layout.terminal_top, layout.terminal_height, width)?;
     }
+    if app.mode == Mode::FileManager {
+        app.file_manager
+            .ensure_selected_visible(content_height.saturating_sub(5));
+        draw_file_manager(out, app, content_top, content_height, width)?;
+    }
     draw_status_bar(out, app, layout.status_row, width)?;
     draw_command_palette(out, app, width, height)?;
     draw_prompt_bar(out, app, layout.prompt_row, width)?;
@@ -260,6 +327,14 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if app.mode == Mode::Dashboard {
         draw_dashboard(out, app, width, height)?;
     }
+    if app.mode == Mode::FileManager
+        && (app.manager_confirmation.is_some() || app.manager_conflicts > 0)
+    {
+        draw_manager_confirmation(out, app, width, height)?;
+    }
+    if app.mode == Mode::FileManager && app.manager_context_menu.is_some() {
+        draw_manager_context_menu(out, app, width, height)?;
+    }
     if app.lsp_panel.is_some() {
         draw_lsp_panel(out, app, width, height)?;
     }
@@ -292,7 +367,7 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     } else {
         (content_top, content_height)
     };
-    if app.lsp_panel.is_some() {
+    if app.lsp_panel.is_some() || app.mode == Mode::FileManager {
         queue!(out, Hide)?;
     } else if app.terminal_focused && layout.terminal_height > 0 {
         let (row, column) = app.terminal_cursor_position();
@@ -336,14 +411,14 @@ fn effective_sidebar_width(app: &App, terminal_width: u16) -> usize {
 }
 
 /// Everything in `title_bar_right` except the project name.
-const TITLE_BAR_RIGHT_FIXED: u16 = 47;
+const TITLE_BAR_RIGHT_FIXED: u16 = 12;
 /// Columns the left half needs before `[FILES]` is fully drawn.
 const TITLE_BAR_FILES_END: u16 = 18;
 
 /// The right-aligned segment of the title bar.  `title_bar_targets` hard-codes
 /// offsets into this string, and a test pins the two together.
 fn title_bar_right(root: &str) -> String {
-    format!(" {root}  │ [Themes] │ [Command] │ [F1 Help] │ [Quit] ")
+    format!(" {root}  │ [Menu] ")
 }
 
 /// The clickable controls in the title bar.  Drawing, hover, and click
@@ -356,18 +431,13 @@ fn title_bar_right(root: &str) -> String {
 /// pointing at whatever ended up in that column.
 fn title_bar_targets(width: u16, root_width: u16) -> Vec<(HoverTarget, u16, &'static str)> {
     let right_width = root_width.saturating_add(TITLE_BAR_RIGHT_FIXED);
-    let mut targets = Vec::with_capacity(5);
+    let mut targets = Vec::with_capacity(2);
 
     if width >= right_width.saturating_add(TITLE_BAR_FILES_END) {
         targets.push((HoverTarget::Files, 11, "[FILES]"));
     }
     if width > right_width {
-        targets.extend([
-            (HoverTarget::Themes, width - 42, "[Themes]"),
-            (HoverTarget::Command, width - 31, "[Command]"),
-            (HoverTarget::Help, width - 19, "[F1 Help]"),
-            (HoverTarget::Quit, width - 7, "[Quit]"),
-        ]);
+        targets.push((HoverTarget::Menu, width - 7, "[Menu]"));
     }
     targets
 }
@@ -603,6 +673,52 @@ fn compact_text(text: &str, maximum_width: usize) -> String {
     output
 }
 
+fn soft_selection_background(app: &App) -> Color {
+    match (app.theme.overlay, app.theme.foreground) {
+        (
+            Color::Rgb {
+                r: base_r,
+                g: base_g,
+                b: base_b,
+            },
+            Color::Rgb {
+                r: text_r,
+                g: text_g,
+                b: text_b,
+            },
+        ) => Color::Rgb {
+            r: blend_channel(base_r, text_r, 14),
+            g: blend_channel(base_g, text_g, 14),
+            b: blend_channel(base_b, text_b, 14),
+        },
+        _ => app.theme.current_line,
+    }
+}
+
+fn blend_channel(base: u8, accent: u8, accent_percent: u16) -> u8 {
+    let base_percent = 100 - accent_percent;
+    ((u16::from(base) * base_percent + u16::from(accent) * accent_percent) / 100) as u8
+}
+
+fn manager_display_line(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut column = 0usize;
+    for character in text.chars() {
+        if character == '\t' {
+            let spaces = 4 - column % 4;
+            output.push_str(&" ".repeat(spaces));
+            column += spaces;
+        } else if character.is_control() {
+            output.push('�');
+            column += 1;
+        } else {
+            output.push(character);
+            column += UnicodeWidthChar::width(character).unwrap_or(0);
+        }
+    }
+    output
+}
+
 fn draw_project_tree<W: Write>(
     out: &mut W,
     app: &App,
@@ -639,20 +755,21 @@ fn draw_project_tree<W: Write>(
                 ""
             };
             let root = format!(
-                " PROJECT ▾ {} · {} items{}{}{}",
-                app.project.root_name(),
+                " 󰉋  {}  {}{}{}{}",
+                explorer_breadcrumb(app, width.saturating_sub(30)),
                 app.project.entries.len(),
                 hidden_marker,
                 filter_marker,
                 git_marker
             );
+            let controls = explorer_header_controls(width);
             queue!(
                 out,
                 MoveTo(0, y),
                 SetForegroundColor(app.theme.top_bar_text),
                 SetAttribute(Attribute::Bold),
-                Print(pad_or_truncate(&root, width)),
-                SetAttribute(Attribute::Reset)
+                Print(fit_bar(&root, controls, width)),
+                SetAttribute(Attribute::NormalIntensity)
             )?;
             continue;
         }
@@ -681,16 +798,37 @@ fn draw_project_tree<W: Write>(
             app.theme.foreground
         };
 
-        let icon = if entry.is_dir {
-            if entry.expanded {
-                "▾"
-            } else {
-                "▸"
+        let icon = match (app.icon_mode(), entry.is_dir, entry.is_symlink, active_file) {
+            (IconMode::Ascii, true, _, _) => {
+                if entry.expanded {
+                    "v"
+                } else {
+                    ">"
+                }
             }
-        } else if active_file {
-            "●"
-        } else {
-            "·"
+            (IconMode::Ascii, false, true, _) => "@",
+            (IconMode::Ascii, false, false, true) => "*",
+            (IconMode::Ascii, false, false, false) => "-",
+            (IconMode::Nerd, true, _, _) => {
+                if entry.expanded {
+                    "󰝰"
+                } else {
+                    "󰉋"
+                }
+            }
+            (IconMode::Nerd, false, true, _) => "󰌷",
+            (IconMode::Nerd, false, false, true) => "󰈔",
+            (IconMode::Nerd, false, false, false) => "󰈔",
+            (IconMode::Unicode, true, _, _) => {
+                if entry.expanded {
+                    "▾"
+                } else {
+                    "▸"
+                }
+            }
+            (IconMode::Unicode, false, true, _) => "↗",
+            (IconMode::Unicode, false, false, true) => "●",
+            (IconMode::Unicode, false, false, false) => "·",
         };
         let git = match entry.git_status {
             Some(GitStatus::Modified) => " M ",
@@ -722,14 +860,61 @@ fn draw_project_tree<W: Write>(
             SetAttribute(if selected {
                 Attribute::Bold
             } else {
-                Attribute::Reset
+                Attribute::NormalIntensity
             }),
             Print(label),
-            SetAttribute(Attribute::Reset)
+            SetAttribute(Attribute::NormalIntensity)
         )?;
     }
 
     Ok(())
+}
+
+fn explorer_breadcrumb(app: &App, max_width: usize) -> String {
+    let selected = app.project.entries.get(app.project.selected);
+    let directory = selected.map_or(app.project.root.as_path(), |entry| {
+        if entry.is_dir {
+            entry.path.as_path()
+        } else {
+            entry.path.parent().unwrap_or(app.project.root.as_path())
+        }
+    });
+    let relative = directory
+        .strip_prefix(&app.project.root)
+        .unwrap_or(directory);
+    let mut breadcrumb = app.project.root_name().to_string();
+    for component in relative.components() {
+        let name = component.as_os_str().to_string_lossy();
+        if !name.is_empty() {
+            breadcrumb.push_str(" › ");
+            breadcrumb.push_str(&name);
+        }
+    }
+    compact_text(&breadcrumb, max_width)
+}
+
+fn explorer_header_controls(width: usize) -> &'static str {
+    if width >= 36 {
+        "[+] [D] [R] [-]"
+    } else {
+        ""
+    }
+}
+
+pub fn explorer_header_action_at(width: usize, column: usize) -> Option<char> {
+    let controls = explorer_header_controls(width);
+    if controls.is_empty() || column >= width {
+        return None;
+    }
+    let start = width.saturating_sub(UnicodeWidthStr::width(controls));
+    let offset = column.checked_sub(start)?;
+    match offset {
+        1 => Some('+'),
+        5 => Some('D'),
+        9 => Some('R'),
+        13 => Some('-'),
+        _ => None,
+    }
 }
 
 fn draw_outline<W: Write>(
@@ -758,7 +943,7 @@ fn draw_outline<W: Write>(
                     &format!(" SYMBOLS ▾ {} items", symbols.len()),
                     width
                 )),
-                SetAttribute(Attribute::Reset)
+                SetAttribute(Attribute::NormalIntensity)
             )?;
             continue;
         }
@@ -796,10 +981,10 @@ fn draw_outline<W: Write>(
             SetAttribute(if selected {
                 Attribute::Bold
             } else {
-                Attribute::Reset
+                Attribute::NormalIntensity
             }),
             Print(pad_or_truncate(&label, width)),
-            SetAttribute(Attribute::Reset)
+            SetAttribute(Attribute::NormalIntensity)
         )?;
     }
     Ok(())
@@ -1110,6 +1295,804 @@ fn render_line_text<W: Write>(
     Ok(())
 }
 
+fn draw_file_manager<W: Write>(
+    out: &mut W,
+    app: &App,
+    top: u16,
+    rows: usize,
+    width: u16,
+) -> io::Result<()> {
+    let width = width as usize;
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    for row in 0..rows {
+        queue!(
+            out,
+            MoveTo(0, top + row as u16),
+            SetBackgroundColor(app.theme.background),
+            SetForegroundColor(app.theme.foreground),
+            Print(" ".repeat(width))
+        )?;
+    }
+
+    let selection_count = app.file_manager.selected_paths.len();
+    let left_header = format!(
+        " 󰉋  {}",
+        manager_breadcrumb(&app.file_manager.current_dir, width.saturating_sub(28))
+    );
+    let right_header = if app.file_manager.loading {
+        " scanning… ".to_string()
+    } else if selection_count > 0 {
+        format!(" {selection_count} selected ")
+    } else {
+        format!(" {} items ", app.file_manager.visible_entries().len())
+    };
+    queue!(
+        out,
+        MoveTo(0, top),
+        SetBackgroundColor(app.theme.top_bar),
+        SetForegroundColor(app.theme.top_bar_text),
+        SetAttribute(Attribute::Bold),
+        Print(fit_bar(&left_header, &right_header, width)),
+        SetAttribute(Attribute::NormalIntensity)
+    )?;
+
+    if rows < 3 {
+        return Ok(());
+    }
+    let body_top = top + 1;
+    let body_rows = rows.saturating_sub(2);
+    let (parent_percent, current_percent) = app.manager_pane_ratios();
+    let manager_layout = FileManagerLayout::calculate(width, parent_percent, current_percent);
+    if manager_layout.parent_width > 0 {
+        draw_manager_parent_pane(
+            out,
+            app,
+            body_top,
+            body_rows,
+            manager_layout.parent_x,
+            manager_layout.parent_width,
+        )?;
+    }
+    draw_manager_current_pane(
+        out,
+        app,
+        body_top,
+        body_rows,
+        manager_layout.current_x,
+        manager_layout.current_width,
+    )?;
+    if manager_layout.preview_width > 0 {
+        draw_manager_preview_pane(
+            out,
+            app,
+            body_top,
+            body_rows,
+            manager_layout.preview_x,
+            manager_layout.preview_width,
+        )?;
+    }
+
+    let operation = app.file_manager.progress.as_ref().map_or_else(
+        || {
+            app.file_manager.last_operation.as_ref().map_or_else(
+                || "Ready".to_string(),
+                |summary| {
+                    format!(
+                        "{:?}: {} complete · {} skipped · {} failed{}",
+                        summary.kind,
+                        summary.completed,
+                        summary.skipped,
+                        summary.failures.len(),
+                        if summary.cancelled {
+                            " · cancelled"
+                        } else {
+                            ""
+                        }
+                    )
+                },
+            )
+        },
+        |progress| {
+            format!(
+                "{:?}: {}/{} · {} · Ctrl-C cancels",
+                progress.kind,
+                progress.completed,
+                progress.total,
+                progress.current.display()
+            )
+        },
+    );
+    let context_hints = if app.file_manager.progress.is_some() {
+        " Ctrl-C cancel "
+    } else if selection_count > 0 {
+        " c copy  x cut  p paste  d duplicate  Del trash "
+    } else {
+        " Enter open  Ctrl-Enter split  Space select  / filter  g go to "
+    };
+    let left_footer = if let Some(kind) = app.manager_input_kind {
+        let label = match kind {
+            ManagerInputKind::Rename => "Rename",
+            ManagerInputKind::NewFile => "New file",
+            ManagerInputKind::NewDirectory => "New folder",
+            ManagerInputKind::GoTo => "Go to",
+        };
+        format!(" {label}  {}_", app.manager_input)
+    } else if !app.file_manager.filter.is_empty() {
+        format!(" Filter  {}_", app.file_manager.filter)
+    } else {
+        format!(" {operation}")
+    };
+    queue!(
+        out,
+        MoveTo(0, top + rows.saturating_sub(1) as u16),
+        SetBackgroundColor(app.theme.status_bar),
+        SetForegroundColor(app.theme.status_text),
+        Print(fit_bar(&left_footer, context_hints, width))
+    )?;
+    Ok(())
+}
+
+fn manager_breadcrumb(path: &Path, max_width: usize) -> String {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                let label = match prefix.kind() {
+                    Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                        format!("{}:", char::from(drive))
+                    }
+                    Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                        format!(
+                            "⌁ {}{}{}",
+                            server.to_string_lossy(),
+                            MAIN_SEPARATOR,
+                            share.to_string_lossy()
+                        )
+                    }
+                    Prefix::DeviceNS(device) | Prefix::Verbatim(device) => {
+                        device.to_string_lossy().into_owned()
+                    }
+                };
+                parts.push(manager_display_line(&label));
+            }
+            Component::RootDir if parts.is_empty() => {
+                parts.push(MAIN_SEPARATOR.to_string());
+            }
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => parts.push("..".to_string()),
+            Component::Normal(part) => {
+                parts.push(manager_display_line(&part.to_string_lossy()));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return manager_display_line(&path.display().to_string());
+    }
+
+    let separator = "  ›  ";
+    let full = parts.join(separator);
+    if UnicodeWidthStr::width(full.as_str()) <= max_width {
+        return full;
+    }
+
+    let mut compact = Vec::new();
+    compact.push(parts[0].clone());
+    if parts.len() > 3 {
+        compact.push("…".to_string());
+    }
+    compact.extend(
+        parts
+            .iter()
+            .skip(parts.len().saturating_sub(2).max(1))
+            .cloned(),
+    );
+    compact.dedup();
+    compact_text(&compact.join(separator), max_width)
+}
+
+pub fn file_manager_entry_at(
+    app: &App,
+    terminal_width: u16,
+    terminal_height: u16,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let layout = screen_layout(app, terminal_width, terminal_height);
+    let (parent_percent, current_percent) = app.manager_pane_ratios();
+    let manager_layout =
+        FileManagerLayout::calculate(terminal_width as usize, parent_percent, current_percent);
+    if (column as usize) <= manager_layout.current_x
+        || (column as usize) >= manager_layout.current_x + manager_layout.current_width - 1
+    {
+        return None;
+    }
+    let first_entry_row = layout.content_top + 3;
+    let body_bottom = layout.content_top + layout.content_height.saturating_sub(2) as u16;
+    if row < first_entry_row || row >= body_bottom {
+        return None;
+    }
+    let index = app.file_manager.scroll + (row - first_entry_row) as usize;
+    (index < app.file_manager.visible_entries().len()).then_some(index)
+}
+
+fn draw_manager_parent_pane<W: Write>(
+    out: &mut W,
+    app: &App,
+    top: u16,
+    rows: usize,
+    x: usize,
+    width: usize,
+) -> io::Result<()> {
+    let parent_name = app
+        .file_manager
+        .current_dir
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| manager_display_line(&name.to_string_lossy()))
+        .unwrap_or_else(|| "ROOT".to_string());
+    draw_manager_panel_frame(
+        out,
+        app,
+        ManagerPanel {
+            top,
+            rows,
+            x,
+            width,
+        },
+        &format!("PARENT  ‹  {parent_name}"),
+        None,
+        false,
+    )?;
+    let current_name = app
+        .file_manager
+        .current_dir
+        .file_name()
+        .map(|name| name.to_string_lossy());
+    for (row, entry) in app
+        .file_manager
+        .parent_entries
+        .iter()
+        .take(rows.saturating_sub(2))
+        .enumerate()
+    {
+        let active = current_name.as_deref() == Some(entry.name.as_str());
+        draw_manager_entry(
+            out,
+            app,
+            entry,
+            top + row as u16 + 1,
+            x + 1,
+            width.saturating_sub(2),
+            active,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn draw_manager_current_pane<W: Write>(
+    out: &mut W,
+    app: &App,
+    top: u16,
+    rows: usize,
+    x: usize,
+    width: usize,
+) -> io::Result<()> {
+    let directory_name = app
+        .file_manager
+        .current_dir
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| app.file_manager.current_dir.display().to_string().into());
+    let entries = app.file_manager.visible_entries();
+    let position = if entries.is_empty() {
+        "0 items".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            app.file_manager
+                .selected
+                .saturating_add(1)
+                .min(entries.len()),
+            entries.len()
+        )
+    };
+    draw_manager_panel_frame(
+        out,
+        app,
+        ManagerPanel {
+            top,
+            rows,
+            x,
+            width,
+        },
+        &format!("FILES  ·  {directory_name}"),
+        Some(&position),
+        true,
+    )?;
+    let filter_text = if app.file_manager.filter.is_empty() {
+        "(/) Type to filter".to_string()
+    } else {
+        format!("(/) {}_", app.file_manager.filter)
+    };
+    queue!(
+        out,
+        MoveTo((x + 1) as u16, top + 1),
+        SetBackgroundColor(app.theme.prompt_bar),
+        SetForegroundColor(if app.file_manager.filter.is_empty() {
+            app.theme.muted
+        } else {
+            app.theme.heading
+        }),
+        Print(pad_or_truncate(
+            &format!(" 🔎 {filter_text}"),
+            width.saturating_sub(2)
+        ))
+    )?;
+    for (screen_row, entry) in entries
+        .iter()
+        .skip(app.file_manager.scroll)
+        .take(rows.saturating_sub(3))
+        .enumerate()
+    {
+        let index = app.file_manager.scroll + screen_row;
+        draw_manager_entry(
+            out,
+            app,
+            entry,
+            top + screen_row as u16 + 2,
+            x + 1,
+            width.saturating_sub(2),
+            index == app.file_manager.selected,
+            app.file_manager.selected_paths.contains(&entry.path),
+        )?;
+    }
+    if let Some(error) = app.file_manager.error.as_deref() {
+        queue!(
+            out,
+            MoveTo((x + 1) as u16, top + 2),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.error),
+            Print(pad_or_truncate(
+                &format!(" {error}"),
+                width.saturating_sub(2)
+            ))
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_manager_entry<W: Write>(
+    out: &mut W,
+    app: &App,
+    entry: &FileEntry,
+    row: u16,
+    x: usize,
+    width: usize,
+    active: bool,
+    selected: bool,
+) -> io::Result<()> {
+    let background = if active {
+        soft_selection_background(app)
+    } else if selected {
+        app.theme.prompt_bar
+    } else {
+        app.theme.overlay
+    };
+    let foreground = if active {
+        app.theme.heading
+    } else if entry.hidden {
+        app.theme.muted
+    } else if entry.is_dir || entry.is_symlink {
+        app.theme.heading
+    } else {
+        app.theme.foreground
+    };
+    let icon = manager_icon(entry, app.icon_mode());
+    let mark = if active {
+        "▌"
+    } else if selected {
+        "●"
+    } else {
+        " "
+    };
+    let suffix = if entry.is_dir {
+        "/"
+    } else if entry.is_symlink {
+        "@"
+    } else {
+        ""
+    };
+    let metadata = if width >= 56 {
+        format!(
+            "  {:>8}  {}",
+            human_size(entry.size),
+            unix_time_label(entry.modified_unix_secs)
+        )
+    } else if width >= 38 {
+        format!("  {:>8}", human_size(entry.size))
+    } else {
+        String::new()
+    };
+    let safe_name = manager_display_line(&entry.name);
+    let label = fit_bar(
+        &format!(" {mark} {icon} {safe_name}{suffix}"),
+        &metadata,
+        width,
+    );
+    queue!(
+        out,
+        MoveTo(x as u16, row),
+        SetBackgroundColor(background),
+        SetForegroundColor(foreground),
+        Print(label)
+    )?;
+    Ok(())
+}
+
+fn manager_icon(entry: &FileEntry, mode: IconMode) -> &'static str {
+    match (mode, entry.is_dir, entry.is_symlink) {
+        (IconMode::Ascii, true, _) => "[D]",
+        (IconMode::Ascii, false, true) => "[L]",
+        (IconMode::Ascii, false, false) => "[F]",
+        (IconMode::Nerd, true, _) => "󰉋",
+        (IconMode::Nerd, false, true) => "󰌷",
+        (IconMode::Nerd, false, false) => "󰈔",
+        (IconMode::Unicode, true, _) => "▸",
+        (IconMode::Unicode, false, true) => "↗",
+        (IconMode::Unicode, false, false) => "·",
+    }
+}
+
+fn draw_manager_preview_pane<W: Write>(
+    out: &mut W,
+    app: &App,
+    top: u16,
+    rows: usize,
+    x: usize,
+    width: usize,
+) -> io::Result<()> {
+    let title = app
+        .file_manager
+        .selected_entry()
+        .map(|entry| entry.name.as_str())
+        .unwrap_or("nothing selected");
+    draw_manager_panel_frame(
+        out,
+        app,
+        ManagerPanel {
+            top,
+            rows,
+            x,
+            width,
+        },
+        &format!("PREVIEW · {title}"),
+        None,
+        false,
+    )?;
+    let mut lines = Vec::new();
+    if let Some(entry) = app.file_manager.selected_entry() {
+        lines.push(format!("Size: {}", human_size(entry.size)));
+        lines.push(format!(
+            "Modified: {}",
+            unix_time_label(entry.modified_unix_secs)
+        ));
+        lines.push(String::new());
+    }
+    match &app.file_manager.preview {
+        Preview::Loading => lines.push("Loading preview…".to_string()),
+        Preview::Empty => lines.push("Preview disabled or unavailable".to_string()),
+        Preview::Directory {
+            children,
+            directories,
+            files,
+            total_bytes,
+            truncated,
+        } => {
+            lines.push(format!("{children} children"));
+            lines.push(format!("{directories} directories"));
+            lines.push(format!("{files} files"));
+            lines.push(format!("{} immediate file data", human_size(*total_bytes)));
+            if *truncated {
+                lines.push("Count truncated".to_string());
+            }
+        }
+        Preview::Text {
+            lines: preview_lines,
+            truncated,
+            structured,
+        } => {
+            if let Some(kind) = structured {
+                lines.push(format!("{kind} preview"));
+                lines.push(String::new());
+            }
+            lines.extend(preview_lines.iter().cloned());
+            if *truncated {
+                lines.push("… preview truncated".to_string());
+            }
+        }
+        Preview::Binary {
+            size,
+            header,
+            kind,
+            dimensions,
+        } => {
+            lines.push((*kind).to_string());
+            lines.push(format!("Size: {}", human_size(*size)));
+            if let Some((width, height)) = dimensions {
+                lines.push(format!("Dimensions: {width} × {height}"));
+            }
+            lines.push(String::new());
+            lines.push("Header:".to_string());
+            lines.push(header.clone());
+        }
+        Preview::Symlink { target, exists } => {
+            lines.push(format!("Target: {}", target.display()));
+            lines.push(if *exists {
+                "Target exists".to_string()
+            } else {
+                "Broken symlink".to_string()
+            });
+        }
+        Preview::Error(error) => lines.push(format!("Preview error: {error}")),
+    }
+    for (index, line) in lines.iter().take(rows.saturating_sub(2)).enumerate() {
+        let safe_line = manager_display_line(line);
+        let metadata = line.starts_with("Size:")
+            || line.starts_with("Modified:")
+            || line.starts_with("Dimensions:")
+            || line.starts_with("Target:")
+            || line == "Header:";
+        queue!(
+            out,
+            MoveTo((x + 1) as u16, top + index as u16 + 1),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(
+                if line.starts_with("Preview error") || line == "Broken symlink" {
+                    app.theme.error
+                } else if metadata {
+                    app.theme.heading
+                } else {
+                    app.theme.foreground
+                }
+            ),
+            Print(pad_or_truncate(
+                &format!(" {safe_line}"),
+                width.saturating_sub(2)
+            ))
+        )?;
+    }
+    Ok(())
+}
+
+fn draw_manager_panel_frame<W: Write>(
+    out: &mut W,
+    app: &App,
+    panel: ManagerPanel,
+    title: &str,
+    footer: Option<&str>,
+    focused: bool,
+) -> io::Result<()> {
+    let ManagerPanel {
+        top,
+        rows,
+        x,
+        width,
+    } = panel;
+    if width < 3 || rows < 2 {
+        return Ok(());
+    }
+    let border = if focused {
+        app.theme.heading
+    } else {
+        app.theme.border
+    };
+    for offset in 0..rows {
+        queue!(
+            out,
+            MoveTo(x as u16, top + offset as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(width))
+        )?;
+    }
+    let inner = width.saturating_sub(2);
+    let safe_title = manager_display_line(title);
+    let label = compact_text(&safe_title, inner.saturating_sub(4));
+    let label_width = UnicodeWidthStr::width(label.as_str());
+    let remaining = inner.saturating_sub(label_width + 3);
+    queue!(
+        out,
+        MoveTo(x as u16, top),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(border)
+    )?;
+    if focused {
+        queue!(out, SetAttribute(Attribute::Bold))?;
+    }
+    queue!(out, Print(format!("╭─ {label} {}╮", "─".repeat(remaining))))?;
+    if focused {
+        queue!(out, SetAttribute(Attribute::NormalIntensity))?;
+    }
+    let bottom = footer.map_or_else(
+        || format!("╰{}╯", "─".repeat(inner)),
+        |footer| {
+            let footer = compact_text(&manager_display_line(footer), inner.saturating_sub(3));
+            let footer_width = UnicodeWidthStr::width(footer.as_str());
+            format!(
+                "╰{} {footer} ─╯",
+                "─".repeat(inner.saturating_sub(footer_width + 3))
+            )
+        },
+    );
+    queue!(
+        out,
+        MoveTo(x as u16, top + rows as u16 - 1),
+        SetForegroundColor(border),
+        Print(bottom)
+    )?;
+    for offset in 1..rows.saturating_sub(1) {
+        queue!(
+            out,
+            MoveTo(x as u16, top + offset as u16),
+            SetForegroundColor(border),
+            Print("│"),
+            MoveTo((x + width - 1) as u16, top + offset as u16),
+            Print("│")
+        )?;
+    }
+    Ok(())
+}
+
+fn draw_manager_confirmation<W: Write>(
+    out: &mut W,
+    app: &App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    if app.manager_conflicts > 0 {
+        let box_width = (width as usize).saturating_sub(4).clamp(34, 76);
+        let x = width.saturating_sub(box_width as u16) / 2;
+        let y = height.saturating_sub(6) / 2;
+        for row in 0..6u16 {
+            queue!(
+                out,
+                MoveTo(x, y + row),
+                SetBackgroundColor(app.theme.prompt_bar),
+                SetForegroundColor(app.theme.foreground),
+                Print(" ".repeat(box_width))
+            )?;
+        }
+        queue!(
+            out,
+            MoveTo(x, y),
+            SetForegroundColor(app.theme.heading),
+            SetAttribute(Attribute::Bold),
+            Print(pad_or_truncate(
+                &format!(" {} paste conflict(s)", app.manager_conflicts),
+                box_width
+            )),
+            MoveTo(x, y + 2),
+            SetAttribute(Attribute::Reset),
+            SetForegroundColor(app.theme.foreground),
+            Print(pad_or_truncate(
+                " Choose one policy for all conflicting items:",
+                box_width
+            )),
+            MoveTo(x, y + 4),
+            SetForegroundColor(app.theme.heading),
+            Print(pad_or_truncate(
+                " O overwrite · S skip · R rename · Esc cancel",
+                box_width
+            ))
+        )?;
+        return Ok(());
+    }
+    let paths = app.file_manager.selected_or_cursor_paths();
+    let action = match app.manager_confirmation {
+        Some(ManagerConfirmation::Trash) => "Move to trash",
+        Some(ManagerConfirmation::Delete) => "PERMANENTLY DELETE",
+        None => return Ok(()),
+    };
+    let detail = if paths.len() == 1 {
+        paths[0].display().to_string()
+    } else {
+        format!("{} selected items", paths.len())
+    };
+    let box_width = (width as usize).saturating_sub(4).clamp(30, 76);
+    let x = width.saturating_sub(box_width as u16) / 2;
+    let y = height.saturating_sub(5) / 2;
+    for row in 0..5u16 {
+        queue!(
+            out,
+            MoveTo(x, y + row),
+            SetBackgroundColor(app.theme.prompt_bar),
+            SetForegroundColor(app.theme.foreground),
+            Print(" ".repeat(box_width))
+        )?;
+    }
+    queue!(
+        out,
+        MoveTo(x, y),
+        SetForegroundColor(app.theme.error),
+        SetAttribute(Attribute::Bold),
+        Print(pad_or_truncate(&format!(" {action}?"), box_width)),
+        MoveTo(x, y + 2),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(app.theme.foreground),
+        Print(pad_or_truncate(&format!(" {detail}"), box_width)),
+        MoveTo(x, y + 4),
+        SetForegroundColor(app.theme.heading),
+        Print(pad_or_truncate(
+            " Enter/Y confirm · Esc/N cancel",
+            box_width
+        ))
+    )?;
+    Ok(())
+}
+
+fn draw_manager_context_menu<W: Write>(
+    out: &mut W,
+    app: &App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let Some((column, row)) = app.manager_context_menu else {
+        return Ok(());
+    };
+    let menu_width = 28usize.min(width.saturating_sub(2) as usize);
+    let menu_height = 9u16;
+    let x = column.min(width.saturating_sub(menu_width as u16 + 1));
+    let y = row.min(height.saturating_sub(menu_height + 1));
+    let items = [
+        (" Enter", "Open"),
+        (" Ctrl-Enter", "Open in split"),
+        (" c / x", "Copy / cut"),
+        (" p", "Paste"),
+        (" d", "Duplicate"),
+        (" F2", "Rename"),
+        (" Delete", "Move to trash"),
+    ];
+    for offset in 0..menu_height {
+        queue!(
+            out,
+            MoveTo(x, y + offset),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(" ".repeat(menu_width))
+        )?;
+    }
+    queue!(
+        out,
+        MoveTo(x, y),
+        SetBackgroundColor(app.theme.normal_mode),
+        SetForegroundColor(app.theme.background),
+        SetAttribute(Attribute::Bold),
+        Print(pad_or_truncate("  FILE ACTIONS", menu_width)),
+        SetAttribute(Attribute::Reset)
+    )?;
+    for (index, (key, label)) in items.iter().enumerate() {
+        queue!(
+            out,
+            MoveTo(x, y + index as u16 + 1),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(app.theme.heading),
+            Print(pad_or_truncate(key, 12)),
+            SetForegroundColor(app.theme.overlay_text),
+            Print(pad_or_truncate(label, menu_width.saturating_sub(12)))
+        )?;
+    }
+    queue!(
+        out,
+        MoveTo(x, y + menu_height - 1),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(" Esc  close", menu_width))
+    )
+}
+
 fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
     let mode_color = if app.terminal_focused {
         app.theme.insert_mode
@@ -1128,7 +2111,8 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             | Mode::ThemeGallery
             | Mode::KeymapGallery
             | Mode::ContextMenu
-            | Mode::Dashboard => app.theme.command_mode,
+            | Mode::Dashboard
+            | Mode::FileManager => app.theme.command_mode,
         }
     };
 
@@ -1180,7 +2164,7 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         SetForegroundColor(mode_color),
         SetAttribute(Attribute::Bold),
         Print(fit_bar(&left, &right, width as usize)),
-        SetAttribute(Attribute::Reset)
+        SetAttribute(Attribute::NormalIntensity)
     )?;
 
     if let Some((label, state)) = background {
@@ -1197,10 +2181,11 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         queue!(
             out,
             MoveTo(x, row),
+            SetBackgroundColor(app.theme.status_bar),
             SetForegroundColor(color),
             SetAttribute(Attribute::Bold),
             Print(label),
-            SetAttribute(Attribute::Reset)
+            SetAttribute(Attribute::NormalIntensity)
         )?;
     }
 
@@ -2426,24 +3411,33 @@ pub fn theme_gallery_contains(app: &App, width: u16, height: u16, column: u16, r
         && row < y.saturating_add((visible_rows + 4) as u16)
 }
 
-/// Rows above the list inside the palette: blank, title, search field,
-/// separator.
-const PALETTE_LIST_TOP: u16 = 4;
+/// Rows above the list inside the palette: framed search field and spacing.
+const PALETTE_LIST_TOP: u16 = 5;
+const PALETTE_ITEM_HEIGHT: usize = 2;
 /// The list rows plus `PALETTE_LIST_TOP` and the footer.
 const PALETTE_CHROME_ROWS: usize = PALETTE_LIST_TOP as usize + 2;
 
 /// `(x, y, panel_width, visible_rows, first_index)` for the command palette.
 fn command_palette_geometry(app: &App, width: u16, height: u16) -> (u16, u16, usize, usize, usize) {
     let total = app.command_suggestions().len();
-    let panel_width = 74usize.min(width.saturating_sub(4) as usize);
+    let available_width = width.saturating_sub(4) as usize;
+    let panel_width = (width as usize * 3 / 5)
+        .max(74.min(available_width))
+        .min(110)
+        .min(available_width)
+        .max(1);
     let visible_rows = total
         .min(COMMAND_PALETTE_ROWS)
-        .min((height as usize).saturating_sub(PALETTE_CHROME_ROWS + 2))
+        .min((height as usize).saturating_sub(PALETTE_CHROME_ROWS + 2) / PALETTE_ITEM_HEIGHT)
         .max(1);
-    let panel_height = visible_rows + PALETTE_CHROME_ROWS;
+    let panel_height = visible_rows * PALETTE_ITEM_HEIGHT + PALETTE_CHROME_ROWS;
     let first = command_suggestion_window_start(total, app.command_suggestion_scroll, visible_rows);
     let x = width.saturating_sub(panel_width as u16) / 2;
-    let y = height.saturating_sub(panel_height as u16) / 2;
+    let y = if height as usize >= panel_height + 4 {
+        2
+    } else {
+        height.saturating_sub(panel_height as u16) / 2
+    };
     (x, y, panel_width, visible_rows, first)
 }
 
@@ -2459,8 +3453,8 @@ fn draw_command_palette<W: Write>(
 
     let (x, y, panel_width, visible_rows, first) = command_palette_geometry(app, width, height);
     let matches = app.command_matches();
-    let inner = panel_width.saturating_sub(4);
-    let panel_height = visible_rows + PALETTE_CHROME_ROWS;
+    let inner = panel_width.saturating_sub(6);
+    let panel_height = visible_rows * PALETTE_ITEM_HEIGHT + PALETTE_CHROME_ROWS;
 
     for row in 0..panel_height {
         queue!(
@@ -2471,44 +3465,61 @@ fn draw_command_palette<W: Write>(
             Print(" ".repeat(panel_width))
         )?;
     }
-
     queue!(
         out,
-        MoveTo(x + 2, y + 1),
-        SetForegroundColor(app.theme.top_bar_text),
-        SetAttribute(Attribute::Bold),
-        Print(pad_or_truncate("COMMAND PALETTE", inner)),
-        SetAttribute(Attribute::Reset)
+        MoveTo(x, y),
+        SetForegroundColor(app.theme.border),
+        Print(format!("╭{}╮", "─".repeat(panel_width.saturating_sub(2)))),
+        MoveTo(x, y + panel_height as u16 - 1),
+        Print(format!("╰{}╯", "─".repeat(panel_width.saturating_sub(2))))
     )?;
+    for offset in 1..panel_height.saturating_sub(1) {
+        queue!(
+            out,
+            MoveTo(x, y + offset as u16),
+            SetForegroundColor(app.theme.border),
+            Print("│"),
+            MoveTo(x + panel_width as u16 - 1, y + offset as u16),
+            Print("│")
+        )?;
+    }
 
-    // The search field, styled like the prompt bar so it reads as an input.
-    // Empty shows a placeholder; the cursor sits just after the "> " prefix.
+    // The framed input and roomy rows intentionally mirror a graphical
+    // launcher while remaining terminal-native.
     let empty = app.command_input.is_empty();
     let field = if empty {
-        "> Type a command name".to_string()
+        "> Type a command name…".to_string()
     } else {
         format!("> {}", app.command_input)
     };
     queue!(
         out,
+        MoveTo(x + 2, y + 1),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.border),
+        Print(format!("╭{}╮", "─".repeat(panel_width.saturating_sub(6)))),
         MoveTo(x + 2, y + 2),
         SetBackgroundColor(app.theme.prompt_bar),
+        SetForegroundColor(app.theme.border),
+        Print("│"),
         SetForegroundColor(if empty {
             app.theme.muted
         } else {
             app.theme.prompt_text
         }),
         Print(pad_or_truncate(&field, inner)),
-        SetBackgroundColor(app.theme.overlay),
-        SetForegroundColor(app.theme.muted),
+        SetForegroundColor(app.theme.border),
+        Print("│"),
         MoveTo(x + 2, y + 3),
-        Print("─".repeat(inner))
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.heading),
+        Print(format!("╰{}╯", "─".repeat(panel_width.saturating_sub(6))))
     )?;
 
     if matches.is_empty() {
         queue!(
             out,
-            MoveTo(x + 2, y + PALETTE_LIST_TOP),
+            MoveTo(x + 3, y + PALETTE_LIST_TOP + 1),
             SetBackgroundColor(app.theme.overlay),
             SetForegroundColor(app.theme.muted),
             Print(pad_or_truncate("No commands match", inner))
@@ -2523,32 +3534,48 @@ fn draw_command_palette<W: Write>(
         .enumerate()
     {
         let selected = index == app.command_suggestion;
-        let left = format!(
-            "{} {:<20} {}",
-            if selected { "▶" } else { " " },
-            format!(":{}", entry.name),
-            entry.description
-        );
-        let right = entry
-            .chord
-            .as_ref()
-            .map_or_else(String::new, |chord| format!("{chord} "));
+        let item_y = y + PALETTE_LIST_TOP + (row * PALETTE_ITEM_HEIGHT) as u16;
+        let item_width = panel_width.saturating_sub(4);
+        let left = format!("  {}", entry.description);
 
         queue!(
             out,
-            MoveTo(x + 2, y + PALETTE_LIST_TOP + row as u16),
+            MoveTo(x + 2, item_y),
             SetBackgroundColor(if selected {
-                app.theme.command_mode
+                soft_selection_background(app)
             } else {
                 app.theme.overlay
             }),
-            SetForegroundColor(if selected {
-                app.theme.background
-            } else {
-                app.theme.overlay_text
-            }),
-            Print(fit_bar(&left, &right, inner))
+            SetForegroundColor(app.theme.overlay_text),
+            Print(pad_or_truncate(&left, item_width))
         )?;
+        if selected {
+            queue!(
+                out,
+                MoveTo(x + 2, item_y),
+                SetForegroundColor(app.theme.heading),
+                SetAttribute(Attribute::Bold),
+                Print("▌"),
+                SetAttribute(Attribute::Reset)
+            )?;
+        }
+        if let Some(chord) = entry.chord.as_deref() {
+            let badge = format!(" {chord} ");
+            let badge_width = UnicodeWidthStr::width(badge.as_str());
+            if badge_width + 4 < item_width {
+                queue!(
+                    out,
+                    MoveTo(x + panel_width as u16 - badge_width as u16 - 3, item_y),
+                    SetBackgroundColor(app.theme.prompt_bar),
+                    SetForegroundColor(if selected {
+                        app.theme.heading
+                    } else {
+                        app.theme.muted
+                    }),
+                    Print(badge)
+                )?;
+            }
+        }
     }
 
     let counter = if matches.is_empty() {
@@ -2558,11 +3585,11 @@ fn draw_command_palette<W: Write>(
     };
     queue!(
         out,
-        MoveTo(x + 2, y + panel_height as u16 - 1),
+        MoveTo(x + 3, y + panel_height as u16 - 2),
         SetBackgroundColor(app.theme.overlay),
         SetForegroundColor(app.theme.muted),
         Print(fit_bar(
-            "↑↓ select · Enter run · Esc cancel",
+            " ↑↓ Navigate   Enter Run   Esc Close",
             &counter,
             inner
         ))
@@ -2594,8 +3621,9 @@ pub fn command_suggestion_at(
         return None;
     }
     let start = y.saturating_add(PALETTE_LIST_TOP);
-    if row >= start && row < start.saturating_add(visible_rows as u16) {
-        let index = first + (row - start) as usize;
+    let list_height = (visible_rows * PALETTE_ITEM_HEIGHT) as u16;
+    if row >= start && row < start.saturating_add(list_height) {
+        let index = first + (row - start) as usize / PALETTE_ITEM_HEIGHT;
         (index < app.command_suggestions().len()).then_some(index)
     } else {
         None
@@ -2611,11 +3639,7 @@ fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
         ),
         // The palette owns the input now, so the bar carries the hint instead
         // of repeating what is already on screen.
-        Mode::Command => (
-            " Type to filter · Enter runs · Esc cancels".to_string(),
-            app.theme.prompt_bar,
-            app.theme.prompt_text,
-        ),
+        Mode::Command => (String::new(), app.theme.background, app.theme.foreground),
         Mode::Help => (
             " Esc, F1, or ? closes help".to_string(),
             app.theme.prompt_bar,
@@ -2657,11 +3681,11 @@ fn draw_prompt_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             if matches!(app.mode, Mode::QuitConfirm | Mode::TabCloseConfirm) {
                 Attribute::Bold
             } else {
-                Attribute::Reset
+                Attribute::NormalIntensity
             }
         ),
         Print(pad_or_truncate(&prompt, width as usize)),
-        SetAttribute(Attribute::Reset)
+        SetAttribute(Attribute::NormalIntensity)
     )
 }
 
@@ -2758,6 +3782,14 @@ fn draw_tab_close_confirm<W: Write>(
 }
 
 fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::Result<()> {
+    if app.mode == Mode::Command {
+        return queue!(
+            out,
+            MoveTo(0, row),
+            SetBackgroundColor(app.theme.background),
+            Print(" ".repeat(width as usize))
+        );
+    }
     let mode_color = if app.terminal_focused {
         app.theme.insert_mode
     } else if app.explorer_focused {
@@ -2775,7 +3807,8 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             | Mode::ThemeGallery
             | Mode::KeymapGallery
             | Mode::ContextMenu
-            | Mode::Dashboard => app.theme.command_mode,
+            | Mode::Dashboard
+            | Mode::FileManager => app.theme.command_mode,
         }
     };
 
@@ -2807,7 +3840,7 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             SetForegroundColor(app.theme.background),
             SetAttribute(Attribute::Bold),
             Print(&key_text),
-            SetAttribute(Attribute::Reset)
+            SetAttribute(Attribute::NormalIntensity)
         )?;
         x += key_width;
 
@@ -2831,9 +3864,10 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             SetAttribute(if clickable {
                 Attribute::Bold
             } else {
-                Attribute::Reset
+                Attribute::NormalIntensity
             }),
-            Print(&description_text)
+            Print(&description_text),
+            SetAttribute(Attribute::NormalIntensity)
         )?;
         x += description_width;
     }
@@ -3004,6 +4038,15 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("F1", "Help"),
             ("Q", "Quit"),
         ],
+        (Mode::FileManager, _) => &[
+            ("↑↓←→", "Navigate"),
+            ("Space", "Select"),
+            ("C/X/P", "Copy/Cut/Paste"),
+            ("Del", "Trash"),
+            ("D", "Delete"),
+            ("/", "Filter"),
+            ("Esc", "Close"),
+        ],
     }
 }
 
@@ -3062,26 +4105,19 @@ fn draw_help<W: Write>(
         ("Alt-N / Alt-P", "Next / previous tab"),
         ("Alt-1 ... Alt-9", "Select a tab directly"),
     ];
-    const FILES: [(&str, &str); 13] = [
+    const FILES: [(&str, &str); 12] = [
         ("Ctrl-B", "Show or hide the explorer"),
-        ("Click FILES", "Show or hide the explorer"),
         ("Ctrl-E", "Switch between editor and files"),
         ("Up / Down", "Select a file or folder"),
         ("Enter", "Open a file or expand a folder"),
         ("Right-click file/tab", "Open actions for that item"),
-        (
-            "+ / ~ / - in gutter",
-            "Added / modified / deleted Git lines",
-        ),
         ("Left / Right", "Collapse / expand a folder"),
         ("Backspace", "Move to the parent folder"),
-        (
-            "Shift-Left / Shift-Right",
-            "Collapse recursively / expand one level",
-        ),
         ("* / -", "Expand all / collapse all"),
         (".", "Show or hide hidden files"),
-        ("r", "Refresh the explorer"),
+        ("/ / Ctrl-P", "Filter tree / fuzzy-open a file"),
+        (":manager / :fm", "Open full filesystem workspace"),
+        ("Space / c x p / Del", "Select and operate in manager"),
     ];
     const COMMANDS: [(&str, &str); 13] = [
         (":  (from Normal mode)", "Open the command prompt"),
@@ -3105,7 +4141,7 @@ fn draw_help<W: Write>(
             "Apply code actions / inspect issues",
         ),
         (":settings", "Search settings and inspect their metadata"),
-        (":plugins", "List loaded plugins and commands"),
+        (":manager / :fm", "Open the full file manager"),
     ];
     const CUSTOMIZE: [(&str, &str); 10] = [
         (
@@ -3128,10 +4164,7 @@ fn draw_help<W: Write>(
             "Search or customize keyboard bindings",
         ),
         ("Ctrl-Shift-P", "Open the command palette from any profile"),
-        (
-            ":config / :theme mono",
-            "Show config path / use high contrast",
-        ),
+        (":set icons=ascii", "Use portable ASCII filesystem icons"),
         (
             ":set reducedmotion",
             "Disable animated background indicators",
@@ -3294,11 +4327,10 @@ fn place_cursor<W: Write>(
     }
 
     if app.mode == Mode::Command {
-        // Inside the palette's search field: panel edge, 2 columns of padding,
-        // then the "> " prefix.
+        // Inside the palette's search field: panel edge, padding, then "> ".
         let (panel_x, panel_y, ..) = command_palette_geometry(app, terminal_width, terminal_height);
         let typed = &app.command_input[..app.command_cursor()];
-        let x = (panel_x as usize + 4 + UnicodeWidthStr::width(typed))
+        let x = (panel_x as usize + 5 + UnicodeWidthStr::width(typed))
             .min(terminal_width.saturating_sub(1) as usize) as u16;
 
         return queue!(out, MoveTo(x, panel_y + 2), Show);
@@ -3424,21 +4456,20 @@ mod tests {
         }
     }
 
-    /// Below this the trailing segment no longer fits, so the offsets would
-    /// point at whatever happened to land in that column.
+    /// Controls disappear only when the compact trailing segment cannot fit;
+    /// FILES drops independently when there is not enough room for both sides.
     #[test]
     fn title_bar_controls_are_dropped_when_they_do_not_fit() {
-        assert!(title_bar_targets(44, 5).is_empty());
-        assert!(title_bar_targets(60, 40).is_empty());
+        assert!(title_bar_targets(44, 40).is_empty());
 
         // FILES goes first: the title is truncated before the right segment is.
-        let cramped = title_bar_targets(60, 5);
+        let cramped = title_bar_targets(60, 40);
         assert!(!cramped
             .iter()
             .any(|(target, _, _)| *target == HoverTarget::Files));
         assert!(cramped
             .iter()
-            .any(|(target, _, _)| *target == HoverTarget::Command));
+            .any(|(target, _, _)| *target == HoverTarget::Menu));
     }
 
     #[test]
@@ -3453,6 +4484,74 @@ mod tests {
         let rendered = fit_bar(" ├─▸ a very long directory name/", " M ", 20);
         assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 20);
         assert!(rendered.ends_with(" M "));
+    }
+
+    #[test]
+    fn sidebar_rows_do_not_reset_their_theme_colors() {
+        let app = App::new(None).expect("create app");
+        let mut tree = Vec::new();
+        draw_project_tree(&mut tree, &app, 2, 4, 40).expect("draw project tree");
+        assert!(
+            !tree
+                .windows(b"\x1b[0m".len())
+                .any(|window| window == b"\x1b[0m"),
+            "an SGR reset after row colors would restore the terminal's black background"
+        );
+
+        let mut outline = Vec::new();
+        draw_outline(&mut outline, &app, 2, 4, 40).expect("draw outline");
+        assert!(!outline
+            .windows(b"\x1b[0m".len())
+            .any(|window| window == b"\x1b[0m"));
+    }
+
+    #[test]
+    fn bottom_chrome_does_not_reset_its_theme_colors() {
+        let app = App::new(None).expect("create app");
+        let mut output = Vec::new();
+        draw_status_bar(&mut output, &app, 20, 100).expect("draw status");
+        draw_prompt_bar(&mut output, &app, 21, 100).expect("draw prompt");
+        draw_hotkey_bar(&mut output, &app, 22, 100).expect("draw hotkeys");
+
+        assert!(
+            !output
+                .windows(b"\x1b[0m".len())
+                .any(|window| window == b"\x1b[0m"),
+            "an SGR reset would leak the terminal background into the bottom rows"
+        );
+    }
+
+    #[test]
+    fn manager_lines_expand_tabs_and_never_emit_terminal_controls() {
+        let safe = manager_display_line("Order\tCustomer\r\nNext");
+        assert_eq!(safe, "Order   Customer��Next");
+        assert!(!safe.chars().any(char::is_control));
+
+        let rendered = pad_or_truncate(&format!(" {safe}"), 18);
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 18);
+        assert!(!rendered.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn manager_breadcrumb_preserves_context_without_exceeding_its_width() {
+        let breadcrumb = manager_breadcrumb(
+            Path::new("/home/nightcat/Documents/code/superfile/src/internal"),
+            34,
+        );
+        assert!(UnicodeWidthStr::width(breadcrumb.as_str()) <= 34);
+        assert!(breadcrumb.contains('…'));
+        assert!(breadcrumb.ends_with("internal"));
+        assert!(breadcrumb.contains('›'));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manager_breadcrumb_hides_windows_verbatim_prefixes() {
+        let breadcrumb =
+            manager_breadcrumb(Path::new(r"\\?\C:\Users\Admin\Documents\oxide-editor"), 80);
+        assert!(breadcrumb.starts_with("C:"));
+        assert!(breadcrumb.ends_with("oxide-editor"));
+        assert!(!breadcrumb.contains(r"\\?\"));
     }
 
     #[test]
@@ -3480,7 +4579,13 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            command_suggestion_at(&app, 80, 24, inside, list_top + visible_rows as u16 - 1),
+            command_suggestion_at(
+                &app,
+                80,
+                24,
+                inside,
+                list_top + (visible_rows * PALETTE_ITEM_HEIGHT) as u16 - 1
+            ),
             Some(first + visible_rows - 1)
         );
 
@@ -3503,7 +4608,7 @@ mod tests {
         for (width, height) in [(80u16, 24u16), (120, 40), (60, 14)] {
             let (x, y, panel_width, visible_rows, _) =
                 command_palette_geometry(&app, width, height);
-            let panel_height = visible_rows + PALETTE_CHROME_ROWS;
+            let panel_height = visible_rows * PALETTE_ITEM_HEIGHT + PALETTE_CHROME_ROWS;
 
             assert!(visible_rows >= 1, "{width}x{height} should show a row");
             assert!(
@@ -3515,6 +4620,37 @@ mod tests {
                 "panel is taller than {width}x{height}"
             );
         }
+    }
+
+    #[test]
+    fn file_manager_hit_testing_tracks_responsive_current_pane() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::FileManager;
+        app.file_manager.entries = vec![FileEntry {
+            path: std::path::PathBuf::from("alpha.txt"),
+            name: "alpha.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            hidden: false,
+            size: 5,
+            modified_unix_secs: None,
+        }];
+        app.file_manager.loading = false;
+
+        // At wide widths the parent pane occupies the left quarter.
+        assert_eq!(file_manager_entry_at(&app, 120, 30, 31, 5), Some(0));
+        assert_eq!(file_manager_entry_at(&app, 120, 30, 2, 4), None);
+        // Narrow layouts collapse to one current-directory pane.
+        assert_eq!(file_manager_entry_at(&app, 60, 20, 2, 5), Some(0));
+    }
+
+    #[test]
+    fn explorer_header_controls_share_drawn_offsets_with_hit_testing() {
+        assert_eq!(explorer_header_action_at(40, 26), Some('+'));
+        assert_eq!(explorer_header_action_at(40, 30), Some('D'));
+        assert_eq!(explorer_header_action_at(40, 34), Some('R'));
+        assert_eq!(explorer_header_action_at(40, 38), Some('-'));
+        assert_eq!(explorer_header_action_at(30, 20), None);
     }
 
     #[test]

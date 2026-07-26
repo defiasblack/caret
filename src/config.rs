@@ -60,6 +60,25 @@ impl StartupView {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IconMode {
+    #[default]
+    Unicode,
+    Ascii,
+    Nerd,
+}
+
+impl IconMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unicode => "unicode",
+            Self::Ascii => "ascii",
+            Self::Nerd => "nerd",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -69,6 +88,13 @@ pub struct Settings {
     pub show_line_numbers: bool,
     pub tree_width: usize,
     pub show_hidden_files: bool,
+    pub icon_mode: IconMode,
+    pub directories_first: bool,
+    pub manager_preview: bool,
+    pub manager_parent_percent: u8,
+    pub manager_current_percent: u8,
+    pub preview_max_bytes: usize,
+    pub confirm_trash: bool,
     pub restore_session: bool,
     pub startup: StartupView,
     pub recent_projects: Vec<PathBuf>,
@@ -149,6 +175,57 @@ impl Settings {
                 default: "off".to_string(),
                 description: "Show hidden files in the project tree",
                 validation: "toggle with :set hidden or :set nohidden",
+                restart_required: false,
+            },
+            SettingInfo {
+                name: "icons",
+                current: self.icon_mode.name().to_string(),
+                default: "unicode".to_string(),
+                description: "Explorer and file-manager icon set",
+                validation: "unicode | ascii | nerd",
+                restart_required: false,
+            },
+            SettingInfo {
+                name: "directoriesfirst",
+                current: on_off(self.directories_first),
+                default: "on".to_string(),
+                description: "Sort directories before files in filesystem views",
+                validation: "on/off via :set directoriesfirst",
+                restart_required: false,
+            },
+            SettingInfo {
+                name: "managerpreview",
+                current: on_off(self.manager_preview),
+                default: "on".to_string(),
+                description: "Show metadata and safe file previews in the file manager",
+                validation: "on/off via :set managerpreview",
+                restart_required: false,
+            },
+            SettingInfo {
+                name: "managerpanes",
+                current: format!(
+                    "{},{}",
+                    self.manager_parent_percent, self.manager_current_percent
+                ),
+                default: "23,42".to_string(),
+                description: "Wide manager parent/current pane percentages",
+                validation: "parent,current; each 15-65 and total 45-85",
+                restart_required: false,
+            },
+            SettingInfo {
+                name: "previewmaxbytes",
+                current: self.preview_max_bytes.to_string(),
+                default: "262144".to_string(),
+                description: "Maximum bytes read by a file preview",
+                validation: "integer from 4096 to 8388608",
+                restart_required: false,
+            },
+            SettingInfo {
+                name: "confirmtrash",
+                current: on_off(self.confirm_trash),
+                default: "on".to_string(),
+                description: "Require confirmation before moving items to trash",
+                validation: "on/off via :set confirmtrash",
                 restart_required: false,
             },
             SettingInfo {
@@ -276,6 +353,13 @@ impl Default for Settings {
             show_line_numbers: true,
             tree_width: 40,
             show_hidden_files: false,
+            icon_mode: IconMode::Unicode,
+            directories_first: true,
+            manager_preview: true,
+            manager_parent_percent: 23,
+            manager_current_percent: 42,
+            preview_max_bytes: 256 * 1024,
+            confirm_trash: true,
             restore_session: true,
             startup: StartupView::Folder,
             recent_projects: Vec::new(),
@@ -369,7 +453,7 @@ mod tests {
         let settings = Settings::default();
         let rows = settings.setting_infos();
 
-        assert_eq!(rows.len(), 19);
+        assert_eq!(rows.len(), 25);
         assert_eq!(rows[0].name, "theme");
         assert_eq!(rows[0].default, "oxide");
         assert!(rows

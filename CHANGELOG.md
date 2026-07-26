@@ -26,6 +26,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   filesystem, watcher, and preview-service capability reporting.
 - An isolated Ubuntu installer smoke test in CI; the installer now honors
   `CARET_INSTALL_DIR` and builds from the locked dependency graph.
+- Responsive full file manager (`:manager` / `:fm`) with parent/current/preview
+  layouts, background cached directory snapshots, generation-based stale-result
+  rejection, targeted polling-watcher invalidation, filtering, history,
+  selection/range/all/invert selection, mouse navigation, and inline
+  create/rename/go-to workflows
+- Safe background filesystem operations for multi-item copy, move, duplicate,
+  OS trash, and explicit permanent delete, including progress, cancellation,
+  descendant-copy protection, cross-device move fallback, overwrite/skip/rename
+  conflict policies, partial-failure summaries, and dirty-buffer safeguards
+- Provider-style text, source, structured-data, directory, symlink, image-kind,
+  and binary metadata previews with byte/line limits and stale preview rejection
+- Unicode, ASCII, and Nerd Font filesystem icon modes plus file-manager preview,
+  sorting, trash-confirmation, and preview-size settings
+- Superfile-inspired manager polish: shared responsive pane geometry,
+  breadcrumb path header, focused-pane styling, wide metadata, contextual
+  action hints, configurable pane ratios, hard preview timeouts, failed-item
+  retry, and Ctrl-Enter open in a vertical split
+- Explorer breadcrumb header controls for new file, new folder, refresh, and
+  collapse
 - Complete find-and-replace panel (Ctrl-F to find, Ctrl-H or :replace to
   replace): case-sensitivity, whole-word, and regex toggles, replace
   one/all, search within a multi-line selection, recallable search
@@ -83,6 +102,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   document version, while closed-file workspace edits use atomic conditional
   writes instead of truncate-in-place writes.
 - CI uses the Node 24-based `actions/checkout` v6 action.
+- The separate title-bar Themes, Command, Help, and Quit controls are now
+  consolidated into a keyboard-accessible `[Menu]` dropdown alongside File
+  Manager, Settings, and Keyboard Shortcuts, reducing top-bar clutter while
+  preserving every existing shortcut.
+- The full file manager now presents its current directory as a compact
+  breadcrumb without Windows verbatim-path noise, uses cleaner Parent/Files/
+  Preview titles, and places the current item position in the focused panel
+  footer for a quieter Superfile-inspired hierarchy.
+- Explorer and full-manager rename/move operations synchronize open tabs,
+  recent files, navigation history, session/recovery inputs, Git state, and LSP
+  document paths
 - Undo and redo are operation-based instead of whole-document
   snapshots: typing runs coalesce into single steps, selections and
   multi-cursors are restored on undo, empty steps are dropped, and the
@@ -119,6 +149,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Title-bar hit zones are derived from the same table that draws them,
   and are dropped on terminals too narrow to render the controls where
   the offsets claim
+- The command palette now uses a wide, top-positioned launcher layout with a
+  framed search field, roomier two-row results, a subtle selection rail, and
+  right-aligned shortcut chips while retaining responsive narrow-terminal
+  behavior and shared mouse hit testing
+- The command palette and file manager now use complete rounded panel frames,
+  stronger theme-derived selection contrast, and less duplicated chrome. The
+  manager presents parent/current/preview as distinct browser panels with a
+  focused border, embedded filter field, inset file rows, richer metadata
+  emphasis, and responsive mouse geometry shared with rendering
+
+### Fixed
+
+- Project-tree and outline row styling no longer resets terminal colors after
+  applying the active theme, so light themes and live theme previews color the
+  complete sidebar instead of leaving non-selected rows on a black background.
+- Status, notification/prompt, and hotkey rows now preserve their theme
+  backgrounds across labels and shortcut chips instead of leaking the
+  terminal's default background into the bottom chrome.
+- Manager preview and filename rendering now expands tabs and replaces terminal
+  control characters before width measurement, preventing long TSV/text rows
+  from crossing pane borders or wrapping into adjacent panels. Panel frame
+  attributes also preserve one border color consistently from top to bottom.
+- Windows verbatim paths (`\\?\C:\...` and `\\?\UNC\...`) are normalized
+  before LSP startup and encoded as valid file URIs. This fixes
+  `csharp-ls` `UriFormatException` failures during `didOpen` and document
+  formatting, including paths containing spaces, Unicode, `%`, or `#`.
 
 ## 0.5.0
 

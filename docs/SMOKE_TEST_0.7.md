@@ -39,6 +39,19 @@ result for each platform.
     sidebar state return.
 13. Run `caret doctor`, then run `cargo test --all-targets --all-features` and
     `cargo build --release` from the repository root.
+14. Open `:manager` at wide, medium, and narrow terminal widths. Confirm it
+    transitions from parent/current/preview to current/preview to current-only,
+    remains keyboard-usable, and mouse click, double-click, right-click action
+    menu, and wheel navigation agree with the rendered rows.
+15. Exercise selection, range selection, select-all, invert, filtering,
+    directory history, inline create/rename/go-to, sorting, hidden files, safe
+    previews, Ctrl-Enter split opening, failed-item retry, pane-ratio settings,
+    and opening a terminal at the selected directory.
+16. In a disposable tree, copy, cut/move, duplicate, paste with rename/skip/
+    overwrite conflicts, cancel a multi-item copy, trash, and permanently
+    delete. Confirm exact-path/count prompts, dirty-buffer blocking,
+    partial-failure summaries, no copy-into-descendant recursion, and open-tab
+    path synchronization after moves and renames.
 
 The CI matrix covers release builds, tests, formatting, Clippy, and diagnostics
 on Ubuntu, Windows, and macOS. The interactive portions above still require a

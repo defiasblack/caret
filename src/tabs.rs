@@ -156,6 +156,32 @@ impl Tabs {
         self.tabs.iter().any(|tab| tab.editor.dirty)
     }
 
+    pub fn any_dirty_path_under(&self, roots: &[PathBuf]) -> bool {
+        self.tabs.iter().any(|tab| {
+            tab.editor.dirty
+                && tab.editor.path.as_ref().is_some_and(|path| {
+                    roots
+                        .iter()
+                        .any(|root| path == root || path.starts_with(root))
+                })
+        })
+    }
+
+    /// Rewrites paths for an exact file move or every open descendant of a
+    /// moved directory. Buffer contents and dirty state are preserved.
+    pub fn remap_paths(&mut self, source: &Path, destination: &Path) {
+        for tab in &mut self.tabs {
+            let Some(path) = tab.editor.path.as_mut() else {
+                continue;
+            };
+            if path == source {
+                *path = destination.to_path_buf();
+            } else if let Ok(relative) = path.strip_prefix(source) {
+                *path = destination.join(relative);
+            }
+        }
+    }
+
     pub fn dirty_titles(&self) -> Vec<String> {
         self.tabs
             .iter()
@@ -443,6 +469,27 @@ mod tests {
         );
         assert_eq!(tabs.len(), 1);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn directory_moves_remap_open_descendants_without_losing_dirty_state() {
+        let root = temp_dir("remap");
+        let source = root.join("old");
+        let destination = root.join("new");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        let file = source.join("nested/file.txt");
+        std::fs::write(&file, "value").unwrap();
+        let mut tabs = Tabs::new(Some(&file)).unwrap();
+        tabs.insert_char('!');
+        assert!(tabs.dirty);
+
+        tabs.remap_paths(&source, &destination);
+        assert_eq!(
+            tabs.path.as_deref(),
+            Some(destination.join("nested/file.txt").as_path())
+        );
+        assert!(tabs.dirty);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// On case-sensitive filesystems (Linux), differently-cased names are

@@ -248,6 +248,7 @@ descriptions as well as names — typing `quit` finds `:q`.
 | `:e! path` | Open and discard unsaved changes |
 | `:cd path` | Change project root |
 | `:tree` | Toggle project tree |
+| `:manager` / `:fm` | Open the responsive full file manager |
 | `:refresh` | Refresh project tree |
 | `:pwd` | Display project root |
 | `:back` / `:forward` | Navigate location history |
@@ -266,6 +267,11 @@ descriptions as well as names — typing `quit` finds `:q`.
 | `:set number` / `:set nonumber` | Toggle line numbers |
 | `:set tabstop=4` | Change tab width |
 | `:set hidden` / `:set nohidden` | Show or hide dotfiles |
+| `:set icons=unicode\|ascii\|nerd` | Select portable or Nerd Font filesystem icons |
+| `:set directoriesfirst` / `:set nodirectoriesfirst` | Control filesystem sorting |
+| `:set managerpreview` / `:set nomanagerpreview` | Enable or disable safe previews |
+| `:set managerpanes=23,42` | Set wide parent/current manager pane percentages |
+| `:set previewmaxbytes=262144` | Limit bytes read for a preview |
 | `:set maxsearchresults=500` | Set the project-search result cap |
 | `:set startup=folder` | Set the launch view: `session`, `folder`, `empty`, or `dashboard` |
 | `:welcome` | Open the recent-project dashboard |
@@ -286,6 +292,37 @@ descriptions as well as names — typing `quit` finds `:q`.
   its current value, default, description, validation rules, and whether it
   applies immediately or on the next launch. Use `:set`, `:theme`, or `:bind`
   to change values.
+
+## Full file manager
+
+Run `:manager` (or `:fm`) for a dedicated filesystem workspace. Wide
+terminals show parent, current, and preview panes; medium terminals hide the
+parent pane; narrow terminals keep a single usable file list. Directory scans,
+previews, copy/move work, and change detection run outside the input/render
+path, and stale background results are rejected.
+
+| Key | Action |
+|---|---|
+| `Up/Down`, `h/j/k/l`, `Enter`, `Backspace` | Navigate and open |
+| `Ctrl-Enter` | Open the selected file in a vertical split |
+| `[` / `]` | Directory history back / forward |
+| `Space`, `Shift-Space`, `a`, `i`, `Esc` | Toggle, range, all, invert, or clear selection |
+| `/`, `.`, `s`, `r` | Filter, hidden files, sort, refresh |
+| `F2`, `n`, `N`, `g` | Rename, new file, new folder, or go to path |
+| `c`, `x`, `p` | Copy, cut, and paste; conflicts open an apply-to-all policy dialog |
+| `P`, `o`, `S` | Paste by rename, overwrite, or skip conflict policy |
+| `d` | Duplicate with an automatically conflict-free name |
+| `Delete` / `D` | Move to OS trash / explicitly confirm permanent deletion |
+| `t` | Open an integrated terminal at the selected directory |
+| `Ctrl-C` | Cancel an active multi-item operation safely |
+| `R` | Retry only the failed items from the last operation |
+| Right click | Open the selected item's file-action menu |
+
+Trash uses the Windows Recycle Bin, macOS Trash, or the freedesktop Trash
+layout. Dirty open buffers block destructive operations. Successful moves and
+renames update open-tab paths, recent files, navigation history, recovery and
+session inputs, Git refresh state, and the active LSP document. Previews have a
+hard 1.5-second UI timeout in addition to byte and line limits.
 
 ## Coding intelligence
 

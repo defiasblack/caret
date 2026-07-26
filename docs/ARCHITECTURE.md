@@ -27,12 +27,22 @@ responsibilities live behind focused boundaries:
   Git-status snapshots, refresh throttling, and application of completed work on
   the UI thread. `src/project.rs` remains the synchronous in-memory tree model
   and only requests background refreshes; it never launches Git itself.
+- `src/file_manager.rs` owns cached parent/current directory snapshots,
+  responsive manager state, selection and history, background scans and safe
+  previews with a hard response timeout, generation-based stale-result
+  rejection, targeted polling-watcher invalidation, failed-item retry, and
+  background operation coordination.
+- `src/file_ops.rs` is the filesystem-command boundary for recursive
+  copy/move/duplicate, conflict policy, cancellation, OS trash, permanent
+  deletion, cross-device fallback, partial-failure reporting, and
+  copy-into-descendant rejection.
 - `src/app/persistence.rs` owns application save/quit policy, while
   `src/app/settings.rs` owns settings inspection and validated `:set` changes.
-- `src/file_ops.rs` is the no-replace safety boundary for the current
-  synchronous project-tree mutations. The non-blocking 0.7 operation service
-  will replace it without weakening those invariants.
-- `src/ui.rs` renders state and does not perform persistence itself.
+- `src/file_ops.rs` preserves the no-replace boundary for synchronous project
+  tree mutations while also providing the non-blocking manager operation
+  service.
+- `src/ui.rs` renders state and does not perform persistence itself. The manager
+  uses one calculated responsive pane layout for drawing and mouse hit testing.
 
 The application object remains the coordinator for user events and background
 work. New data-loss-sensitive behavior must be added to the focused lower

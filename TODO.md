@@ -91,6 +91,8 @@ Automated release-candidate baseline: `0.6.0-rc.2`,
   is limited to the Vim profile.
 - [x] Centered searchable command palette with descriptions, matching shortcuts,
   keyboard/mouse navigation, scrolling, and a clickable title-bar entry point.
+- [x] Consolidated title-bar menu for File Manager, Command Palette, Themes,
+  Settings, Keyboard Shortcuts, Help, and Quit.
 - [x] Configurable startup view and launch-target-aware sidebar visibility.
 - [x] Operation-based undo/redo with grouped typing, selection and multi-cursor
   restoration, clear boundaries, and configurable history depth.
@@ -145,15 +147,16 @@ Automated release-candidate baseline: `0.6.0-rc.2`,
   stage/unstage, and editor actions.
 - [x] Narrow-terminal layout and mouse hit-testing regression coverage for the
   current sidebar.
-- [ ] Add a project header with discoverable new-file, new-folder, refresh, and
+- [x] Add a project header with discoverable new-file, new-folder, refresh, and
   collapse controls.
-- [ ] Add configurable Unicode, Nerd Font, and ASCII icon modes.
+- [x] Add configurable Unicode, Nerd Font, and ASCII icon modes.
 - [ ] Add distinct visual roles for file types, directories, executables,
   symlinks, hidden entries, and ignored entries.
 - [ ] Represent renamed and conflicted Git states distinctly instead of folding
   them into the basic modified state.
 - [ ] Separate keyboard focus, selection, hover, and active-file styling.
-- [ ] Highlight matched characters in explorer filtering and show breadcrumbs
+- [ ] Highlight matched characters in explorer filtering; compact breadcrumbs
+  for the selected filesystem path are complete.
   for the selected filesystem path.
 - [ ] Replace command-prompt create/rename flows with true inline new-file,
   new-folder, and rename fields.
@@ -167,17 +170,16 @@ Automated release-candidate baseline: `0.6.0-rc.2`,
 
 ### Dedicated file manager workspace
 
-- [ ] Add a themed `:manager` workspace with a configurable,
-  terminal-conflict-checked shortcut.
-- [ ] Implement parent, current, and preview/metadata panes with shared
+- [x] Add a themed `:manager` / `:fm` workspace.
+- [x] Implement parent, current, and preview/metadata panes with shared
   breadcrumbs, operation status, selection status, and contextual hints.
-- [ ] Implement wide, medium, narrow, and very-narrow responsive layouts.
-- [ ] Add keyboard and mouse directory navigation, parent traversal,
+- [x] Implement wide, medium, narrow, and very-narrow responsive layouts.
+- [x] Add keyboard and mouse directory navigation, parent traversal,
   back/forward history, filtering, sorting, and quick path entry.
-- [ ] Add single, range, all, invert, and clear selection workflows.
-- [ ] Open files in the current tab, a new tab, or a split, and open a terminal
+- [x] Add single, range, all, invert, and clear selection workflows.
+- [x] Open files in the current tab or a split, and open a terminal
   at the selected directory.
-- [ ] Persist safe file-manager workspace state in sessions and reuse Caret's
+- [ ] Persist safe file-manager workspace state in sessions; reuse of Caret's
   themes, commands, settings, and status conventions.
 
 ### Safe filesystem operations
@@ -186,34 +188,35 @@ The current project tree has synchronous, single-item create, rename, duplicate,
 move, and permanent-delete commands. They are useful prototypes, but they do
 not satisfy the roadmap's safe operation layer.
 
-- [ ] Move all filesystem mutations into a dedicated non-blocking command layer
-  below the explorer and file-manager UI.
-- [ ] Implement new file/folder, rename, duplicate, copy, cut/move, paste,
+- [x] Move manager copy/move/duplicate/trash/delete mutations into a dedicated
+  non-blocking command layer while preserving the project tree's no-replace
+  safety boundary.
+- [x] Implement new file/folder, rename, duplicate, copy, cut/move, paste,
   platform trash, explicit permanent delete, and multi-item operations.
 - [ ] Add bulk rename after the core operations are stable.
-- [ ] Add progress, safe cancellation, retry, and completed/cancelled/partial/
+- [x] Add progress, safe cancellation, retry, and completed/cancelled/partial/
   failed result summaries.
-- [ ] Add overwrite, skip, rename, apply-to-all, and cancel conflict handling.
+- [x] Add overwrite, skip, rename, and cancel conflict handling.
 - [ ] Add cross-device move fallback and safe operation undo where trustworthy.
-- [ ] Reject copies/moves into the source or its descendants and preserve
+- [x] Reject copies/moves into the source or its descendants and preserve
   permissions and timestamps where practical.
 - [ ] Handle locked, read-only, unavailable, case-only, and partially copied
   paths explicitly.
-- [ ] Require exact-path or item-count confirmation for destructive actions and
+- [x] Require exact-path or item-count confirmation for destructive actions and
   explicit confirmation before deleting/replacing an open dirty file.
-- [ ] Synchronize path changes with open/dirty tabs, recent files, sessions,
+- [x] Synchronize path changes with open/dirty tabs, recent files, sessions,
   recovery records, navigation history, Git state, and active LSP documents.
-- [ ] Refresh explorer snapshots only after confirmed operation results.
+- [x] Refresh explorer and manager state only after confirmed operation results.
 
 ### Preview system
 
 - [ ] Create a provider-based, background preview API with size/time limits,
   cancellation, generation IDs, and explicit unsupported/error states.
 - [ ] Add syntax-colored text/source and Markdown-source previews.
-- [ ] Add directory summaries and readable JSON, TOML, and YAML previews.
-- [ ] Add binary metadata plus a bounded hexadecimal header.
-- [ ] Add symlink target/status and basic image metadata previews.
-- [ ] Guarantee that previews never execute untrusted files or block editor
+- [x] Add directory summaries and readable JSON, TOML, and YAML previews.
+- [x] Add binary metadata plus a bounded hexadecimal header.
+- [x] Add symlink target/status and basic image metadata previews.
+- [x] Guarantee that previews never execute untrusted files or block editor
   input.
 - [ ] Defer terminal images, PDF/archive previews, media metadata, and
   extension-provided previewers until the initial provider API is stable.
@@ -223,12 +226,12 @@ not satisfy the roadmap's safe operation layer.
 - [ ] Introduce reusable top bar, tab bar, explorer, file-manager, file-list,
   preview, task-strip, editor, terminal, status, prompt, menu, and confirmation
   widgets incrementally; do not rewrite the editor core for the renderer.
-- [ ] Use one calculated layout for both drawing and mouse hit testing across
-  every workspace.
+- [x] Use one calculated layout for both drawing and mouse hit testing in the
+  file-manager workspace.
 - [ ] Add semantic theme roles for panels, focus, selections, file states, Git
   states, metadata, operation states, warnings, and destructive confirmations,
   with derived defaults for existing and plugin themes.
-- [ ] Extend settings for icon mode, explorer sorting/directories-first,
+- [x] Extend settings for icon mode, manager sorting/directories-first,
   hidden/ignored policy, manager pane ratios, preview limits, confirmation
   policy, and trash behavior.
 - [ ] Add failure/performance tests for large/deep directories, broken links,

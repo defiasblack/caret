@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 use crate::{
     config::{self, KeymapProfile, Settings, StartupView},
     editor::{Cursor, EditorOptions, ReplaceOutcome},
+    file_manager::{ActivateResult, FileManager},
+    file_ops::ConflictPolicy,
     keys::{Action as KeyAction, KeyBindings},
     lsp::{self, LspClient},
     plugin::{PluginContext, PluginRegistry, PluginResponse},
@@ -54,12 +56,13 @@ pub enum Mode {
     KeymapGallery,
     ContextMenu,
     Dashboard,
+    FileManager,
 }
 
 /// Rows the command palette shows at once.  The drawing code and
 /// `ensure_command_suggestion_visible` must agree or the selected row scrolls
 /// out of the window it is being kept inside.
-pub const COMMAND_PALETTE_ROWS: usize = 8;
+pub const COMMAND_PALETTE_ROWS: usize = 12;
 
 /// One row in the command palette.
 #[derive(Debug, Clone)]
@@ -73,9 +76,7 @@ pub struct CommandEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoverTarget {
     Files,
-    Themes,
-    Help,
-    Quit,
+    Menu,
     Command,
 }
 
@@ -112,6 +113,7 @@ impl Mode {
             Self::KeymapGallery => "KEYMAPS",
             Self::ContextMenu => "MENU",
             Self::Dashboard => "WELCOME",
+            Self::FileManager => "MANAGER",
         }
     }
 }
@@ -197,6 +199,13 @@ pub struct LspPanel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextAction {
+    FileManager,
+    CommandPalette,
+    Themes,
+    Settings,
+    KeyBindings,
+    Help,
+    Quit,
     Open,
     Rename,
     Duplicate,
@@ -217,6 +226,13 @@ pub enum ContextAction {
 impl ContextAction {
     pub fn label(self) -> &'static str {
         match self {
+            Self::FileManager => "File Manager",
+            Self::CommandPalette => "Command Palette",
+            Self::Themes => "Themes",
+            Self::Settings => "Settings",
+            Self::KeyBindings => "Keyboard Shortcuts",
+            Self::Help => "Help",
+            Self::Quit => "Quit Caret",
             Self::Open => "Open",
             Self::Rename => "Rename…",
             Self::Duplicate => "Duplicate…",
@@ -237,6 +253,13 @@ impl ContextAction {
 
     pub fn hint(self) -> &'static str {
         match self {
+            Self::FileManager => ":manager",
+            Self::CommandPalette => "Ctrl-Shift-P",
+            Self::Themes => ":themes",
+            Self::Settings => ":settings",
+            Self::KeyBindings => ":keybindings",
+            Self::Help => "F1",
+            Self::Quit => "Ctrl-Q",
             Self::Rename => "F2",
             Self::SaveTab => "Ctrl-S",
             Self::CloseTab => "Ctrl-W",
@@ -329,6 +352,15 @@ pub struct App {
     search_history_index: Option<usize>,
     pub project_search: ProjectSearchState,
     pub file_picker: FilePickerState,
+    pub file_manager: FileManager,
+    manager_return_mode: Mode,
+    manager_filter_active: bool,
+    pub manager_confirmation: Option<ManagerConfirmation>,
+    pub manager_conflicts: usize,
+    pub manager_input_kind: Option<ManagerInputKind>,
+    pub manager_input: String,
+    pub manager_context_menu: Option<(u16, u16)>,
+    handled_manager_operation: u64,
     tree_filter_active: bool,
     keys: KeyBindings,
     pub key_browser_input: String,
@@ -402,6 +434,20 @@ pub struct App {
     last_recovery_checkpoint: Instant,
     last_session_checkpoint: Instant,
     last_session_state: Option<crate::session::SessionState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerConfirmation {
+    Trash,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerInputKind {
+    Rename,
+    NewFile,
+    NewDirectory,
+    GoTo,
 }
 
 impl App {
@@ -498,6 +544,13 @@ impl App {
         project.width = settings.tree_width.clamp(22, 80);
         project.show_hidden = settings.show_hidden_files;
         let _ = project.refresh();
+        let mut file_manager = FileManager::new(project.root.clone())?;
+        file_manager.configure(
+            settings.show_hidden_files,
+            settings.directories_first,
+            settings.manager_preview,
+            settings.preview_max_bytes,
+        );
         let show_dashboard = path.is_none() && settings.startup == StartupView::Dashboard;
         let mode = if show_dashboard {
             Mode::Dashboard
@@ -554,6 +607,15 @@ impl App {
             search_history_index: None,
             project_search: ProjectSearchState::default(),
             file_picker: FilePickerState::default(),
+            file_manager,
+            manager_return_mode: mode,
+            manager_filter_active: false,
+            manager_confirmation: None,
+            manager_conflicts: 0,
+            manager_input_kind: None,
+            manager_input: String::new(),
+            manager_context_menu: None,
+            handled_manager_operation: 0,
             tree_filter_active: false,
             keys,
             key_browser_input: String::new(),
@@ -915,7 +977,14 @@ impl App {
 
     pub fn poll_background(&mut self) -> bool {
         let message = self.message.clone();
-        let mut changed = false;
+        let mut changed = self.file_manager.poll();
+        if let Some(summary) = self.file_manager.last_operation.clone() {
+            if summary.id != self.handled_manager_operation {
+                self.handled_manager_operation = summary.id;
+                self.finish_manager_operation(&summary);
+                changed = true;
+            }
+        }
         if let Some(terminal) = self.terminal.as_mut() {
             changed |= terminal.poll();
         }
@@ -964,6 +1033,59 @@ impl App {
         };
 
         if width < 44 || height < 8 {
+            return;
+        }
+
+        if mouse.row == 0 && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.handle_title_bar_click(mouse.column, width);
+            return;
+        }
+
+        if self.mode == Mode::FileManager {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.file_manager.move_selection(-3),
+                MouseEventKind::ScrollDown => self.file_manager.move_selection(3),
+                MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
+                | MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(index) = crate::ui::file_manager_entry_at(
+                        self,
+                        width,
+                        height,
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
+                            self.file_manager.select_index(index);
+                            self.file_manager.select_range();
+                            self.message = format!(
+                                "Selected {} item(s)",
+                                self.file_manager.selected_paths.len()
+                            );
+                            return;
+                        }
+                        self.file_manager.begin_mouse_range(index);
+                        if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
+                            self.manager_context_menu = Some((mouse.column, mouse.row));
+                            self.message = "File actions · choose a shortcut or Esc".to_string();
+                        } else if let Some(path) =
+                            self.file_manager.selected_path().map(Path::to_path_buf)
+                        {
+                            let double_click =
+                                self.last_project_click
+                                    .as_ref()
+                                    .is_some_and(|(when, previous)| {
+                                        *previous == path
+                                            && when.elapsed() <= Duration::from_millis(500)
+                                    });
+                            self.last_project_click = Some((Instant::now(), path));
+                            if double_click {
+                                self.activate_manager_entry();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -1285,6 +1407,13 @@ impl App {
         self.context_menu = None;
         self.mode = return_mode;
         match action {
+            ContextAction::FileManager => self.open_file_manager(),
+            ContextAction::CommandPalette => self.open_command_palette(),
+            ContextAction::Themes => self.open_theme_gallery(),
+            ContextAction::Settings => self.open_settings_browser(),
+            ContextAction::KeyBindings => self.open_key_browser(),
+            ContextAction::Help => self.open_help(),
+            ContextAction::Quit => self.request_quit(false),
             ContextAction::Open => self.activate_project_entry(),
             ContextAction::Rename => self.begin_rename_selected(),
             ContextAction::Duplicate => {
@@ -1371,29 +1500,6 @@ impl App {
             return;
         }
 
-        // Title-bar controls are always available, including while typing.
-        if row == 0 {
-            let target = crate::ui::title_bar_target_at(self, width, column);
-            match target {
-                Some(HoverTarget::Files) => self.toggle_file_tree(),
-                Some(HoverTarget::Themes) => {
-                    self.explorer_focused = false;
-                    self.open_theme_gallery();
-                }
-                Some(HoverTarget::Command) => {
-                    self.explorer_focused = false;
-                    self.open_command_palette();
-                }
-                Some(HoverTarget::Help) => {
-                    self.explorer_focused = false;
-                    self.open_help();
-                }
-                Some(HoverTarget::Quit) => self.request_quit(false),
-                None => {}
-            }
-            return;
-        }
-
         // Tabs occupy the second terminal row.
         if row == 1 {
             if let Some(index) = crate::ui::tab_index_at(self, width, column) {
@@ -1431,7 +1537,26 @@ impl App {
                 return;
             }
             if screen_row == 0 {
-                self.message = format!("Project: {}", self.project.root.display());
+                match crate::ui::explorer_header_action_at(layout.sidebar_width, column as usize) {
+                    Some('+') => self.begin_context_command("newfile ", "Enter the new file path"),
+                    Some('D') => self.begin_context_command("newdir ", "Enter the new folder path"),
+                    Some('R') => {
+                        self.message = match self.project.refresh() {
+                            Ok(()) => {
+                                self.project.request_git_refresh();
+                                "File tree refreshed".to_string()
+                            }
+                            Err(error) => format!("Refresh failed: {error}"),
+                        }
+                    }
+                    Some('-') => {
+                        self.message = match self.project.collapse_all() {
+                            Ok(count) => format!("Collapsed {count} folder(s)"),
+                            Err(error) => format!("Collapse failed: {error}"),
+                        }
+                    }
+                    _ => self.message = format!("Project: {}", self.project.root.display()),
+                }
                 return;
             }
 
@@ -1526,6 +1651,38 @@ impl App {
             self.editor.cursor.line + 1,
             self.editor.cursor.column + 1
         );
+    }
+
+    fn handle_title_bar_click(&mut self, column: u16, width: u16) {
+        match crate::ui::title_bar_target_at(self, width, column) {
+            Some(HoverTarget::Files) => self.toggle_file_tree(),
+            Some(HoverTarget::Menu) => {
+                self.explorer_focused = false;
+                self.context_menu_previous_mode = if self.mode == Mode::ContextMenu {
+                    self.context_menu_previous_mode
+                } else {
+                    self.mode
+                };
+                self.context_menu = Some(ContextMenu {
+                    x: width.saturating_sub(29),
+                    y: 1,
+                    selected: 0,
+                    actions: vec![
+                        ContextAction::FileManager,
+                        ContextAction::CommandPalette,
+                        ContextAction::Themes,
+                        ContextAction::Settings,
+                        ContextAction::KeyBindings,
+                        ContextAction::Help,
+                        ContextAction::Quit,
+                    ],
+                });
+                self.mode = Mode::ContextMenu;
+                self.message = "Menu · ↑↓ select · Enter open · Esc close".to_string();
+            }
+            Some(HoverTarget::Command) => self.open_command_palette(),
+            None => {}
+        }
     }
 
     fn handle_editor_drag(&mut self, column: u16, row: u16, width: u16, height: u16) {
@@ -1762,6 +1919,17 @@ impl App {
 
     pub fn reduced_motion(&self) -> bool {
         self.settings.reduced_motion || std::env::var_os("CARET_REDUCED_MOTION").is_some()
+    }
+
+    pub fn icon_mode(&self) -> crate::config::IconMode {
+        self.settings.icon_mode
+    }
+
+    pub fn manager_pane_ratios(&self) -> (u8, u8) {
+        (
+            self.settings.manager_parent_percent,
+            self.settings.manager_current_percent,
+        )
     }
 
     fn open_help(&mut self) {
@@ -2086,6 +2254,10 @@ impl App {
             self.handle_file_picker(key);
             return;
         }
+        if self.mode == Mode::FileManager {
+            self.handle_file_manager(key);
+            return;
+        }
         if self.mode == Mode::SettingsBrowser {
             self.handle_settings_browser(key);
             return;
@@ -2186,7 +2358,8 @@ impl App {
             | Mode::ThemeGallery
             | Mode::KeymapGallery
             | Mode::ContextMenu
-            | Mode::Dashboard => {}
+            | Mode::Dashboard
+            | Mode::FileManager => {}
         }
     }
 
@@ -2797,18 +2970,33 @@ impl App {
             self.message = "Select a file or folder first".to_string();
             return;
         };
-        let Some(destination) = source
-            .parent()
-            .and_then(|parent| (!value.is_empty()).then(|| parent.join(value)))
-        else {
+        if value.is_empty()
+            || Path::new(value).file_name().and_then(|name| name.to_str()) != Some(value)
+        {
             self.message = "Usage: :rename new-name".to_string();
             return;
+        }
+        let Some(parent) = source.parent() else {
+            self.message = "Cannot rename a filesystem root".to_string();
+            return;
         };
+        let destination = parent.join(value);
+        let same_entry = destination.exists()
+            && source
+                .canonicalize()
+                .ok()
+                .zip(destination.canonicalize().ok())
+                .is_some_and(|(source, destination)| source == destination);
+        if destination.exists() && !same_entry {
+            self.message = format!("Rename failed: {} already exists", destination.display());
+            return;
+        }
         if self.block_operation_for_dirty_path(&source, "rename") {
             return;
         }
         match crate::file_ops::rename_without_replace(&source, &destination) {
             Ok(()) => {
+                self.synchronize_path_change(&source, &destination);
                 let _ = self.project.refresh();
                 self.project.request_git_refresh();
                 self.message = format!("Renamed to {}", destination.display());
@@ -2897,6 +3085,7 @@ impl App {
         }
         match crate::file_ops::rename_without_replace(&source, &destination) {
             Ok(()) => {
+                self.synchronize_path_change(&source, &destination);
                 let _ = self.project.refresh();
                 self.project.request_git_refresh();
                 self.message = format!("Moved to {}", destination.display());
@@ -2910,6 +3099,13 @@ impl App {
             self.message = "Select a file or folder first".to_string();
             return;
         };
+        if self
+            .editor
+            .any_dirty_path_under(std::slice::from_ref(&path))
+        {
+            self.message = "Save or close dirty files before deleting them".to_string();
+            return;
+        }
         if !force {
             self.message = format!("Delete {} permanently? :delete! confirms", path.display());
             return;
@@ -3353,6 +3549,614 @@ impl App {
                 self.mode = Mode::TabCloseConfirm;
             }
         }
+    }
+
+    fn open_file_manager(&mut self) {
+        self.manager_return_mode = if matches!(self.mode, Mode::FileManager) {
+            self.preferred_editor_mode()
+        } else {
+            self.mode
+        };
+        self.manager_filter_active = false;
+        self.manager_confirmation = None;
+        self.manager_conflicts = 0;
+        self.manager_input_kind = None;
+        self.manager_input.clear();
+        self.manager_context_menu = None;
+        if !self
+            .file_manager
+            .current_dir
+            .starts_with(&self.project.root)
+        {
+            let _ = self.file_manager.go_to(self.project.root.clone());
+        }
+        self.file_manager.configure(
+            self.settings.show_hidden_files,
+            self.settings.directories_first,
+            self.settings.manager_preview,
+            self.settings.preview_max_bytes,
+        );
+        self.mode = Mode::FileManager;
+        self.explorer_focused = false;
+        self.message =
+            "File manager · Space selects · c/x/p transfer · Delete trashes · Esc closes"
+                .to_string();
+    }
+
+    fn close_file_manager(&mut self) {
+        self.manager_filter_active = false;
+        self.manager_confirmation = None;
+        self.manager_conflicts = 0;
+        self.manager_input_kind = None;
+        self.manager_input.clear();
+        self.manager_context_menu = None;
+        self.mode = if matches!(self.manager_return_mode, Mode::FileManager) {
+            self.preferred_editor_mode()
+        } else {
+            self.manager_return_mode
+        };
+        self.message.clear();
+    }
+
+    fn handle_file_manager(&mut self, key: KeyEvent) {
+        if self.manager_context_menu.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.manager_context_menu = None;
+                    self.message.clear();
+                }
+                KeyCode::Enter
+                | KeyCode::Char('c' | 'x' | 'p' | 'd')
+                | KeyCode::F(2)
+                | KeyCode::Delete => {
+                    self.manager_context_menu = None;
+                    self.handle_file_manager(key);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.manager_conflicts > 0 {
+            let policy = match key.code {
+                KeyCode::Char('o' | 'O') => Some(ConflictPolicy::Overwrite),
+                KeyCode::Char('s' | 'S') => Some(ConflictPolicy::Skip),
+                KeyCode::Char('r' | 'R') => Some(ConflictPolicy::Rename),
+                KeyCode::Esc | KeyCode::Char('c' | 'C') => {
+                    self.manager_conflicts = 0;
+                    self.message = "Paste cancelled".to_string();
+                    return;
+                }
+                _ => None,
+            };
+            if let Some(policy) = policy {
+                self.manager_conflicts = 0;
+                self.message = if self.file_manager.paste(policy) {
+                    "Resolving all conflicts with the selected policy…".to_string()
+                } else {
+                    "Paste could not start".to_string()
+                };
+            }
+            return;
+        }
+        if let Some(kind) = self.manager_input_kind {
+            match key.code {
+                KeyCode::Esc => {
+                    self.manager_input_kind = None;
+                    self.manager_input.clear();
+                    self.message = "File-manager input cancelled".to_string();
+                }
+                KeyCode::Enter => self.apply_manager_input(kind),
+                KeyCode::Backspace => {
+                    self.manager_input.pop();
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.manager_input.push(character);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if let Some(confirmation) = self.manager_confirmation {
+            match key.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                    self.manager_confirmation = None;
+                    let started = match confirmation {
+                        ManagerConfirmation::Trash => self.file_manager.trash(),
+                        ManagerConfirmation::Delete => self.file_manager.delete_permanently(),
+                    };
+                    self.message = if started {
+                        match confirmation {
+                            ManagerConfirmation::Trash => "Moving selected items to trash…",
+                            ManagerConfirmation::Delete => "Permanently deleting selected items…",
+                        }
+                        .to_string()
+                    } else {
+                        "No filesystem operation started".to_string()
+                    };
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                    self.manager_confirmation = None;
+                    self.message = "Delete cancelled".to_string();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.manager_filter_active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.manager_filter_active = false;
+                    self.file_manager.clear_filter();
+                    self.message = "Manager filter cleared".to_string();
+                }
+                KeyCode::Enter => {
+                    self.manager_filter_active = false;
+                    self.activate_manager_entry();
+                }
+                KeyCode::Up => self.file_manager.move_selection(-1),
+                KeyCode::Down => self.file_manager.move_selection(1),
+                KeyCode::Backspace => {
+                    let mut filter = self.file_manager.filter.clone();
+                    filter.pop();
+                    self.file_manager.set_filter(filter);
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let mut filter = self.file_manager.filter.clone();
+                    filter.push(character);
+                    self.file_manager.set_filter(filter);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Enter => self.open_manager_entry_in_split(),
+                KeyCode::Char('c') if self.file_manager.progress.is_some() => {
+                    self.message = if self.file_manager.cancel() {
+                        "Cancelling after the current filesystem step…".to_string()
+                    } else {
+                        "No cancellable operation".to_string()
+                    };
+                }
+                KeyCode::Char('a') => {
+                    self.file_manager.select_all();
+                    self.message = format!(
+                        "Selected {} item(s)",
+                        self.file_manager.selected_paths.len()
+                    );
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc if !self.file_manager.selected_paths.is_empty() => {
+                self.file_manager.clear_selection();
+                self.message = "Selection cleared".to_string();
+            }
+            KeyCode::Esc => self.close_file_manager(),
+            KeyCode::Up | KeyCode::Char('k') => self.file_manager.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.file_manager.move_selection(1),
+            KeyCode::PageUp => self
+                .file_manager
+                .page(-(self.viewport_rows.saturating_sub(4) as isize)),
+            KeyCode::PageDown => self
+                .file_manager
+                .page(self.viewport_rows.saturating_sub(4) as isize),
+            KeyCode::Home => {
+                let amount = self.file_manager.selected as isize;
+                self.file_manager.move_selection(-amount);
+            }
+            KeyCode::End => {
+                let amount = self.file_manager.visible_entries().len() as isize;
+                self.file_manager.move_selection(amount);
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.activate_manager_entry(),
+            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
+                match self.file_manager.parent() {
+                    Ok(()) => self.message = self.file_manager.current_dir.display().to_string(),
+                    Err(error) => self.message = format!("Cannot open parent: {error}"),
+                }
+            }
+            KeyCode::Char('[') => {
+                if let Err(error) = self.file_manager.back() {
+                    self.message = format!("Back failed: {error}");
+                }
+            }
+            KeyCode::Char(']') => {
+                if let Err(error) = self.file_manager.forward() {
+                    self.message = format!("Forward failed: {error}");
+                }
+            }
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.file_manager.select_range();
+                self.message = format!(
+                    "Selected {} item(s)",
+                    self.file_manager.selected_paths.len()
+                );
+            }
+            KeyCode::Char(' ') => {
+                self.file_manager.toggle_selection();
+                self.message = format!(
+                    "Selected {} item(s)",
+                    self.file_manager.selected_paths.len()
+                );
+            }
+            KeyCode::Char('a') => {
+                self.file_manager.select_all();
+                self.message = format!(
+                    "Selected {} item(s)",
+                    self.file_manager.selected_paths.len()
+                );
+            }
+            KeyCode::Char('i') => {
+                self.file_manager.invert_selection();
+                self.message = format!(
+                    "Selected {} item(s)",
+                    self.file_manager.selected_paths.len()
+                );
+            }
+            KeyCode::Char('/') | KeyCode::Char('f') => {
+                self.manager_filter_active = true;
+                self.message = "Filter current directory · type to narrow · Esc clears".to_string();
+            }
+            KeyCode::Char('.') => {
+                self.file_manager.show_hidden = !self.file_manager.show_hidden;
+                self.file_manager.refresh();
+                self.message = if self.file_manager.show_hidden {
+                    "Hidden files shown for this manager session"
+                } else {
+                    "Hidden files hidden for this manager session"
+                }
+                .to_string();
+            }
+            KeyCode::Char('r') => {
+                self.file_manager.refresh();
+                self.message = "Refreshing directory in the background…".to_string();
+            }
+            KeyCode::Char('R') => {
+                self.message = if self.file_manager.retry_failures() {
+                    "Retrying failed filesystem items…".to_string()
+                } else {
+                    "No failed filesystem items to retry".to_string()
+                };
+            }
+            KeyCode::F(2) => self.begin_manager_input(ManagerInputKind::Rename),
+            KeyCode::Char('n') => self.begin_manager_input(ManagerInputKind::NewFile),
+            KeyCode::Char('N') => self.begin_manager_input(ManagerInputKind::NewDirectory),
+            KeyCode::Char('g') => self.begin_manager_input(ManagerInputKind::GoTo),
+            KeyCode::Char('t') => {
+                let directory = self
+                    .file_manager
+                    .selected_entry()
+                    .map(|entry| {
+                        if entry.is_dir {
+                            entry.path.clone()
+                        } else {
+                            entry
+                                .path
+                                .parent()
+                                .map(Path::to_path_buf)
+                                .unwrap_or_else(|| self.file_manager.current_dir.clone())
+                        }
+                    })
+                    .unwrap_or_else(|| self.file_manager.current_dir.clone());
+                match TerminalPane::start(&directory) {
+                    Ok(terminal) => {
+                        self.terminal = Some(terminal);
+                        self.mode = self.preferred_editor_mode();
+                        self.terminal_focused = true;
+                        self.message = format!("Terminal: {}", directory.display());
+                    }
+                    Err(error) => self.message = format!("Could not start terminal: {error}"),
+                }
+            }
+            KeyCode::Char('s') => {
+                self.file_manager.cycle_sort();
+                self.message = format!("Sorted by {}", self.file_manager.sort.name());
+            }
+            KeyCode::Char('c') => {
+                self.file_manager.copy_to_clipboard(false);
+                self.message = format!("Copied {} item(s)", self.file_manager.clipboard.len());
+            }
+            KeyCode::Char('x') => {
+                self.file_manager.copy_to_clipboard(true);
+                self.message = format!("Cut {} item(s)", self.file_manager.clipboard.len());
+            }
+            KeyCode::Char('p') => {
+                let conflicts = self.file_manager.clipboard_conflicts();
+                self.message = if conflicts > 0 {
+                    self.manager_conflicts = conflicts;
+                    format!("{conflicts} conflict(s) require a policy")
+                } else if self.file_manager.paste(ConflictPolicy::Ask) {
+                    "Pasting in the background…".to_string()
+                } else {
+                    "Nothing to paste or an operation is already running".to_string()
+                };
+            }
+            KeyCode::Char('P') => {
+                self.message = if self.file_manager.paste(ConflictPolicy::Rename) {
+                    "Pasting with automatic conflict renaming…".to_string()
+                } else {
+                    "Nothing to paste or an operation is already running".to_string()
+                };
+            }
+            KeyCode::Char('o') => {
+                self.message = if self.file_manager.paste(ConflictPolicy::Overwrite) {
+                    "Pasting and overwriting conflicts…".to_string()
+                } else {
+                    "Nothing to paste or an operation is already running".to_string()
+                };
+            }
+            KeyCode::Char('S') => {
+                self.message = if self.file_manager.paste(ConflictPolicy::Skip) {
+                    "Pasting and skipping conflicts…".to_string()
+                } else {
+                    "Nothing to paste or an operation is already running".to_string()
+                };
+            }
+            KeyCode::Char('d') => {
+                self.message = if self.file_manager.duplicate(ConflictPolicy::Rename) {
+                    "Duplicating in the background…".to_string()
+                } else {
+                    "Nothing selected or an operation is already running".to_string()
+                };
+            }
+            KeyCode::Delete => {
+                if self.manager_selection_has_dirty_buffer() {
+                    self.message =
+                        "Save or close dirty buffers before trashing their files".to_string();
+                } else if self.settings.confirm_trash {
+                    self.manager_confirmation = Some(ManagerConfirmation::Trash);
+                } else if self.file_manager.trash() {
+                    self.message = "Moving selected items to trash…".to_string();
+                }
+            }
+            KeyCode::Char('D') => {
+                if self.manager_selection_has_dirty_buffer() {
+                    self.message =
+                        "Save or close dirty buffers before permanently deleting their files"
+                            .to_string();
+                } else {
+                    self.manager_confirmation = Some(ManagerConfirmation::Delete);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn begin_manager_input(&mut self, kind: ManagerInputKind) {
+        self.manager_input_kind = Some(kind);
+        self.manager_input = match kind {
+            ManagerInputKind::Rename => self
+                .file_manager
+                .selected_entry()
+                .map(|entry| entry.name.clone())
+                .unwrap_or_default(),
+            ManagerInputKind::GoTo => self.file_manager.current_dir.display().to_string(),
+            ManagerInputKind::NewFile | ManagerInputKind::NewDirectory => String::new(),
+        };
+        self.message = match kind {
+            ManagerInputKind::Rename => "Rename selected item",
+            ManagerInputKind::NewFile => "Create file in current directory",
+            ManagerInputKind::NewDirectory => "Create directory in current directory",
+            ManagerInputKind::GoTo => "Go to directory",
+        }
+        .to_string();
+    }
+
+    fn apply_manager_input(&mut self, kind: ManagerInputKind) {
+        let value = self.manager_input.trim().to_string();
+        if value.is_empty() {
+            self.message = "A name or path is required".to_string();
+            return;
+        }
+        let result = match kind {
+            ManagerInputKind::Rename => {
+                let Some(source) = self.file_manager.selected_path().map(Path::to_path_buf) else {
+                    self.message = "Nothing selected".to_string();
+                    return;
+                };
+                if Path::new(&value).file_name().and_then(|name| name.to_str()) != Some(&value) {
+                    self.message = "Rename accepts a file name, not a path".to_string();
+                    return;
+                }
+                let destination = source
+                    .parent()
+                    .unwrap_or(&self.file_manager.current_dir)
+                    .join(&value);
+                let same_entry = destination.exists()
+                    && source
+                        .canonicalize()
+                        .ok()
+                        .zip(destination.canonicalize().ok())
+                        .is_some_and(|(source, destination)| source == destination);
+                if destination.exists() && !same_entry {
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} already exists", destination.display()),
+                    ))
+                } else {
+                    fs::rename(&source, &destination).map(|()| {
+                        self.synchronize_path_change(&source, &destination);
+                    })
+                }
+            }
+            ManagerInputKind::NewFile => {
+                let path = self.file_manager.current_dir.join(&value);
+                if path.exists() {
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} already exists", path.display()),
+                    ))
+                } else {
+                    path.parent()
+                        .map(fs::create_dir_all)
+                        .transpose()
+                        .and_then(|_| {
+                            fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(path)
+                        })
+                        .map(|_| ())
+                }
+            }
+            ManagerInputKind::NewDirectory => {
+                fs::create_dir(self.file_manager.current_dir.join(&value))
+            }
+            ManagerInputKind::GoTo => {
+                let path = if value == "~" {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| self.file_manager.current_dir.clone())
+                } else {
+                    let path = PathBuf::from(&value);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        self.file_manager.current_dir.join(path)
+                    }
+                };
+                self.file_manager.go_to(path)
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.manager_input_kind = None;
+                self.manager_input.clear();
+                self.file_manager.refresh();
+                let _ = self.project.refresh();
+                self.project.request_git_refresh();
+                self.message = "Filesystem change complete".to_string();
+            }
+            Err(error) => self.message = format!("Filesystem change failed: {error}"),
+        }
+    }
+
+    fn activate_manager_entry(&mut self) {
+        match self.file_manager.activate() {
+            ActivateResult::OpenFile(path) => {
+                let before = self.current_location();
+                match self.editor.open_or_switch(&path) {
+                    Ok(disposition) => {
+                        self.commit_navigation(before);
+                        self.remember_recent_file();
+                        self.mode = self.preferred_editor_mode();
+                        self.message = match disposition {
+                            OpenDisposition::Opened => format!("Opened {}", path.display()),
+                            OpenDisposition::Switched => format!("Switched to {}", path.display()),
+                        };
+                        self.refresh_git_line_changes();
+                    }
+                    Err(error) => self.message = format!("Open failed: {error}"),
+                }
+            }
+            ActivateResult::EnteredDirectory(path) => {
+                self.message = path.display().to_string();
+            }
+            ActivateResult::None => {}
+        }
+    }
+
+    fn open_manager_entry_in_split(&mut self) {
+        let Some(entry) = self.file_manager.selected_entry().cloned() else {
+            return;
+        };
+        if entry.is_dir {
+            self.message = "Ctrl-Enter opens files in a vertical split".to_string();
+            return;
+        }
+        let primary = EditorView {
+            tab_index: self.editor.active_index(),
+            cursor: self.editor.cursor,
+            scroll_line: self.editor.scroll_line,
+            scroll_column: self.editor.scroll_column,
+        };
+        let before = self.current_location();
+        match self.editor.open_or_switch(&entry.path) {
+            Ok(_) => {
+                self.commit_navigation(before);
+                self.remember_recent_file();
+                let secondary = EditorView {
+                    tab_index: self.editor.active_index(),
+                    cursor: self.editor.cursor,
+                    scroll_line: self.editor.scroll_line,
+                    scroll_column: self.editor.scroll_column,
+                };
+                self.split_views = Some(SplitViews {
+                    primary,
+                    secondary,
+                    secondary_active: true,
+                    vertical: true,
+                });
+                self.mode = self.preferred_editor_mode();
+                self.message = format!("Opened {} in vertical split", entry.path.display());
+                self.refresh_git_line_changes();
+            }
+            Err(error) => self.message = format!("Open failed: {error}"),
+        }
+    }
+
+    fn manager_selection_has_dirty_buffer(&self) -> bool {
+        let paths = self.file_manager.selected_or_cursor_paths();
+        self.editor.any_dirty_path_under(&paths)
+    }
+
+    fn finish_manager_operation(&mut self, summary: &crate::file_ops::OperationSummary) {
+        for (source, destination) in &summary.path_changes {
+            self.synchronize_path_change(source, destination);
+        }
+        if summary.kind == crate::file_ops::OperationKind::Move
+            && !summary.cancelled
+            && summary.failures.is_empty()
+        {
+            self.file_manager.clipboard.clear();
+            self.file_manager.clipboard_cut = false;
+        }
+        let failed = summary.failures.len();
+        let status = if summary.cancelled {
+            "cancelled"
+        } else if failed > 0 {
+            "finished with errors"
+        } else {
+            "complete"
+        };
+        self.message = format!(
+            "Filesystem operation {status}: {} complete, {} skipped, {failed} failed",
+            summary.completed, summary.skipped
+        );
+        self.file_manager.clear_selection();
+        let _ = self.project.refresh();
+        self.project.request_git_refresh();
+    }
+
+    fn synchronize_path_change(&mut self, source: &Path, destination: &Path) {
+        self.editor.remap_paths(source, destination);
+        remap_path_list(&mut self.settings.recent_files, source, destination);
+        for location in self
+            .back_history
+            .iter_mut()
+            .chain(self.forward_history.iter_mut())
+        {
+            if let Some(path) = location.path.as_mut() {
+                remap_path(path, source, destination);
+            }
+        }
+        self.persist_settings();
+        self.sync_lsp_document();
     }
 
     fn handle_explorer(&mut self, key: KeyEvent) {
@@ -4852,8 +5656,6 @@ impl App {
     }
 
     fn ensure_command_suggestion_visible(&mut self) {
-        const VISIBLE_ROWS: usize = COMMAND_PALETTE_ROWS;
-
         let total = self.command_suggestions().len();
         if total == 0 {
             self.command_suggestion = 0;
@@ -4862,7 +5664,16 @@ impl App {
         }
 
         self.command_suggestion = self.command_suggestion.min(total - 1);
-        let rows = total.min(VISIBLE_ROWS);
+        let available_rows = if self.viewport_rows == 0 {
+            COMMAND_PALETTE_ROWS
+        } else {
+            self.viewport_rows
+                .saturating_sub(4)
+                .checked_div(2)
+                .unwrap_or(1)
+                .clamp(1, COMMAND_PALETTE_ROWS)
+        };
+        let rows = total.min(available_rows);
         self.command_suggestion_scroll = self.command_suggestion_scroll.min(total - rows);
         if self.command_suggestion < self.command_suggestion_scroll {
             self.command_suggestion_scroll = self.command_suggestion;
@@ -4922,6 +5733,7 @@ impl App {
             "Show or hide the project tree",
             Some(KeyAction::ToggleTree),
         ),
+        ("manager", "Open the full file manager", None),
         ("newfile", "Create a file in the tree", None),
         ("newdir", "Create a directory in the tree", None),
         ("rename", "Rename the selected file", None),
@@ -5029,6 +5841,19 @@ impl App {
         ("set noformatonsave", "Stop formatting on save", None),
         ("set hidden", "Show dotfiles in the tree", None),
         ("set nohidden", "Hide dotfiles in the tree", None),
+        ("set icons=unicode", "Use portable Unicode file icons", None),
+        ("set icons=ascii", "Use ASCII-only file icons", None),
+        ("set icons=nerd", "Use Nerd Font file icons", None),
+        ("set directoriesfirst", "Sort folders before files", None),
+        ("set nodirectoriesfirst", "Sort folders with files", None),
+        ("set managerpreview", "Enable safe file previews", None),
+        ("set nomanagerpreview", "Disable file previews", None),
+        (
+            "set managerpanes=23,42",
+            "Set wide manager parent/current percentages",
+            None,
+        ),
+        ("set previewmaxbytes=262144", "Limit preview reads", None),
         ("set restoresession", "Reopen tabs on launch", None),
         ("set norestoresession", "Start with a clean session", None),
         ("set reducedmotion", "Disable animations", None),
@@ -5297,6 +6122,7 @@ impl App {
                     "File tree hidden".to_string()
                 };
             }
+            "manager" | "filemanager" | "fm" => self.open_file_manager(),
             "newfile" | "touch" => {
                 if argument.is_empty() {
                     self.message = "Usage: :newfile path".to_string();
@@ -5702,6 +6528,7 @@ impl App {
     fn change_project_root(&mut self, path: PathBuf) {
         match self.project.set_root(path) {
             Ok(()) => {
+                let _ = self.file_manager.go_to(self.project.root.clone());
                 self.project.visible = true;
                 self.explorer_focused = true;
                 self.mode = Mode::Normal;
@@ -6855,6 +7682,20 @@ fn parse_git_hunks(diff: &str, line_count: usize) -> HashMap<usize, GitLineChang
     changes
 }
 
+fn remap_path(path: &mut PathBuf, source: &Path, destination: &Path) {
+    if path == source {
+        *path = destination.to_path_buf();
+    } else if let Ok(relative) = path.strip_prefix(source) {
+        *path = destination.join(relative);
+    }
+}
+
+fn remap_path_list(paths: &mut [PathBuf], source: &Path, destination: &Path) {
+    for path in paths {
+        remap_path(path, source, destination);
+    }
+}
+
 fn parse_diff_range(value: &str, prefix: char) -> Option<(usize, usize)> {
     let value = value.strip_prefix(prefix)?;
     let (start, count) = value.split_once(',').unwrap_or((value, "1"));
@@ -7619,7 +8460,7 @@ mod tests {
         assert_eq!(app.mode, Mode::SettingsBrowser);
 
         let all = app.setting_rows();
-        assert_eq!(all.len(), 19);
+        assert_eq!(all.len(), 25);
 
         type_text(&mut app, "undo");
         let filtered = app.setting_rows();
@@ -7628,6 +8469,41 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.message.contains("undolimit"), "{}", app.message);
+    }
+
+    #[test]
+    fn file_manager_opens_and_supports_keyboard_selection() {
+        let root = std::env::temp_dir().join(format!("caret-app-manager-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("alpha.txt"), "alpha").unwrap();
+        fs::create_dir(root.join("folder")).unwrap();
+
+        let mut app = App::new(Some(&root)).expect("create app");
+        app.execute_command("manager");
+        assert_eq!(app.mode, Mode::FileManager);
+        for _ in 0..100 {
+            app.poll_background();
+            if !app.file_manager.loading {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.file_manager.entries.len(), 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(app.file_manager.selected_paths.len(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(app.file_manager.clipboard.len(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.file_manager.selected_paths.is_empty());
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        type_text(&mut app, "made.txt");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(root.join("made.txt").exists());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_ne!(app.mode, Mode::FileManager);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7803,13 +8679,14 @@ mod tests {
     fn command_suggestion_scrolls_when_keyboard_selection_reaches_the_edge() {
         let mut app = App::new(None).expect("create app");
         app.mode = Mode::Command;
+        app.viewport_rows = 19;
 
         for _ in 0..9 {
             app.handle_command_input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
 
         assert_eq!(app.command_suggestion, 9);
-        assert_eq!(app.command_suggestion_scroll, 2);
+        assert_eq!(app.command_suggestion_scroll, 3);
     }
 
     #[test]
@@ -7849,6 +8726,35 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Insert);
         assert_eq!(app.editor.selected_text().as_deref(), Some("hello"));
+        assert!(app.context_menu.is_none());
+    }
+
+    #[test]
+    fn title_bar_menu_groups_primary_actions_and_opens_them() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::Insert;
+
+        app.handle_title_bar_click(115, 120);
+
+        assert_eq!(app.mode, Mode::ContextMenu);
+        let menu = app.context_menu.as_mut().expect("menu should open");
+        assert_eq!(menu.actions[0].label(), "File Manager");
+        assert!(menu.actions.contains(&ContextAction::CommandPalette));
+        assert!(menu.actions.contains(&ContextAction::Themes));
+        assert!(menu.actions.contains(&ContextAction::Settings));
+        assert!(menu.actions.contains(&ContextAction::KeyBindings));
+        assert!(menu.actions.contains(&ContextAction::Help));
+        assert!(menu.actions.contains(&ContextAction::Quit));
+        menu.selected = menu
+            .actions
+            .iter()
+            .position(|action| *action == ContextAction::Help)
+            .expect("help action");
+
+        app.execute_context_action();
+
+        assert_eq!(app.mode, Mode::Help);
+        assert_eq!(app.help_return_mode, Mode::Insert);
         assert!(app.context_menu.is_none());
     }
 
