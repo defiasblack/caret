@@ -6863,25 +6863,36 @@ fn parse_diff_range(value: &str, prefix: char) -> Option<(usize, usize)> {
 
 fn lsp_workspace_root(path: &Path) -> Option<PathBuf> {
     let mut directory = path.parent()?.to_path_buf();
+    let mut project_root = None;
     loop {
-        let has_workspace_file = std::fs::read_dir(&directory)
-            .ok()?
+        let workspace_files = std::fs::read_dir(&directory)
+            .ok()
+            .into_iter()
+            .flatten()
             .filter_map(Result::ok)
-            .any(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| {
-                        matches!(extension.to_ascii_lowercase().as_str(), "sln" | "csproj")
-                    })
-            });
-        if has_workspace_file {
+            .filter_map(|entry| {
+                let extension = entry.path().extension()?.to_str()?.to_ascii_lowercase();
+                Some(extension)
+            })
+            .collect::<Vec<_>>();
+        if workspace_files
+            .iter()
+            .any(|extension| matches!(extension.as_str(), "sln" | "slnx"))
+        {
             return Some(directory);
         }
-        let parent = directory.parent()?.to_path_buf();
+        if project_root.is_none()
+            && workspace_files
+                .iter()
+                .any(|extension| extension == "csproj")
+        {
+            project_root = Some(directory.clone());
+        }
+        let Some(parent) = directory.parent().map(Path::to_path_buf) else {
+            return project_root;
+        };
         if parent == directory {
-            return None;
+            return project_root;
         }
         directory = parent;
     }
@@ -8065,6 +8076,39 @@ mod tests {
 
         assert!(path.exists());
         assert!(app.message.contains("dirty file"), "{}", app.message);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn csharp_workspace_prefers_an_ancestor_solution_over_the_nearest_project() {
+        let root =
+            std::env::temp_dir().join(format!("caret-csharp-workspace-{}", std::process::id()));
+        let project = root.join("src").join("Demo");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&project).unwrap();
+        fs::write(root.join("Demo.sln"), "").unwrap();
+        fs::write(project.join("Demo.csproj"), "").unwrap();
+        let source = project.join("Program.cs");
+        fs::write(&source, "").unwrap();
+
+        assert_eq!(lsp_workspace_root(&source), Some(root.clone()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn csharp_workspace_uses_the_nearest_project_without_a_solution() {
+        let root =
+            std::env::temp_dir().join(format!("caret-csharp-project-{}", std::process::id()));
+        let project = root.join("src").join("Demo");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("Demo.csproj"), "").unwrap();
+        let source = project.join("Program.cs");
+        fs::write(&source, "").unwrap();
+
+        assert_eq!(lsp_workspace_root(&source), Some(project));
+
         let _ = fs::remove_dir_all(root);
     }
 }

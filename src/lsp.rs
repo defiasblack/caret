@@ -106,7 +106,9 @@ fn find_solution(root: &Path) -> Option<std::path::PathBuf> {
         .filter(|path| {
             path.extension()
                 .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("sln"))
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("sln") || extension.eq_ignore_ascii_case("slnx")
+                })
         })
         .collect::<Vec<_>>();
     solutions.sort();
@@ -134,23 +136,48 @@ pub fn server_for_extension(path: &Path) -> Option<&'static str> {
 
 pub fn file_uri(path: &Path) -> String {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    format!(
-        "file:///{}",
-        path.to_string_lossy()
-            .replace('\\', "/")
-            .replace(' ', "%20")
-    )
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    let path = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|path| format!(r"\\{path}"))
+        .or_else(|| path.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| path.into_owned());
+    #[cfg(not(windows))]
+    let path = path.into_owned();
+    let path = percent_encode_path(&path.replace('\\', "/"));
+    if path.starts_with("//") {
+        format!("file:{path}")
+    } else if path.starts_with('/') {
+        format!("file://{path}")
+    } else {
+        format!("file:///{path}")
+    }
 }
 
 pub fn path_from_uri(uri: &str) -> Option<std::path::PathBuf> {
     let encoded = uri.strip_prefix("file://")?;
     let decoded = percent_decode(encoded)?;
     #[cfg(windows)]
-    let decoded = decoded
-        .strip_prefix('/')
-        .unwrap_or(&decoded)
-        .replace('/', "\\");
+    let decoded = if let Some(path) = decoded.strip_prefix('/') {
+        path.replace('/', "\\")
+    } else {
+        format!(r"\\{}", decoded.replace('/', "\\"))
+    };
     Some(std::path::PathBuf::from(decoded))
+}
+
+fn percent_encode_path(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }
 
 fn percent_decode(value: &str) -> Option<String> {
@@ -257,7 +284,28 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_drive_paths_round_trip_through_file_uris() {
-        let path = std::path::PathBuf::from(r"C:\work\caret\main.rs");
+        let root = std::env::temp_dir().join(format!("caret-lsp-uri-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("hello #%.cs");
+        std::fs::write(&path, "").unwrap();
+        let uri = file_uri(&path);
+        assert!(uri.starts_with("file:///"), "{uri}");
+        assert!(!uri.contains("/?/"), "{uri}");
+        assert!(uri.ends_with("hello%20%23%25.cs"), "{uri}");
+        let decoded = path_from_uri(&uri).unwrap();
+        assert_eq!(
+            decoded.canonicalize().unwrap(),
+            path.canonicalize().unwrap()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unc_paths_round_trip_through_file_uris() {
+        let path = std::path::PathBuf::from(r"\\server\share\hello world.cs");
+        let uri = file_uri(&path);
+        assert_eq!(uri, "file://server/share/hello%20world.cs");
         let decoded = path_from_uri(&file_uri(&path)).unwrap();
         assert_eq!(decoded, path);
     }
@@ -266,7 +314,9 @@ mod tests {
     #[test]
     fn macos_paths_round_trip_through_file_uris() {
         let path = std::path::PathBuf::from("/Users/test/project/main.rs");
-        let decoded = path_from_uri(&file_uri(&path)).unwrap();
+        let uri = file_uri(&path);
+        assert_eq!(uri, "file:///Users/test/project/main.rs");
+        let decoded = path_from_uri(&uri).unwrap();
         assert_eq!(decoded, path);
     }
 
@@ -274,7 +324,9 @@ mod tests {
     #[test]
     fn linux_paths_round_trip_through_file_uris() {
         let path = std::path::PathBuf::from("/home/test/project/main.rs");
-        let decoded = path_from_uri(&file_uri(&path)).unwrap();
+        let uri = file_uri(&path);
+        assert_eq!(uri, "file:///home/test/project/main.rs");
+        let decoded = path_from_uri(&uri).unwrap();
         assert_eq!(decoded, path);
     }
 
@@ -334,5 +386,141 @@ mod tests {
             }
         }
         panic!("rust-analyzer hover timed out");
+    }
+
+    #[test]
+    #[ignore = "requires csharp-ls and a .NET SDK on PATH"]
+    fn csharp_ls_definition_round_trip_for_a_loaded_solution() {
+        if !Command::new("csharp-ls")
+            .arg("--version")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("caret-csharp-ls-{}", std::process::id()));
+        let project = root.join("src").join("Demo");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&project).expect("create C# fixture");
+        std::fs::write(
+            root.join("Demo.sln"),
+            r#"
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Demo", "src\Demo\Demo.csproj", "{11111111-1111-1111-1111-111111111111}"
+EndProject
+Global
+EndGlobal
+"#
+            .trim_start(),
+        )
+        .expect("write solution");
+        std::fs::write(
+            project.join("Demo.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+</Project>
+"#,
+        )
+        .expect("write project");
+        std::fs::write(
+            project.join("Greeter.cs"),
+            "namespace Demo;\npublic class Greeter { public string Message() => \"hi\"; }\n",
+        )
+        .expect("write definition source");
+        let program = project.join("Program.cs");
+        let program_text =
+            "using Demo;\nvar greeter = new Greeter();\nConsole.WriteLine(greeter.Message());\n";
+        std::fs::write(&program, program_text).expect("write use source");
+
+        let mut client = LspClient::start("csharp-ls", &root).expect("start csharp-ls");
+        let load_deadline = Instant::now() + Duration::from_secs(30);
+        let mut initialized = false;
+        while Instant::now() < load_deadline && !initialized {
+            if let Some(message) = client.try_recv() {
+                if message["id"].as_u64() == Some(1) {
+                    assert!(message.get("error").is_none(), "{message}");
+                    client
+                        .notify("initialized", json!({}))
+                        .expect("initialized notification");
+                    client
+                        .notify(
+                            "textDocument/didOpen",
+                            json!({
+                                "textDocument": {
+                                    "uri": file_uri(&program),
+                                    "languageId": "csharp",
+                                    "version": 1,
+                                    "text": program_text
+                                }
+                            }),
+                        )
+                        .expect("didOpen");
+                    initialized = true;
+                } else if message.get("method").is_some() && message.get("id").is_some() {
+                    let count = message["params"]["items"].as_array().map_or(0, Vec::len);
+                    let result = if message["method"] == "workspace/configuration" {
+                        json!(vec![json!({}); count])
+                    } else if message["method"] == "workspace/workspaceFolders" {
+                        json!([{
+                            "uri": file_uri(&root),
+                            "name": "Demo"
+                        }])
+                    } else {
+                        Value::Null
+                    };
+                    client
+                        .respond(&message["id"], result)
+                        .expect("respond to server");
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert!(initialized, "csharp-ls did not initialize in time");
+
+        let request = client
+            .request(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": file_uri(&program) },
+                    "position": { "line": 1, "character": 22 }
+                }),
+            )
+            .expect("definition request");
+        let request_deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < request_deadline {
+            if let Some(message) = client.try_recv() {
+                if message["id"].as_u64() == Some(request) {
+                    assert!(message.get("error").is_none(), "{message}");
+                    let location = message["result"]
+                        .as_array()
+                        .and_then(|locations| locations.first())
+                        .unwrap_or(&message["result"]);
+                    let uri = location["uri"]
+                        .as_str()
+                        .or_else(|| location["targetUri"].as_str())
+                        .expect("definition URI");
+                    assert!(
+                        uri.ends_with("/Greeter.cs"),
+                        "unexpected definition response: {message}"
+                    );
+                    let _ = std::fs::remove_dir_all(root);
+                    return;
+                }
+                if message.get("method").is_some() && message.get("id").is_some() {
+                    client
+                        .respond(&message["id"], Value::Null)
+                        .expect("respond to server");
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        panic!("csharp-ls definition timed out");
     }
 }

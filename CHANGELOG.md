@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Unreleased
 
+## 0.6.0-rc.2 - 2026-07-25
+
+### Fixed
+
+- C# go-to-definition now finds solutions above nested project directories and
+  sends valid, percent-encoded file URIs for existing Windows and UNC paths.
+  The regression is covered by workspace-selection and URI tests plus a real
+  `csharp-ls` definition round trip.
+
 ## 0.6.0-rc.1 - 2026-07-25
 
 ### Added

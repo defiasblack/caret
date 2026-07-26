@@ -358,9 +358,9 @@ not satisfy the roadmap's safe operation layer.
 
 ## Known release-blocking or tracked defects
 
-- [ ] Fix C# `:def`: Caret returns no definition even though the same
-  `csharp-ls` request succeeds against the loaded solution in an isolated
-  protocol test.
+- [x] Fix C# `:def`: solution discovery now prefers an ancestor `.sln`/`.slnx`
+  over a nested `.csproj`, existing Windows and UNC paths produce valid file
+  URIs, and a real `csharp-ls` definition round trip verifies the fix.
 - [ ] Treat every newly discovered data-loss defect as release-blocking and add
   a regression test with the fix.
 
