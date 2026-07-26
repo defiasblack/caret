@@ -79,6 +79,25 @@ impl IconMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExplorerSort {
+    #[default]
+    Name,
+    Size,
+    Modified,
+}
+
+impl ExplorerSort {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Size => "size",
+            Self::Modified => "modified",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -90,6 +109,8 @@ pub struct Settings {
     pub show_hidden_files: bool,
     pub icon_mode: IconMode,
     pub directories_first: bool,
+    pub explorer_sort: ExplorerSort,
+    pub explorer_metadata: bool,
     pub manager_preview: bool,
     pub manager_parent_percent: u8,
     pub manager_current_percent: u8,
@@ -191,6 +212,22 @@ impl Settings {
                 default: "on".to_string(),
                 description: "Sort directories before files in filesystem views",
                 validation: "on/off via :set directoriesfirst",
+                restart_required: false,
+            },
+            SettingInfo {
+                name: "explorersort",
+                current: self.explorer_sort.name().to_string(),
+                default: "name".to_string(),
+                description: "Project explorer ordering",
+                validation: "name | size | modified via :set explorersort=value",
+                restart_required: false,
+            },
+            SettingInfo {
+                name: "explorermetadata",
+                current: on_off(self.explorer_metadata),
+                default: "on".to_string(),
+                description: "Show size and modified-time columns when the explorer is wide",
+                validation: "on/off via :set explorermetadata",
                 restart_required: false,
             },
             SettingInfo {
@@ -355,6 +392,8 @@ impl Default for Settings {
             show_hidden_files: false,
             icon_mode: IconMode::Unicode,
             directories_first: true,
+            explorer_sort: ExplorerSort::Name,
+            explorer_metadata: true,
             manager_preview: true,
             manager_parent_percent: 23,
             manager_current_percent: 42,
@@ -453,7 +492,7 @@ mod tests {
         let settings = Settings::default();
         let rows = settings.setting_infos();
 
-        assert_eq!(rows.len(), 25);
+        assert_eq!(rows.len(), 27);
         assert_eq!(rows[0].name, "theme");
         assert_eq!(rows[0].default, "oxide");
         assert!(rows

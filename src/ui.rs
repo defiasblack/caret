@@ -15,13 +15,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, BackgroundState, HoverTarget, ManagerConfirmation, ManagerInputKind, Mode,
-        SidebarView, COMMAND_PALETTE_ROWS,
+        App, BackgroundState, ExplorerInputKind, HoverTarget, ManagerConfirmation,
+        ManagerInputKind, Mode, SidebarView, COMMAND_PALETTE_ROWS,
     },
     config::{IconMode, KeymapProfile},
     editor::display_width,
     file_manager::{human_size, unix_time_label, FileEntry, Preview},
-    project::GitStatus,
+    project::{GitStatus, TreeLoadState},
     syntax::{self, Language},
     theme::ThemeKind,
 };
@@ -754,13 +754,22 @@ fn draw_project_tree<W: Write>(
             } else {
                 ""
             };
+            let tree_marker = match &app.project.tree_state {
+                TreeLoadState::Loading => " · scan…",
+                TreeLoadState::Empty => " · empty",
+                TreeLoadState::PermissionDenied(_) => " · denied",
+                TreeLoadState::Missing(_) => " · missing",
+                TreeLoadState::Error(_) => " · scan!",
+                TreeLoadState::Ready => "",
+            };
             let root = format!(
-                " 󰉋  {}  {}{}{}{}",
+                " 󰉋  {}  {}{}{}{}{}",
                 explorer_breadcrumb(app, width.saturating_sub(30)),
                 app.project.entries.len(),
                 hidden_marker,
                 filter_marker,
-                git_marker
+                git_marker,
+                tree_marker
             );
             let controls = explorer_header_controls(width);
             queue!(
@@ -774,28 +783,92 @@ fn draw_project_tree<W: Write>(
             continue;
         }
 
-        let entry_index = app.project.scroll + screen_row - 1;
+        if screen_row == 1 && app.project.entries.is_empty() {
+            let message = match &app.project.tree_state {
+                TreeLoadState::Loading => "  Scanning project…",
+                TreeLoadState::Empty => "  This folder is empty",
+                state => state.message().unwrap_or("  No project entries"),
+            };
+            queue!(
+                out,
+                MoveTo(0, y),
+                SetForegroundColor(match &app.project.tree_state {
+                    TreeLoadState::PermissionDenied(_)
+                    | TreeLoadState::Missing(_)
+                    | TreeLoadState::Error(_) => app.theme.error,
+                    _ => app.theme.muted,
+                }),
+                Print(pad_or_truncate(message, width))
+            )?;
+            continue;
+        }
+
+        let visual_index = app.project.scroll + screen_row - 1;
+        let insert_index = matches!(
+            app.explorer_input_kind,
+            Some(ExplorerInputKind::NewFile | ExplorerInputKind::NewDirectory)
+        )
+        .then_some(app.project.selected.saturating_add(1));
+        if insert_index == Some(visual_index) {
+            let kind = app.explorer_input_kind.unwrap();
+            let parent_depth = app
+                .project
+                .selected_entry()
+                .map_or(0, |entry| entry.depth + usize::from(entry.is_dir));
+            let indent = "   ".repeat(parent_depth);
+            let icon = if kind == ExplorerInputKind::NewDirectory {
+                "▸"
+            } else {
+                "+"
+            };
+            let placeholder = if app.explorer_input.is_empty() {
+                if kind == ExplorerInputKind::NewDirectory {
+                    "folder name"
+                } else {
+                    "file name"
+                }
+            } else {
+                &app.explorer_input
+            };
+            let line = format!(" {indent}└─{icon} {placeholder}_");
+            queue!(
+                out,
+                MoveTo(0, y),
+                SetBackgroundColor(app.theme.current_line),
+                SetForegroundColor(app.theme.search_foreground),
+                SetAttribute(Attribute::Bold),
+                Print(pad_or_truncate(&line, width)),
+                SetAttribute(Attribute::NormalIntensity)
+            )?;
+            continue;
+        }
+        let entry_index = visual_index.saturating_sub(usize::from(
+            insert_index.is_some_and(|insert| visual_index > insert),
+        ));
         let Some(entry) = app.project.entries.get(entry_index) else {
             continue;
         };
 
         let selected = entry_index == app.project.selected;
+        let hovered = app.explorer_hovered == Some(entry_index);
         let active_file = app.editor.path.as_ref() == Some(&entry.path);
         let background = if selected && app.explorer_focused {
             app.theme.normal_mode
         } else if selected {
             app.theme.current_line
+        } else if hovered {
+            soft_selection_background(app)
         } else {
             app.theme.prompt_bar
         };
         let foreground = if selected && app.explorer_focused {
             app.theme.background
-        } else if entry.is_dir {
-            app.theme.heading
+        } else if entry.git_status == Some(GitStatus::Conflicted) {
+            app.theme.error
         } else if active_file {
             app.theme.success
         } else {
-            app.theme.foreground
+            explorer_entry_foreground(app, entry)
         };
 
         let icon = match (app.icon_mode(), entry.is_dir, entry.is_symlink, active_file) {
@@ -834,9 +907,45 @@ fn draw_project_tree<W: Write>(
             Some(GitStatus::Modified) => " M ",
             Some(GitStatus::Added) => " A ",
             Some(GitStatus::Deleted) => " D ",
+            Some(GitStatus::Renamed) => " R ",
+            Some(GitStatus::Conflicted) => " U ",
             Some(GitStatus::Untracked) => " ? ",
             None => "",
         };
+        let metadata = if app.project.show_metadata && width >= 68 {
+            let size = if entry.is_dir {
+                "—".to_string()
+            } else {
+                entry
+                    .size
+                    .map(human_size)
+                    .unwrap_or_else(|| "…".to_string())
+            };
+            format!(
+                " {:>8} {:>8}",
+                compact_text(&size, 8),
+                compact_text(
+                    &entry
+                        .modified_unix_secs
+                        .map(|seconds| unix_time_label(Some(seconds)))
+                        .unwrap_or_else(|| "…".to_string()),
+                    8
+                )
+            )
+        } else if app.project.show_metadata && width >= 52 {
+            let size = if entry.is_dir {
+                "—".to_string()
+            } else {
+                entry
+                    .size
+                    .map(human_size)
+                    .unwrap_or_else(|| "…".to_string())
+            };
+            format!(" {:>8}", compact_text(&size, 8))
+        } else {
+            String::new()
+        };
+        let right = format!("{metadata}{git}");
         let indent = entry
             .guides
             .iter()
@@ -849,15 +958,23 @@ fn draw_project_tree<W: Write>(
             (false, true) => "@",
             (false, false) => "",
         };
-        let left = format!(" {indent}{branch}{icon} {}{suffix}", entry.name);
-        let label = fit_bar(&left, git, width);
+        let display_name = if app.explorer_input_kind == Some(ExplorerInputKind::Rename)
+            && entry_index == app.project.selected
+        {
+            format!("{}_", app.explorer_input)
+        } else {
+            entry.name.clone()
+        };
+        let prefix = format!(" {indent}{branch}{icon} ");
+        let left = format!("{prefix}{display_name}{suffix}");
+        let label = fit_bar(&left, &right, width);
 
         queue!(
             out,
             MoveTo(0, y),
             SetBackgroundColor(background),
             SetForegroundColor(foreground),
-            SetAttribute(if selected {
+            SetAttribute(if selected || active_file {
                 Attribute::Bold
             } else {
                 Attribute::NormalIntensity
@@ -865,9 +982,77 @@ fn draw_project_tree<W: Write>(
             Print(label),
             SetAttribute(Attribute::NormalIntensity)
         )?;
+        if app.explorer_input_kind.is_none() && !app.project.filter.is_empty() {
+            if let Some((match_start, match_end)) =
+                case_insensitive_match_range(&display_name, &app.project.filter)
+            {
+                let x = UnicodeWidthStr::width(prefix.as_str())
+                    + UnicodeWidthStr::width(&display_name[..match_start]);
+                let matched = &display_name[match_start..match_end];
+                let matched_width = UnicodeWidthStr::width(matched);
+                let right_width = UnicodeWidthStr::width(right.as_str());
+                if x + matched_width < width.saturating_sub(right_width) {
+                    queue!(
+                        out,
+                        MoveTo(x as u16, y),
+                        SetBackgroundColor(app.theme.search_background),
+                        SetForegroundColor(app.theme.search_foreground),
+                        SetAttribute(Attribute::Bold),
+                        Print(matched),
+                        SetAttribute(Attribute::NormalIntensity)
+                    )?;
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+fn case_insensitive_match_range(text: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    if text.is_ascii() && needle.is_ascii() {
+        let start = text
+            .to_ascii_lowercase()
+            .find(&needle.to_ascii_lowercase())?;
+        return Some((start, start + needle.len()));
+    }
+    text.find(needle).map(|start| (start, start + needle.len()))
+}
+
+fn explorer_entry_foreground(app: &App, entry: &crate::project::ProjectEntry) -> Color {
+    if entry.ignored || entry.hidden {
+        return app.theme.muted;
+    }
+    if entry.is_symlink {
+        return app.theme.punctuation;
+    }
+    if entry.is_dir {
+        return app.theme.heading;
+    }
+    if entry.is_executable == Some(true) {
+        return app.theme.success;
+    }
+
+    match entry
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some(
+            "rs" | "go" | "cs" | "py" | "js" | "jsx" | "ts" | "tsx" | "java" | "c" | "h" | "cpp"
+            | "hpp",
+        ) => app.theme.keyword,
+        Some("md" | "txt" | "rst" | "adoc") => app.theme.string,
+        Some("json" | "toml" | "yaml" | "yml" | "xml" | "ini" | "conf") => app.theme.number,
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico") => app.theme.type_name,
+        Some("zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar") => app.theme.comment,
+        _ => app.theme.foreground,
+    }
 }
 
 fn explorer_breadcrumb(app: &App, max_width: usize) -> String {
@@ -1070,8 +1255,7 @@ fn draw_editor<W: Write>(
     editor_width: u16,
     gutter_width: usize,
 ) -> io::Result<()> {
-    let language = Language::from_path(app.editor.path.as_deref());
-    let fold_ranges = syntax::fold_ranges(&app.editor.text(), language);
+    let fold_ranges = app.editor.syntax_fold_ranges();
 
     for screen_row in 0..rows {
         let terminal_row = top + screen_row as u16;
@@ -1144,7 +1328,9 @@ fn draw_editor<W: Write>(
         }
 
         let line = app.editor.line_text(line_index);
-        let colors = syntax::highlight_line(&line, language, &app.theme);
+        let colors = app
+            .editor
+            .syntax_colors_for_line(line_index, &line, &app.theme);
         let search_hits = app.search_line_hits(&line);
         let text_width = editor_width.saturating_sub(gutter_width as u16) as usize;
         let line_start = app.editor.buffer_line_to_char(line_index);
@@ -1414,6 +1600,7 @@ fn draw_file_manager<W: Write>(
     let left_footer = if let Some(kind) = app.manager_input_kind {
         let label = match kind {
             ManagerInputKind::Rename => "Rename",
+            ManagerInputKind::BulkRename => "Bulk rename",
             ManagerInputKind::NewFile => "New file",
             ManagerInputKind::NewDirectory => "New folder",
             ManagerInputKind::GoTo => "Go to",
@@ -1773,18 +1960,22 @@ fn draw_manager_preview_pane<W: Write>(
         None,
         false,
     )?;
-    let mut lines = Vec::new();
+    let mut lines: Vec<(String, Option<Language>)> = Vec::new();
     if let Some(entry) = app.file_manager.selected_entry() {
-        lines.push(format!("Size: {}", human_size(entry.size)));
-        lines.push(format!(
-            "Modified: {}",
-            unix_time_label(entry.modified_unix_secs)
+        lines.push((format!("Size: {}", human_size(entry.size)), None));
+        lines.push((
+            format!("Modified: {}", unix_time_label(entry.modified_unix_secs)),
+            None,
         ));
-        lines.push(String::new());
+        lines.push((String::new(), None));
     }
     match &app.file_manager.preview {
-        Preview::Loading => lines.push("Loading preview…".to_string()),
-        Preview::Empty => lines.push("Preview disabled or unavailable".to_string()),
+        Preview::Loading => lines.push(("Loading preview…".to_string(), None)),
+        Preview::Empty => lines.push(("Preview disabled or unavailable".to_string(), None)),
+        Preview::Cancelled => lines.push(("Preview cancelled".to_string(), None)),
+        Preview::Unsupported { reason } => {
+            lines.push((format!("Preview unsupported: {reason}"), None));
+        }
         Preview::Directory {
             children,
             directories,
@@ -1792,26 +1983,35 @@ fn draw_manager_preview_pane<W: Write>(
             total_bytes,
             truncated,
         } => {
-            lines.push(format!("{children} children"));
-            lines.push(format!("{directories} directories"));
-            lines.push(format!("{files} files"));
-            lines.push(format!("{} immediate file data", human_size(*total_bytes)));
+            lines.push((format!("{children} children"), None));
+            lines.push((format!("{directories} directories"), None));
+            lines.push((format!("{files} files"), None));
+            lines.push((
+                format!("{} immediate file data", human_size(*total_bytes)),
+                None,
+            ));
             if *truncated {
-                lines.push("Count truncated".to_string());
+                lines.push(("Count truncated".to_string(), None));
             }
         }
         Preview::Text {
             lines: preview_lines,
             truncated,
             structured,
+            language,
         } => {
             if let Some(kind) = structured {
-                lines.push(format!("{kind} preview"));
-                lines.push(String::new());
+                lines.push((format!("{kind} preview"), None));
+                lines.push((String::new(), None));
             }
-            lines.extend(preview_lines.iter().cloned());
+            lines.extend(
+                preview_lines
+                    .iter()
+                    .cloned()
+                    .map(|line| (line, Some(*language))),
+            );
             if *truncated {
-                lines.push("… preview truncated".to_string());
+                lines.push(("… preview truncated".to_string(), None));
             }
         }
         Preview::Binary {
@@ -1820,26 +2020,50 @@ fn draw_manager_preview_pane<W: Write>(
             kind,
             dimensions,
         } => {
-            lines.push((*kind).to_string());
-            lines.push(format!("Size: {}", human_size(*size)));
+            lines.push(((*kind).to_string(), None));
+            lines.push((format!("Size: {}", human_size(*size)), None));
             if let Some((width, height)) = dimensions {
-                lines.push(format!("Dimensions: {width} × {height}"));
+                lines.push((format!("Dimensions: {width} × {height}"), None));
             }
-            lines.push(String::new());
-            lines.push("Header:".to_string());
-            lines.push(header.clone());
+            lines.push((String::new(), None));
+            lines.push(("Header:".to_string(), None));
+            lines.push((header.clone(), None));
         }
         Preview::Symlink { target, exists } => {
-            lines.push(format!("Target: {}", target.display()));
-            lines.push(if *exists {
-                "Target exists".to_string()
-            } else {
-                "Broken symlink".to_string()
-            });
+            lines.push((format!("Target: {}", target.display()), None));
+            lines.push((
+                if *exists {
+                    "Target exists".to_string()
+                } else {
+                    "Broken symlink".to_string()
+                },
+                None,
+            ));
         }
-        Preview::Error(error) => lines.push(format!("Preview error: {error}")),
+        Preview::Error(error) => lines.push((format!("Preview error: {error}"), None)),
     }
-    for (index, line) in lines.iter().take(rows.saturating_sub(2)).enumerate() {
+    for (index, (line, language)) in lines.iter().take(rows.saturating_sub(2)).enumerate() {
+        let y = top + index as u16 + 1;
+        if let Some(language) = language {
+            let colors = syntax::highlight_line(line, *language, &app.theme);
+            render_line_text(
+                out,
+                line,
+                &colors,
+                &[],
+                (x + 2) as u16,
+                y,
+                width.saturating_sub(4),
+                0,
+                4,
+                app.theme.overlay,
+                app.theme.foreground,
+                app.theme.search_background,
+                0,
+                &[],
+            )?;
+            continue;
+        }
         let safe_line = manager_display_line(line);
         let metadata = line.starts_with("Size:")
             || line.starts_with("Modified:")
@@ -1848,7 +2072,7 @@ fn draw_manager_preview_pane<W: Write>(
             || line == "Header:";
         queue!(
             out,
-            MoveTo((x + 1) as u16, top + index as u16 + 1),
+            MoveTo((x + 1) as u16, y),
             SetBackgroundColor(app.theme.overlay),
             SetForegroundColor(
                 if line.starts_with("Preview error") || line == "Broken symlink" {
@@ -4042,6 +4266,8 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("↑↓←→", "Navigate"),
             ("Space", "Select"),
             ("C/X/P", "Copy/Cut/Paste"),
+            ("Z", "Undo"),
+            ("B", "Bulk rename"),
             ("Del", "Trash"),
             ("D", "Delete"),
             ("/", "Filter"),
@@ -4484,6 +4710,13 @@ mod tests {
         let rendered = fit_bar(" ├─▸ a very long directory name/", " M ", 20);
         assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 20);
         assert!(rendered.ends_with(" M "));
+    }
+
+    #[test]
+    fn explorer_filter_match_ranges_preserve_original_case() {
+        let (start, end) = case_insensitive_match_range("src/ProjectTree.rs", "project").unwrap();
+        assert_eq!(&"src/ProjectTree.rs"[start..end], "Project");
+        assert!(case_insensitive_match_range("main.rs", "missing").is_none());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use std::{
+    env,
     io::{self, BufRead, BufReader, Read, Write},
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         mpsc::{self, Receiver},
         Mutex,
@@ -11,6 +12,69 @@ use std::{
 
 use serde_json::{json, Value};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageServerSpec {
+    pub id: &'static str,
+    pub command: &'static str,
+    pub arguments: &'static [&'static str],
+    pub language_id: &'static str,
+    pub install_guidance: &'static str,
+}
+
+const SERVERS: [(&[&str], LanguageServerSpec); 5] = [
+    (
+        &["rs"],
+        LanguageServerSpec {
+            id: "rust-analyzer",
+            command: "rust-analyzer",
+            arguments: &[],
+            language_id: "rust",
+            install_guidance: "Install with `rustup component add rust-analyzer`.",
+        },
+    ),
+    (
+        &["cs"],
+        LanguageServerSpec {
+            id: "csharp-ls",
+            command: "csharp-ls",
+            arguments: &[],
+            language_id: "csharp",
+            install_guidance: "Install with `dotnet tool install --global csharp-ls`.",
+        },
+    ),
+    (
+        &["py", "pyw"],
+        LanguageServerSpec {
+            id: "pyright",
+            command: "pyright-langserver",
+            arguments: &["--stdio"],
+            language_id: "python",
+            install_guidance: "Install with `npm install --global pyright`.",
+        },
+    ),
+    (
+        &["go"],
+        LanguageServerSpec {
+            id: "gopls",
+            command: "gopls",
+            arguments: &[],
+            language_id: "go",
+            install_guidance: "Install with `go install golang.org/x/tools/gopls@latest`.",
+        },
+    ),
+    (
+        &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"],
+        LanguageServerSpec {
+            id: "typescript-language-server",
+            command: "typescript-language-server",
+            arguments: &["--stdio"],
+            language_id: "typescript",
+            install_guidance:
+                "Install with `npm install --global typescript typescript-language-server`.",
+        },
+    ),
+];
+
 pub struct LspClient {
     child: Child,
     input: Mutex<ChildStdin>,
@@ -19,9 +83,19 @@ pub struct LspClient {
 }
 
 impl LspClient {
+    #[cfg(test)]
     pub fn start(command: &str, root: &Path) -> io::Result<Self> {
+        Self::start_with(command, &[], root)
+    }
+
+    pub fn start_server(server: &LanguageServerSpec, root: &Path) -> io::Result<Self> {
+        Self::start_with(server.command, server.arguments, root)
+    }
+
+    fn start_with(command: &str, arguments: &[&str], root: &Path) -> io::Result<Self> {
         let mut process = Command::new(command);
         process.current_dir(root);
+        process.args(arguments);
         if command == "csharp-ls" {
             if let Some(solution) = find_solution(root) {
                 process.arg("--solution").arg(solution);
@@ -53,6 +127,7 @@ impl LspClient {
             "capabilities": {
                 "workspace": { "configuration": true, "workspaceFolders": true, "workspaceEdit": { "documentChanges": true } },
                 "window": { "workDoneProgress": true },
+                "general": { "positionEncodings": ["utf-16"] },
                 "textDocument": {
                     "definition": { "linkSupport": true },
                     "hover": { "contentFormat": ["plaintext", "markdown"] },
@@ -61,12 +136,47 @@ impl LspClient {
                     "rename": { "prepareSupport": false },
                     "codeAction": { "codeActionLiteralSupport": { "codeActionKind": { "valueSet": ["", "quickfix", "refactor", "source"] } } },
                     "formatting": {},
+                    "rangeFormatting": {},
+                    "signatureHelp": { "signatureInformation": { "documentationFormat": ["plaintext", "markdown"], "parameterInformation": { "labelOffsetSupport": true } } },
+                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
                     "publishDiagnostics": { "relatedInformation": true }
                 }
             }
         }))?;
         client.next_id = 1_000;
         Ok(client)
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    pub fn stop_gracefully(&mut self) {
+        let shutdown = self.request("shutdown", json!(null)).ok();
+        for _ in 0..10 {
+            if self
+                .try_recv()
+                .as_ref()
+                .and_then(|message| message.get("id"))
+                .and_then(Value::as_u64)
+                == shutdown
+            {
+                break;
+            }
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = self.notify("exit", json!(null));
+        for _ in 0..10 {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> io::Result<u64> {
@@ -112,7 +222,10 @@ fn find_solution(root: &Path) -> Option<std::path::PathBuf> {
         })
         .collect::<Vec<_>>();
     solutions.sort();
-    solutions.into_iter().next()
+    solutions
+        .into_iter()
+        .next()
+        .map(|path| without_windows_verbatim_prefix(&path))
 }
 
 impl Drop for LspClient {
@@ -121,30 +234,65 @@ impl Drop for LspClient {
     }
 }
 
-pub fn server_for_extension(path: &Path) -> Option<&'static str> {
-    match path
+pub fn server_for_extension(path: &Path) -> Option<&'static LanguageServerSpec> {
+    let extension = path
         .extension()
         .and_then(|extension| extension.to_str())?
-        .to_ascii_lowercase()
-        .as_str()
+        .to_ascii_lowercase();
+    SERVERS
+        .iter()
+        .find(|(extensions, _)| extensions.contains(&extension.as_str()))
+        .map(|(_, server)| server)
+}
+
+pub fn executable_available(command: &str) -> bool {
+    let command = Path::new(command);
+    if command.components().count() > 1 {
+        return executable_candidate(command);
+    }
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|directory| {
+        let candidate = directory.join(command);
+        executable_candidate(&candidate)
+            || executable_extensions()
+                .iter()
+                .any(|extension| executable_candidate(&candidate.with_extension(extension)))
+    })
+}
+
+fn executable_candidate(path: &Path) -> bool {
+    path.metadata().is_ok_and(|metadata| metadata.is_file())
+}
+
+fn executable_extensions() -> Vec<String> {
+    #[cfg(windows)]
     {
-        "cs" => Some("csharp-ls"),
-        "rs" => Some("rust-analyzer"),
-        _ => None,
+        env::var_os("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter_map(|extension| {
+                        let extension = extension.trim().trim_start_matches('.');
+                        (!extension.is_empty()).then(|| extension.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["EXE".to_string(), "CMD".to_string(), "BAT".to_string()])
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
     }
 }
 
 pub fn file_uri(path: &Path) -> String {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let path = path.to_string_lossy();
-    #[cfg(windows)]
-    let path = path
-        .strip_prefix(r"\\?\UNC\")
-        .map(|path| format!(r"\\{path}"))
-        .or_else(|| path.strip_prefix(r"\\?\").map(str::to_string))
-        .unwrap_or_else(|| path.into_owned());
-    #[cfg(not(windows))]
-    let path = path.into_owned();
+    let path = without_windows_verbatim_prefix(&path)
+        .to_string_lossy()
+        .into_owned();
     let path = percent_encode_path(&path.replace('\\', "/"));
     if path.starts_with("//") {
         format!("file:{path}")
@@ -153,6 +301,20 @@ pub fn file_uri(path: &Path) -> String {
     } else {
         format!("file:///{path}")
     }
+}
+
+fn without_windows_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy();
+        if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{path}"));
+        }
+        if let Some(path) = path.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(path);
+        }
+    }
+    path.to_path_buf()
 }
 
 pub fn path_from_uri(uri: &str) -> Option<std::path::PathBuf> {
@@ -281,6 +443,29 @@ mod tests {
         assert_eq!(lines, ["server failed", "second line"]);
     }
 
+    #[test]
+    fn official_language_servers_are_data_driven_and_actionable() {
+        for (name, id, command_fragment) in [
+            ("main.rs", "rust-analyzer", "rustup"),
+            ("Program.cs", "csharp-ls", "dotnet"),
+            ("main.py", "pyright", "npm"),
+            ("main.go", "gopls", "go install"),
+            ("main.tsx", "typescript-language-server", "npm"),
+        ] {
+            let server = server_for_extension(Path::new(name)).unwrap();
+            assert_eq!(server.id, id);
+            assert!(server.install_guidance.contains(command_fragment));
+            assert!(!server.language_id.is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_executables_are_detected_without_spawning_them() {
+        assert!(!executable_available(
+            "caret-language-server-that-does-not-exist"
+        ));
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_drive_paths_round_trip_through_file_uris() {
@@ -298,6 +483,21 @@ mod tests {
             path.canonicalize().unwrap()
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_solution_arguments_never_use_verbatim_paths() {
+        let path = std::path::PathBuf::from(r"\\?\C:\code\Demo.slnx");
+        assert_eq!(
+            without_windows_verbatim_prefix(&path),
+            std::path::PathBuf::from(r"C:\code\Demo.slnx")
+        );
+        let unc = std::path::PathBuf::from(r"\\?\UNC\server\share\Demo.sln");
+        assert_eq!(
+            without_windows_verbatim_prefix(&unc),
+            std::path::PathBuf::from(r"\\server\share\Demo.sln")
+        );
     }
 
     #[cfg(windows)]
@@ -390,7 +590,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires csharp-ls and a .NET SDK on PATH"]
-    fn csharp_ls_definition_round_trip_for_a_loaded_solution() {
+    fn csharp_ls_definition_and_formatting_round_trip_for_a_loaded_solution() {
         if !Command::new("csharp-ls")
             .arg("--version")
             .status()
@@ -437,7 +637,8 @@ EndGlobal
             "using Demo;\nvar greeter = new Greeter();\nConsole.WriteLine(greeter.Message());\n";
         std::fs::write(&program, program_text).expect("write use source");
 
-        let mut client = LspClient::start("csharp-ls", &root).expect("start csharp-ls");
+        let canonical_root = root.canonicalize().expect("canonical fixture root");
+        let mut client = LspClient::start("csharp-ls", &canonical_root).expect("start csharp-ls");
         let load_deadline = Instant::now() + Duration::from_secs(30);
         let mut initialized = false;
         while Instant::now() < load_deadline && !initialized {
@@ -509,8 +710,40 @@ EndGlobal
                         uri.ends_with("/Greeter.cs"),
                         "unexpected definition response: {message}"
                     );
-                    let _ = std::fs::remove_dir_all(root);
-                    return;
+                    let formatting = client
+                        .request(
+                            "textDocument/formatting",
+                            json!({
+                                "textDocument": { "uri": file_uri(&program) },
+                                "options": { "tabSize": 4, "insertSpaces": true }
+                            }),
+                        )
+                        .expect("formatting request");
+                    let formatting_deadline = Instant::now() + Duration::from_secs(30);
+                    while Instant::now() < formatting_deadline {
+                        if let Some(format_message) = client.try_recv() {
+                            if format_message["id"].as_u64() == Some(formatting) {
+                                assert!(format_message.get("error").is_none(), "{format_message}");
+                                assert!(
+                                    format_message["result"].is_array()
+                                        || format_message["result"].is_null(),
+                                    "unexpected formatting response: {format_message}"
+                                );
+                                let _ = std::fs::remove_dir_all(root);
+                                return;
+                            }
+                            if format_message.get("method").is_some()
+                                && format_message.get("id").is_some()
+                            {
+                                client
+                                    .respond(&format_message["id"], Value::Null)
+                                    .expect("respond to server");
+                            }
+                        } else {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                    panic!("csharp-ls formatting timed out");
                 }
                 if message.get("method").is_some() && message.get("id").is_some() {
                     client

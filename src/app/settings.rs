@@ -3,7 +3,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, Mode};
-use crate::{config, config::IconMode, document::FinalNewline};
+use crate::{
+    config,
+    config::{ExplorerSort, IconMode},
+    document::FinalNewline,
+};
 
 impl App {
     pub(super) fn open_settings_browser(&mut self) {
@@ -169,6 +173,7 @@ impl App {
             }
             "directoriesfirst" => {
                 self.settings.directories_first = true;
+                self.project.set_sort(self.settings.explorer_sort, true);
                 self.file_manager.directories_first = true;
                 self.file_manager.refresh();
                 self.persist_settings();
@@ -176,10 +181,42 @@ impl App {
             }
             "nodirectoriesfirst" => {
                 self.settings.directories_first = false;
+                self.project.set_sort(self.settings.explorer_sort, false);
                 self.file_manager.directories_first = false;
                 self.file_manager.refresh();
                 self.persist_settings();
                 self.message = "Directories use the active sort order".to_string();
+            }
+            value if value.starts_with("explorersort=") => {
+                let sort = match value.split_once('=').map(|(_, value)| value) {
+                    Some("name") => Some(ExplorerSort::Name),
+                    Some("size") => Some(ExplorerSort::Size),
+                    Some("modified") | Some("time") => Some(ExplorerSort::Modified),
+                    _ => None,
+                };
+                match sort {
+                    Some(sort) => {
+                        self.settings.explorer_sort = sort;
+                        self.project.set_sort(sort, self.settings.directories_first);
+                        self.persist_settings();
+                        self.message = format!("Explorer sorted by {}", sort.name());
+                    }
+                    None => {
+                        self.message = "Explorer sort must be name, size, or modified".to_string()
+                    }
+                }
+            }
+            "explorermetadata" => {
+                self.settings.explorer_metadata = true;
+                self.project.show_metadata = true;
+                self.persist_settings();
+                self.message = "Explorer metadata columns enabled".to_string();
+            }
+            "noexplorermetadata" => {
+                self.settings.explorer_metadata = false;
+                self.project.show_metadata = false;
+                self.persist_settings();
+                self.message = "Explorer metadata columns disabled".to_string();
             }
             "managerpreview" => {
                 self.settings.manager_preview = true;

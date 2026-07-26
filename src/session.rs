@@ -4,7 +4,7 @@ use std::{fs, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{document, editor::Cursor};
+use crate::{document, editor::Cursor, file_manager::SortMode};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabState {
@@ -46,6 +46,23 @@ pub struct SessionState {
     pub sidebar_outline: bool,
     #[serde(default)]
     pub split: Option<SplitState>,
+    #[serde(default)]
+    pub file_manager: Option<FileManagerState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileManagerState {
+    pub active: bool,
+    pub current_dir: PathBuf,
+    pub selected_path: Option<PathBuf>,
+    #[serde(default)]
+    pub history_back: Vec<PathBuf>,
+    #[serde(default)]
+    pub history_forward: Vec<PathBuf>,
+    #[serde(default)]
+    pub filter: String,
+    #[serde(default)]
+    pub sort: SortMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +153,15 @@ mod tests {
                 secondary_active: true,
                 vertical: true,
             }),
+            file_manager: Some(FileManagerState {
+                active: true,
+                current_dir: PathBuf::from("C:/work/project/src"),
+                selected_path: Some(PathBuf::from("C:/work/project/src/main.rs")),
+                history_back: vec![PathBuf::from("C:/work/project")],
+                history_forward: Vec::new(),
+                filter: "main".to_string(),
+                sort: SortMode::Modified,
+            }),
         };
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -145,6 +171,10 @@ mod tests {
         assert_eq!(restored.project_root, state.project_root);
         assert_eq!(restored.tabs[0].cursor.line, 7);
         assert!(restored.split.as_ref().unwrap().vertical);
+        assert_eq!(
+            restored.file_manager.as_ref().unwrap().sort,
+            SortMode::Modified
+        );
         let _ = fs::remove_dir_all(root);
     }
 

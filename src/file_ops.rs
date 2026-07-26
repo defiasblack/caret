@@ -23,6 +23,40 @@ pub fn rename_without_replace(source: &Path, destination: &Path) -> io::Result<(
     rename_without_replace_platform(source, destination)
 }
 
+pub fn rename_safely(source: &Path, destination: &Path) -> io::Result<()> {
+    if source == destination {
+        return Ok(());
+    }
+    let same_entry = destination.exists()
+        && source
+            .canonicalize()
+            .ok()
+            .zip(destination.canonicalize().ok())
+            .is_some_and(|(source, destination)| source == destination);
+    if !same_entry {
+        return rename_without_replace(source, destination);
+    }
+
+    let parent = source.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = unique_temporary_path(parent);
+    rename_without_replace(source, &temporary)?;
+    if let Err(error) = rename_without_replace(&temporary, destination) {
+        let rollback = rename_without_replace(&temporary, source);
+        return Err(io::Error::new(
+            error.kind(),
+            if let Err(rollback) = rollback {
+                format!(
+                    "case-only rename failed and rollback also failed; item remains at {}: {error}; rollback: {rollback}",
+                    temporary.display()
+                )
+            } else {
+                format!("case-only rename failed and was rolled back: {error}")
+            },
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn rename_without_replace_platform(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -154,8 +188,10 @@ pub enum OperationKind {
     Copy,
     Move,
     Duplicate,
+    BulkRename,
     Trash,
     Delete,
+    Undo,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +219,30 @@ pub struct OperationSummary {
     pub failures: Vec<OperationFailure>,
     /// Successful source-to-destination changes used to synchronize editor state.
     pub path_changes: Vec<(PathBuf, PathBuf)>,
+    pub undo: Option<UndoRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoRecord {
+    actions: Vec<UndoAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UndoAction {
+    RemoveCreated {
+        path: PathBuf,
+        fingerprint: PathFingerprint,
+    },
+    MoveBack {
+        from: PathBuf,
+        to: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PathFingerprint {
+    first: u64,
+    second: u64,
 }
 
 impl OperationSummary {
@@ -195,6 +255,7 @@ impl OperationSummary {
             cancelled: false,
             failures: Vec::new(),
             path_changes: Vec::new(),
+            undo: None,
         }
     }
 }
@@ -236,15 +297,61 @@ pub fn execute(
                 request.conflict,
                 cancelled,
             ),
+            OperationKind::BulkRename => Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "bulk rename plans must be executed with execute_bulk_rename",
+            )),
             OperationKind::Trash => move_to_trash(source).map(|()| None),
             OperationKind::Delete => remove_path(source).map(|()| None),
+            OperationKind::Undo => Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "undo records must be executed with execute_undo",
+            )),
         };
 
         match result {
             Ok(Some(destination)) => {
                 summary.completed += 1;
-                if request.kind == OperationKind::Move {
-                    summary.path_changes.push((source.clone(), destination));
+                match request.kind {
+                    OperationKind::Move => {
+                        summary
+                            .path_changes
+                            .push((source.clone(), destination.clone()));
+                        if request.conflict != ConflictPolicy::Overwrite {
+                            summary
+                                .undo
+                                .get_or_insert_with(|| UndoRecord {
+                                    actions: Vec::new(),
+                                })
+                                .actions
+                                .push(UndoAction::MoveBack {
+                                    from: destination,
+                                    to: source.clone(),
+                                });
+                        }
+                    }
+                    OperationKind::Copy | OperationKind::Duplicate
+                        if request.conflict != ConflictPolicy::Overwrite =>
+                    {
+                        if let Ok(fingerprint) = fingerprint_path(&destination) {
+                            summary
+                                .undo
+                                .get_or_insert_with(|| UndoRecord {
+                                    actions: Vec::new(),
+                                })
+                                .actions
+                                .push(UndoAction::RemoveCreated {
+                                    path: destination,
+                                    fingerprint,
+                                });
+                        }
+                    }
+                    OperationKind::Copy
+                    | OperationKind::Duplicate
+                    | OperationKind::BulkRename
+                    | OperationKind::Trash
+                    | OperationKind::Delete
+                    | OperationKind::Undo => {}
                 }
             }
             Ok(None) => summary.completed += 1,
@@ -255,13 +362,290 @@ pub fn execute(
             }
             Err(error) => summary.failures.push(OperationFailure {
                 path: source.clone(),
-                message: error.to_string(),
+                message: operation_error_message(error),
             }),
         }
         progress(index + 1, total, source);
     }
 
     summary
+}
+
+fn operation_error_message(error: io::Error) -> String {
+    match error.kind() {
+        ErrorKind::PermissionDenied => {
+            format!("permission denied or filesystem item is locked/read-only: {error}")
+        }
+        ErrorKind::NotFound => format!("filesystem item became unavailable: {error}"),
+        ErrorKind::StorageFull => {
+            format!("copy or operation stopped because storage is full: {error}")
+        }
+        _ => error.to_string(),
+    }
+}
+
+pub fn execute_undo(
+    id: u64,
+    record: &UndoRecord,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(usize, usize, &Path),
+) -> OperationSummary {
+    let mut summary = OperationSummary {
+        id,
+        kind: OperationKind::Undo,
+        completed: 0,
+        skipped: 0,
+        cancelled: false,
+        failures: Vec::new(),
+        path_changes: Vec::new(),
+        undo: None,
+    };
+    let total = record.actions.len();
+    let mut retry = vec![false; total];
+    for (index, (original_index, action)) in record.actions.iter().enumerate().rev().enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            summary.cancelled = true;
+            retry[..=original_index].fill(true);
+            break;
+        }
+        let (path, result) = match action {
+            UndoAction::RemoveCreated { path, fingerprint } => {
+                let result = fingerprint_path(path).and_then(|current| {
+                    if current != *fingerprint {
+                        return Err(io::Error::other(
+                            "created item changed after the operation; refusing to remove it",
+                        ));
+                    }
+                    remove_path(path)
+                });
+                (path.as_path(), result)
+            }
+            UndoAction::MoveBack { from, to } => {
+                let result = move_back_without_replace(from, to).map(|()| {
+                    summary.path_changes.push((from.clone(), to.clone()));
+                });
+                (from.as_path(), result)
+            }
+        };
+        match result {
+            Ok(()) => summary.completed += 1,
+            Err(error) => {
+                summary.failures.push(OperationFailure {
+                    path: path.to_path_buf(),
+                    message: error.to_string(),
+                });
+                retry[original_index] = true;
+            }
+        }
+        progress(index + 1, total, path);
+    }
+    if retry.iter().any(|retry| *retry) {
+        summary.undo = Some(UndoRecord {
+            actions: record
+                .actions
+                .iter()
+                .zip(retry)
+                .filter(|(_, retry)| *retry)
+                .map(|(action, _)| action.clone())
+                .collect(),
+        });
+    }
+    summary
+}
+
+pub fn execute_bulk_rename(
+    id: u64,
+    pairs: &[(PathBuf, PathBuf)],
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(usize, usize, &Path),
+) -> OperationSummary {
+    let mut summary = OperationSummary {
+        id,
+        kind: OperationKind::BulkRename,
+        completed: 0,
+        skipped: 0,
+        cancelled: false,
+        failures: Vec::new(),
+        path_changes: Vec::new(),
+        undo: None,
+    };
+    if cancelled.load(Ordering::Relaxed) {
+        summary.cancelled = true;
+        return summary;
+    }
+    let pairs = pairs
+        .iter()
+        .filter(|(source, destination)| source != destination)
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Err(error) = validate_bulk_rename(&pairs) {
+        summary.failures.push(OperationFailure {
+            path: error.0,
+            message: error.1,
+        });
+        return summary;
+    }
+
+    let mut staged = Vec::with_capacity(pairs.len());
+    for (source, destination) in &pairs {
+        let parent = source.parent().unwrap_or_else(|| Path::new("."));
+        let temporary = unique_temporary_path(parent);
+        if let Err(error) = rename_without_replace(source, &temporary) {
+            let rollback = rollback_staged_renames(&staged);
+            summary.failures.push(OperationFailure {
+                path: source.clone(),
+                message: match rollback {
+                    Ok(()) => format!("could not stage rename: {error}; staging was rolled back"),
+                    Err(rollback) => format!(
+                        "could not stage rename: {error}; rollback was incomplete: {rollback}"
+                    ),
+                },
+            });
+            return summary;
+        }
+        staged.push((source.clone(), temporary, destination.clone()));
+    }
+
+    for index in 0..staged.len() {
+        let (source, temporary, destination) = &staged[index];
+        if let Err(error) = rename_without_replace(temporary, destination) {
+            let rollback = rollback_bulk_rename(&staged, index);
+            summary.failures.push(OperationFailure {
+                path: source.clone(),
+                message: match rollback {
+                    Ok(()) => {
+                        format!("could not install bulk rename: {error}; changes were rolled back")
+                    }
+                    Err(rollback) => format!(
+                        "could not install bulk rename: {error}; rollback was incomplete: {rollback}"
+                    ),
+                },
+            });
+            return summary;
+        }
+        progress(index + 1, staged.len(), source);
+    }
+
+    summary.completed = staged.len();
+    summary.path_changes = staged
+        .iter()
+        .map(|(source, _, destination)| (source.clone(), destination.clone()))
+        .collect();
+    summary.undo = (!staged.is_empty()).then(|| UndoRecord {
+        actions: staged
+            .into_iter()
+            .map(|(source, _, destination)| UndoAction::MoveBack {
+                from: destination,
+                to: source,
+            })
+            .collect(),
+    });
+    summary
+}
+
+fn validate_bulk_rename(pairs: &[(PathBuf, PathBuf)]) -> Result<(), (PathBuf, String)> {
+    let sources = pairs
+        .iter()
+        .map(|(source, _)| collision_key(source))
+        .collect::<std::collections::HashSet<_>>();
+    let mut destinations = std::collections::HashSet::new();
+    for (source, destination) in pairs {
+        if !source.exists() {
+            return Err((
+                source.clone(),
+                "bulk rename source no longer exists".to_string(),
+            ));
+        }
+        if source.parent() != destination.parent() || destination.file_name().is_none() {
+            return Err((
+                source.clone(),
+                "bulk rename destinations must stay in the source directory".to_string(),
+            ));
+        }
+        let destination_key = collision_key(destination);
+        if !destinations.insert(destination_key.clone()) {
+            return Err((
+                destination.clone(),
+                "bulk rename produced duplicate destination names".to_string(),
+            ));
+        }
+        if sources.contains(&destination_key) && collision_key(source) != destination_key {
+            return Err((
+                destination.clone(),
+                "bulk rename cannot swap or cycle existing names".to_string(),
+            ));
+        }
+        let same_entry = destination.exists()
+            && source
+                .canonicalize()
+                .ok()
+                .zip(destination.canonicalize().ok())
+                .is_some_and(|(source, destination)| source == destination);
+        if destination.exists() && !same_entry {
+            return Err((
+                destination.clone(),
+                "bulk rename destination already exists".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn collision_key(path: &Path) -> String {
+    let value = absolute_clean(path).to_string_lossy().into_owned();
+    if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value
+    }
+}
+
+fn rollback_staged_renames(staged: &[(PathBuf, PathBuf, PathBuf)]) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for (source, temporary, _) in staged.iter().rev() {
+        if let Err(error) = rename_without_replace(temporary, source) {
+            failures.push(format!(
+                "{} -> {}: {error}",
+                temporary.display(),
+                source.display()
+            ));
+        }
+    }
+    rollback_result(failures)
+}
+
+fn rollback_bulk_rename(
+    staged: &[(PathBuf, PathBuf, PathBuf)],
+    installed: usize,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for (source, _, destination) in staged[..installed].iter().rev() {
+        if let Err(error) = rename_without_replace(destination, source) {
+            failures.push(format!(
+                "{} -> {}: {error}",
+                destination.display(),
+                source.display()
+            ));
+        }
+    }
+    for (source, temporary, _) in staged[installed..].iter().rev() {
+        if let Err(error) = rename_without_replace(temporary, source) {
+            failures.push(format!(
+                "{} -> {}: {error}",
+                temporary.display(),
+                source.display()
+            ));
+        }
+    }
+    rollback_result(failures)
+}
+
+fn rollback_result(failures: Vec<String>) -> Result<(), String> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 fn transfer_one(
@@ -393,27 +777,93 @@ fn copy_path_safely(
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
     if !overwrite {
-        return copy_path(source, destination, cancelled);
+        if let Err(error) = copy_path(source, destination, cancelled) {
+            return Err(cleanup_failed_copy(destination, error));
+        }
+        return Ok(());
     }
 
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let temporary = unique_temporary_path(parent);
     if let Err(error) = copy_path(source, &temporary, cancelled) {
-        let _ = remove_path(&temporary);
-        return Err(error);
+        return Err(cleanup_failed_copy(&temporary, error));
     }
-    if let Err(error) = remove_path(destination) {
-        let _ = remove_path(&temporary);
-        return Err(error);
+    install_completed_replacement(&temporary, destination)
+}
+
+fn cleanup_failed_copy(partial: &Path, error: io::Error) -> io::Error {
+    let cleanup = if partial.exists() {
+        remove_path(partial)
+    } else {
+        Ok(())
+    };
+    io::Error::new(
+        error.kind(),
+        if let Err(cleanup) = cleanup {
+            format!(
+                "copy failed: {error}; partial output remains at {} because cleanup failed: {cleanup}",
+                partial.display()
+            )
+        } else {
+            format!("copy failed and partial output was removed: {error}")
+        },
+    )
+}
+
+fn install_completed_replacement(temporary: &Path, destination: &Path) -> io::Result<()> {
+    let temporary_metadata = fs::symlink_metadata(temporary)?;
+    let destination_metadata = fs::symlink_metadata(destination)?;
+    if temporary_metadata.is_file()
+        && destination_metadata.is_file()
+        && !temporary_metadata.file_type().is_symlink()
+        && !destination_metadata.file_type().is_symlink()
+    {
+        return crate::platform::replace_file(temporary, destination).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "completed replacement remains at {}, and the original at {} was preserved: {error}",
+                    temporary.display(),
+                    destination.display()
+                ),
+            )
+        });
     }
-    if let Err(error) = fs::rename(&temporary, destination) {
-        // The completed replacement remains recoverable beside the intended
-        // destination if the final rename fails.
+
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let backup = unique_temporary_path(parent);
+    rename_without_replace(destination, &backup).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "could not preserve the existing destination before replacement; completed copy remains at {}: {error}",
+                temporary.display()
+            ),
+        )
+    })?;
+    if let Err(error) = rename_without_replace(temporary, destination) {
+        let rollback = rename_without_replace(&backup, destination);
+        return Err(io::Error::new(
+            error.kind(),
+            match rollback {
+                Ok(()) => format!(
+                    "could not install replacement; the original destination was restored and the completed copy remains at {}: {error}",
+                    temporary.display()
+                ),
+                Err(rollback) => format!(
+                    "could not install replacement and could not restore the original; original remains at {}, completed copy remains at {}: {error}; rollback: {rollback}",
+                    backup.display(),
+                    temporary.display()
+                ),
+            },
+        ));
+    }
+    if let Err(error) = remove_path(&backup) {
         return Err(io::Error::new(
             error.kind(),
             format!(
-                "replacement is complete at {}, but could not be installed: {error}",
-                temporary.display()
+                "replacement was installed, but the preserved original could not be removed from {}: {error}",
+                backup.display()
             ),
         ));
     }
@@ -506,6 +956,106 @@ fn absolute_clean(path: &Path) -> PathBuf {
         }
     }
     absolute
+}
+
+fn move_back_without_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    if destination.exists() {
+        return Err(io::Error::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "original path is occupied; refusing to replace {}",
+                destination.display()
+            ),
+        ));
+    }
+    match rename_without_replace(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if is_cross_device(&error) => {
+            let cancelled = AtomicBool::new(false);
+            copy_path(source, destination, &cancelled)?;
+            if let Err(error) = remove_path(source) {
+                let _ = remove_path(destination);
+                return Err(error);
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn fingerprint_path(path: &Path) -> io::Result<PathFingerprint> {
+    let mut state = PathFingerprint {
+        first: 0xcbf29ce484222325,
+        second: 0x9e3779b97f4a7c15,
+    };
+    fingerprint_into(path, &mut state)?;
+    Ok(state)
+}
+
+fn fingerprint_into(path: &Path, state: &mut PathFingerprint) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    update_fingerprint(state, &[u8::from(metadata.permissions().readonly())]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        update_fingerprint(state, &metadata.permissions().mode().to_le_bytes());
+    }
+    if metadata.file_type().is_symlink() {
+        update_fingerprint(state, b"L");
+        update_fingerprint_os(state, fs::read_link(path)?.as_os_str());
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        update_fingerprint(state, b"D");
+        let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            update_fingerprint_os(state, &entry.file_name());
+            fingerprint_into(&entry.path(), state)?;
+        }
+        return Ok(());
+    }
+
+    update_fingerprint(state, b"F");
+    update_fingerprint(state, &metadata.len().to_le_bytes());
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        update_fingerprint(state, &buffer[..read]);
+    }
+    Ok(())
+}
+
+fn update_fingerprint(state: &mut PathFingerprint, bytes: &[u8]) {
+    for byte in bytes {
+        state.first ^= u64::from(*byte);
+        state.first = state.first.wrapping_mul(0x100000001b3);
+        state.second ^= u64::from(*byte).wrapping_add(0x9e3779b9);
+        state.second = state.second.rotate_left(7).wrapping_mul(0x9ddfea08eb382d69);
+    }
+}
+
+#[cfg(unix)]
+fn update_fingerprint_os(state: &mut PathFingerprint, value: &std::ffi::OsStr) {
+    use std::os::unix::ffi::OsStrExt;
+    update_fingerprint(state, value.as_bytes());
+}
+
+#[cfg(windows)]
+fn update_fingerprint_os(state: &mut PathFingerprint, value: &std::ffi::OsStr) {
+    use std::os::windows::ffi::OsStrExt;
+    for unit in value.encode_wide() {
+        update_fingerprint(state, &unit.to_le_bytes());
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn update_fingerprint_os(state: &mut PathFingerprint, value: &std::ffi::OsStr) {
+    update_fingerprint(state, value.to_string_lossy().as_bytes());
 }
 
 fn remove_path(path: &Path) -> io::Result<()> {
@@ -826,6 +1376,56 @@ mod tests {
     }
 
     #[test]
+    fn directory_overwrite_preserves_then_replaces_the_complete_tree() {
+        let root = temp_dir("overwrite-directory");
+        let source_dir = root.join("source");
+        let destination_dir = root.join("destination");
+        let source = source_dir.join("folder");
+        let destination = destination_dir.join("folder");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("new.txt"), "new").unwrap();
+        fs::write(destination.join("old.txt"), "old").unwrap();
+
+        let result = execute(
+            &OperationRequest {
+                id: 51,
+                kind: OperationKind::Copy,
+                sources: vec![source],
+                destination: Some(destination_dir.clone()),
+                conflict: ConflictPolicy::Overwrite,
+            },
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        );
+
+        assert_eq!(result.completed, 1, "{:?}", result.failures);
+        assert_eq!(
+            fs::read_to_string(destination.join("new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!destination.join("old.txt").exists());
+        assert!(fs::read_dir(&destination_dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".caret-copy")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn permission_and_unavailable_failures_are_actionable() {
+        let locked = operation_error_message(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "sharing violation",
+        ));
+        assert!(locked.contains("locked/read-only"));
+        let missing =
+            operation_error_message(io::Error::new(ErrorKind::NotFound, "path disappeared"));
+        assert!(missing.contains("became unavailable"));
+    }
+
+    #[test]
     fn moving_onto_the_same_path_never_deletes_the_source() {
         let root = temp_dir("same-path");
         let source = root.join("note.txt");
@@ -862,6 +1462,171 @@ mod tests {
             ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read_to_string(destination).unwrap(), "important");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn case_only_rename_preserves_contents_without_replacement() {
+        let root = temp_dir("case-rename");
+        let source = root.join("name.txt");
+        let destination = root.join("NAME.txt");
+        fs::write(&source, "content").unwrap();
+
+        rename_safely(&source, &destination).unwrap();
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "content");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".caret-copy")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copy_undo_removes_only_an_unchanged_created_item() {
+        let root = temp_dir("copy-undo");
+        let source = root.join("source.txt");
+        let destination = root.join("destination");
+        fs::write(&source, "source").unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let request = OperationRequest {
+            id: 7,
+            kind: OperationKind::Copy,
+            sources: vec![source],
+            destination: Some(destination.clone()),
+            conflict: ConflictPolicy::Ask,
+        };
+        let result = execute(&request, &AtomicBool::new(false), |_, _, _| {});
+        let undo = result.undo.expect("copy should be undoable");
+        let copied = destination.join("source.txt");
+        assert!(copied.exists());
+
+        let undone = execute_undo(8, &undo, &AtomicBool::new(false), |_, _, _| {});
+        assert_eq!(undone.completed, 1);
+        assert!(!copied.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copy_undo_refuses_to_remove_a_changed_item() {
+        let root = temp_dir("changed-copy-undo");
+        let source = root.join("source.txt");
+        let destination = root.join("destination");
+        fs::write(&source, "source").unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let result = execute(
+            &OperationRequest {
+                id: 9,
+                kind: OperationKind::Copy,
+                sources: vec![source],
+                destination: Some(destination.clone()),
+                conflict: ConflictPolicy::Ask,
+            },
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        );
+        let undo = result.undo.unwrap();
+        let copied = destination.join("source.txt");
+        fs::write(&copied, "changed after copy").unwrap();
+
+        let undone = execute_undo(10, &undo, &AtomicBool::new(false), |_, _, _| {});
+        assert_eq!(undone.failures.len(), 1);
+        assert_eq!(fs::read_to_string(copied).unwrap(), "changed after copy");
+        assert!(undone.undo.is_some(), "a refused undo remains retryable");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_undo_returns_the_item_without_replacing_anything() {
+        let root = temp_dir("move-undo");
+        let source_dir = root.join("source");
+        let destination_dir = root.join("destination");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&destination_dir).unwrap();
+        let source = source_dir.join("note.txt");
+        fs::write(&source, "content").unwrap();
+        let result = execute(
+            &OperationRequest {
+                id: 11,
+                kind: OperationKind::Move,
+                sources: vec![source.clone()],
+                destination: Some(destination_dir.clone()),
+                conflict: ConflictPolicy::Ask,
+            },
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        );
+        let undo = result.undo.unwrap();
+        let moved = destination_dir.join("note.txt");
+        assert!(moved.exists());
+
+        let undone = execute_undo(12, &undo, &AtomicBool::new(false), |_, _, _| {});
+        assert_eq!(undone.completed, 1);
+        assert!(source.exists());
+        assert!(!moved.exists());
+        assert_eq!(undone.path_changes, vec![(moved, source)]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bulk_rename_is_atomic_and_undoable() {
+        let root = temp_dir("bulk-rename");
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        let first_next = root.join("item-1.txt");
+        let second_next = root.join("item-2.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        let result = execute_bulk_rename(
+            13,
+            &[
+                (first.clone(), first_next.clone()),
+                (second.clone(), second_next.clone()),
+            ],
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        );
+
+        assert_eq!(result.completed, 2);
+        assert_eq!(fs::read_to_string(&first_next).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&second_next).unwrap(), "second");
+        let undone = execute_undo(
+            14,
+            &result.undo.unwrap(),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        );
+        assert_eq!(undone.completed, 2);
+        assert_eq!(fs::read_to_string(first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(second).unwrap(), "second");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bulk_rename_rejects_collisions_before_changing_sources() {
+        let root = temp_dir("bulk-collision");
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        let occupied = root.join("occupied.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        fs::write(&occupied, "important").unwrap();
+        let result = execute_bulk_rename(
+            15,
+            &[
+                (first.clone(), occupied.clone()),
+                (second.clone(), root.join("other.txt")),
+            ],
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        );
+
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(fs::read_to_string(first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(second).unwrap(), "second");
+        assert_eq!(fs::read_to_string(occupied).unwrap(), "important");
         let _ = fs::remove_dir_all(root);
     }
 }

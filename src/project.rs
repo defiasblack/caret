@@ -1,10 +1,12 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
 };
 
 use ignore::gitignore::Gitignore;
+
+use crate::config::ExplorerSort;
 
 const MAX_EXPAND_ALL_DIRECTORIES: usize = 5_000;
 const MAX_FILTER_RESULTS: usize = 500;
@@ -17,8 +19,13 @@ pub struct ProjectEntry {
     pub depth: usize,
     pub is_dir: bool,
     pub is_symlink: bool,
+    pub hidden: bool,
+    pub ignored: bool,
+    pub is_executable: Option<bool>,
     pub expanded: bool,
     pub git_status: Option<GitStatus>,
+    pub size: Option<u64>,
+    pub modified_unix_secs: Option<u64>,
     /// Whether each ancestor has a later sibling and therefore needs a guide.
     pub guides: Vec<bool>,
     pub is_last: bool,
@@ -29,7 +36,30 @@ pub enum GitStatus {
     Modified,
     Added,
     Deleted,
+    Renamed,
+    Conflicted,
     Untracked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeLoadState {
+    Loading,
+    Ready,
+    Empty,
+    PermissionDenied(String),
+    Missing(String),
+    Error(String),
+}
+
+impl TreeLoadState {
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::PermissionDenied(message) | Self::Missing(message) | Self::Error(message) => {
+                Some(message)
+            }
+            Self::Loading | Self::Ready | Self::Empty => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -45,9 +75,37 @@ pub struct ProjectTree {
     pub width: usize,
     pub git_refreshing: bool,
     pub git_error: Option<String>,
+    pub tree_loading: bool,
+    pub tree_error: Option<String>,
+    pub tree_state: TreeLoadState,
+    pub sort: ExplorerSort,
+    pub directories_first: bool,
+    pub show_metadata: bool,
     expanded: HashSet<PathBuf>,
-    ignore_rules: Option<Gitignore>,
     git_refresh_requested: bool,
+    tree_refresh_requested: bool,
+    tree_invalidate_all: bool,
+    tree_invalidated_directories: HashSet<PathBuf>,
+    expand_all_requested: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TreeScanRequest {
+    pub root: PathBuf,
+    pub expanded: HashSet<PathBuf>,
+    pub show_hidden: bool,
+    pub filter: String,
+    pub invalidate_all: bool,
+    pub invalidated_directories: HashSet<PathBuf>,
+    pub sort: ExplorerSort,
+    pub directories_first: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EntryMetadata {
+    pub size: u64,
+    pub modified_unix_secs: u64,
+    pub is_executable: bool,
 }
 
 impl ProjectTree {
@@ -56,8 +114,7 @@ impl ProjectTree {
         let mut expanded = HashSet::new();
         expanded.insert(root.clone());
 
-        let mut tree = Self {
-            ignore_rules: load_ignore_rules(&root),
+        let tree = Self {
             root,
             entries: Vec::new(),
             selected: 0,
@@ -68,10 +125,19 @@ impl ProjectTree {
             width: 40,
             git_refreshing: false,
             git_error: None,
+            tree_loading: true,
+            tree_error: None,
+            tree_state: TreeLoadState::Loading,
+            sort: ExplorerSort::Name,
+            directories_first: true,
+            show_metadata: true,
             expanded,
             git_refresh_requested: true,
+            tree_refresh_requested: true,
+            tree_invalidate_all: true,
+            tree_invalidated_directories: HashSet::new(),
+            expand_all_requested: false,
         };
-        tree.refresh()?;
         Ok(tree)
     }
 
@@ -89,57 +155,161 @@ impl ProjectTree {
     }
 
     pub fn refresh(&mut self) -> io::Result<()> {
-        self.ignore_rules = load_ignore_rules(&self.root);
-        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
-        let mut entries = Vec::new();
+        self.tree_invalidate_all = true;
+        self.tree_invalidated_directories.clear();
+        self.queue_tree_projection();
+        Ok(())
+    }
 
-        let view = TreeView {
-            show_hidden: self.show_hidden,
-            ignore_rules: self.ignore_rules.as_ref(),
-        };
-        if self.filter.trim().is_empty() {
-            let mut guides = Vec::new();
-            collect_entries(
-                &self.root,
-                0,
-                &self.expanded,
-                view,
-                &mut guides,
-                &mut entries,
-            )?;
-        } else {
-            collect_filtered_entries(
-                &self.root,
-                &self.root,
-                &self.filter.to_lowercase(),
-                view,
-                0,
-                &mut entries,
-            );
-            let length = entries.len();
-            for (index, entry) in entries.iter_mut().enumerate() {
-                entry.is_last = index + 1 == length;
-            }
+    pub fn refresh_paths(&mut self, paths: &[PathBuf]) -> io::Result<()> {
+        if paths.is_empty() {
+            return self.refresh();
         }
-
-        self.entries = entries;
-
-        if let Some(path) = selected_path {
-            if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
-                self.selected = index;
-            } else {
-                self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        for path in paths {
+            if !path.starts_with(&self.root) {
+                return self.refresh();
             }
+            let directory = if path.is_dir() {
+                path.as_path()
+            } else {
+                path.parent().unwrap_or(&self.root)
+            };
+            self.tree_invalidated_directories
+                .insert(directory.to_path_buf());
+        }
+        self.queue_tree_projection();
+        Ok(())
+    }
+
+    fn queue_tree_projection(&mut self) {
+        self.tree_refresh_requested = true;
+        self.tree_loading = true;
+        self.tree_error = None;
+        self.tree_state = TreeLoadState::Loading;
+    }
+
+    pub(crate) fn take_tree_refresh_request(&mut self) -> Option<TreeScanRequest> {
+        if !std::mem::take(&mut self.tree_refresh_requested) {
+            return None;
+        }
+        Some(TreeScanRequest {
+            root: self.root.clone(),
+            expanded: self.expanded.clone(),
+            show_hidden: self.show_hidden,
+            filter: self.filter.clone(),
+            invalidate_all: std::mem::take(&mut self.tree_invalidate_all),
+            invalidated_directories: std::mem::take(&mut self.tree_invalidated_directories),
+            sort: self.sort,
+            directories_first: self.directories_first,
+        })
+    }
+
+    pub(crate) fn apply_tree_snapshot(&mut self, entries: Vec<ProjectEntry>) -> bool {
+        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
+        let changed =
+            self.entries.len() != entries.len()
+                || self.entries.iter().zip(&entries).any(|(left, right)| {
+                    left.path != right.path || left.expanded != right.expanded
+                });
+        self.entries = entries;
+        if let Some(path) = selected_path {
+            self.selected = self
+                .entries
+                .iter()
+                .position(|entry| entry.path == path)
+                .unwrap_or_else(|| self.selected.min(self.entries.len().saturating_sub(1)));
         } else {
             self.selected = self.selected.min(self.entries.len().saturating_sub(1));
         }
-
         self.clamp_scroll(1);
+        self.tree_loading = false;
+        self.tree_error = None;
+        self.tree_state = if self.entries.is_empty() {
+            TreeLoadState::Empty
+        } else {
+            TreeLoadState::Ready
+        };
+
+        if self.expand_all_requested {
+            let before = self.expanded.len();
+            self.expanded.extend(
+                self.entries
+                    .iter()
+                    .filter(|entry| entry.is_dir && !entry.is_symlink)
+                    .map(|entry| entry.path.clone()),
+            );
+            if self.expanded.len() > before && self.expanded.len() < MAX_EXPAND_ALL_DIRECTORIES {
+                self.tree_refresh_requested = true;
+                self.tree_loading = true;
+                self.tree_state = TreeLoadState::Loading;
+            } else {
+                self.expand_all_requested = false;
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn apply_tree_metadata(
+        &mut self,
+        metadata: &std::collections::HashMap<PathBuf, EntryMetadata>,
+    ) -> bool {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            let next = metadata.get(&entry.path).copied();
+            let size = next.map(|value| value.size);
+            let modified = next.map(|value| value.modified_unix_secs);
+            let executable = next.map(|value| value.is_executable);
+            if entry.size != size
+                || entry.modified_unix_secs != modified
+                || entry.is_executable != executable
+            {
+                entry.size = size;
+                entry.modified_unix_secs = modified;
+                entry.is_executable = executable;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn fail_tree_refresh(&mut self, kind: io::ErrorKind, message: String) -> bool {
+        let changed = self.tree_loading || self.tree_error.as_deref() != Some(&message);
+        self.tree_loading = false;
+        self.tree_error = Some(message.clone());
+        self.tree_state = match kind {
+            io::ErrorKind::PermissionDenied => TreeLoadState::PermissionDenied(message),
+            io::ErrorKind::NotFound => TreeLoadState::Missing(message),
+            _ => TreeLoadState::Error(message),
+        };
+        changed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_pending_refresh_for_test(&mut self) -> io::Result<()> {
+        let Some(request) = self.take_tree_refresh_request() else {
+            return Ok(());
+        };
+        let entries = TreeScanner::default().scan(&request)?;
+        self.apply_tree_snapshot(entries);
         Ok(())
     }
 
     pub fn request_git_refresh(&mut self) {
         self.git_refresh_requested = true;
+    }
+
+    pub fn set_sort(&mut self, sort: ExplorerSort, directories_first: bool) {
+        if self.sort != sort || self.directories_first != directories_first {
+            self.sort = sort;
+            self.directories_first = directories_first;
+            self.queue_tree_projection();
+        }
+    }
+
+    pub(crate) fn resort_after_metadata(&mut self) {
+        if self.sort != ExplorerSort::Name {
+            self.queue_tree_projection();
+        }
     }
 
     pub(crate) fn take_git_refresh_request(&mut self) -> bool {
@@ -156,8 +326,14 @@ impl ProjectTree {
         self.filter.clear();
         self.git_refreshing = false;
         self.git_error = None;
+        self.tree_error = None;
+        self.tree_state = TreeLoadState::Loading;
         self.git_refresh_requested = true;
-        self.refresh()
+        self.tree_refresh_requested = true;
+        self.tree_invalidate_all = true;
+        self.tree_loading = true;
+        self.expand_all_requested = false;
+        Ok(())
     }
 
     /// Filters the tree to files whose project-relative path contains
@@ -166,7 +342,8 @@ impl ProjectTree {
         self.filter = filter;
         self.selected = 0;
         self.scroll = 0;
-        self.refresh()
+        self.queue_tree_projection();
+        Ok(())
     }
 
     pub fn move_up(&mut self) {
@@ -205,7 +382,7 @@ impl ProjectTree {
             } else {
                 self.expanded.insert(entry.path);
             }
-            self.refresh()?;
+            self.queue_tree_projection();
             Ok(None)
         } else {
             Ok(Some(entry.path))
@@ -219,7 +396,7 @@ impl ProjectTree {
 
         if entry.is_dir && !self.expanded.contains(&entry.path) {
             self.expanded.insert(entry.path);
-            self.refresh()?;
+            self.queue_tree_projection();
         }
 
         Ok(())
@@ -235,18 +412,18 @@ impl ProjectTree {
         }
 
         let mut added = usize::from(self.expanded.insert(entry.path.clone()));
-
-        let view = TreeView {
-            show_hidden: self.show_hidden,
-            ignore_rules: self.ignore_rules.as_ref(),
-        };
-        for child in readable_children(&entry.path, view)? {
-            if child.is_dir && self.expanded.insert(child.path) {
-                added += 1;
-            }
+        let child_depth = entry.depth.saturating_add(1);
+        for child in self
+            .entries
+            .iter()
+            .skip(self.selected.saturating_add(1))
+            .take_while(|child| child.depth > entry.depth)
+            .filter(|child| child.depth == child_depth && child.is_dir && !child.is_symlink)
+        {
+            added += usize::from(self.expanded.insert(child.path.clone()));
         }
 
-        self.refresh()?;
+        self.queue_tree_projection();
         Ok(added)
     }
 
@@ -263,7 +440,7 @@ impl ProjectTree {
         self.expanded
             .retain(|path| !path.starts_with(&entry.path) || path == &self.root);
         let removed = before.saturating_sub(self.expanded.len());
-        self.refresh()?;
+        self.queue_tree_projection();
         Ok(removed)
     }
 
@@ -273,7 +450,7 @@ impl ProjectTree {
         };
 
         if entry.is_dir && self.expanded.remove(&entry.path) {
-            self.refresh()?;
+            self.queue_tree_projection();
             return Ok(());
         }
 
@@ -292,23 +469,17 @@ impl ProjectTree {
     }
 
     pub fn expand_all(&mut self) -> io::Result<usize> {
-        let mut directories = Vec::new();
-        let view = TreeView {
-            show_hidden: self.show_hidden,
-            ignore_rules: self.ignore_rules.as_ref(),
-        };
-        collect_directory_paths(
-            &self.root,
-            view,
-            &mut directories,
-            MAX_EXPAND_ALL_DIRECTORIES,
-        )?;
-
         let before = self.expanded.len();
         self.expanded.insert(self.root.clone());
-        self.expanded.extend(directories);
+        self.expanded.extend(
+            self.entries
+                .iter()
+                .filter(|entry| entry.is_dir && !entry.is_symlink)
+                .map(|entry| entry.path.clone()),
+        );
+        self.expand_all_requested = true;
         let added = self.expanded.len().saturating_sub(before);
-        self.refresh()?;
+        self.queue_tree_projection();
         Ok(added)
     }
 
@@ -316,9 +487,10 @@ impl ProjectTree {
         let removed = self.expanded.len().saturating_sub(1);
         self.expanded.clear();
         self.expanded.insert(self.root.clone());
+        self.expand_all_requested = false;
         self.selected = 0;
         self.scroll = 0;
-        self.refresh()?;
+        self.queue_tree_projection();
         Ok(removed)
     }
 
@@ -340,7 +512,7 @@ impl ProjectTree {
             current = directory.parent();
         }
 
-        self.refresh()?;
+        self.queue_tree_projection();
         if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
             self.selected = index;
             return Ok(true);
@@ -351,7 +523,8 @@ impl ProjectTree {
 
     pub fn toggle_hidden(&mut self) -> io::Result<()> {
         self.show_hidden = !self.show_hidden;
-        self.refresh()
+        self.queue_tree_projection();
+        Ok(())
     }
 
     pub fn ensure_selected_visible(&mut self, rows: usize) {
@@ -375,7 +548,125 @@ impl ProjectTree {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+pub(crate) struct TreeScanner {
+    root: Option<PathBuf>,
+    directories: HashMap<PathBuf, Vec<ChildEntry>>,
+    metadata: HashMap<PathBuf, EntryMetadata>,
+}
+
+impl TreeScanner {
+    pub(crate) fn scan(&mut self, request: &TreeScanRequest) -> io::Result<Vec<ProjectEntry>> {
+        if self.root.as_ref() != Some(&request.root) || request.invalidate_all {
+            self.root = Some(request.root.clone());
+            self.directories.clear();
+            self.metadata.clear();
+        } else {
+            for directory in &request.invalidated_directories {
+                self.directories.remove(directory);
+                self.metadata.retain(|path, _| !path.starts_with(directory));
+            }
+        }
+
+        let ignore_rules = load_ignore_rules(&request.root);
+        let view = TreeView {
+            show_hidden: request.show_hidden,
+            ignore_rules: ignore_rules.as_ref(),
+        };
+        let context = ProjectionContext {
+            expanded: &request.expanded,
+            view,
+            sort: request.sort,
+            directories_first: request.directories_first,
+            metadata: &self.metadata,
+        };
+        let mut entries = Vec::new();
+        if request.filter.trim().is_empty() {
+            let mut guides = Vec::new();
+            collect_entries(
+                &request.root,
+                0,
+                &context,
+                &mut self.directories,
+                &mut guides,
+                &mut entries,
+            )?;
+        } else {
+            collect_filtered_entries(
+                &request.root,
+                &request.root,
+                &request.filter.to_lowercase(),
+                0,
+                &context,
+                &mut self.directories,
+                &mut entries,
+            );
+            let length = entries.len();
+            for (index, entry) in entries.iter_mut().enumerate() {
+                entry.is_last = index + 1 == length;
+            }
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn apply_metadata(&mut self, metadata: &HashMap<PathBuf, EntryMetadata>) {
+        self.metadata.extend(
+            metadata
+                .iter()
+                .map(|(path, metadata)| (path.clone(), *metadata)),
+        );
+    }
+}
+
+pub(crate) fn load_entry_metadata(paths: &[PathBuf]) -> HashMap<PathBuf, EntryMetadata> {
+    use std::time::UNIX_EPOCH;
+    paths
+        .iter()
+        .filter_map(|path| {
+            let metadata = fs::symlink_metadata(path).ok()?;
+            let modified_unix_secs = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |value| value.as_secs());
+            Some((
+                path.clone(),
+                EntryMetadata {
+                    size: metadata.len(),
+                    modified_unix_secs,
+                    is_executable: is_executable(path, &metadata),
+                },
+            ))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn is_executable(_path: &Path, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn is_executable(path: &Path, metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "exe" | "com" | "bat" | "cmd" | "ps1"
+                )
+            })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_executable(_path: &Path, _metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[derive(Debug, Clone)]
 struct ChildEntry {
     path: PathBuf,
     name: String,
@@ -390,16 +681,31 @@ struct TreeView<'rules> {
     ignore_rules: Option<&'rules Gitignore>,
 }
 
+struct ProjectionContext<'a, 'rules> {
+    expanded: &'a HashSet<PathBuf>,
+    view: TreeView<'rules>,
+    sort: ExplorerSort,
+    directories_first: bool,
+    metadata: &'a HashMap<PathBuf, EntryMetadata>,
+}
+
 impl TreeView<'_> {
     fn shows(&self, path: &Path, name: &str, is_dir: bool) -> bool {
         if self.show_hidden {
             return true;
         }
-        if name.starts_with('.') {
+        if self.is_hidden(name) {
             return false;
         }
-        !self
-            .ignore_rules
+        !self.is_ignored(path, is_dir)
+    }
+
+    fn is_hidden(&self, name: &str) -> bool {
+        name.starts_with('.')
+    }
+
+    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        self.ignore_rules
             .is_some_and(|rules| rules.matched(path, is_dir).is_ignore())
     }
 }
@@ -438,7 +744,7 @@ fn normalize_root(root: PathBuf) -> io::Result<PathBuf> {
     Ok(fs::canonicalize(&absolute).unwrap_or(absolute))
 }
 
-fn readable_children(directory: &Path, view: TreeView) -> io::Result<Vec<ChildEntry>> {
+fn read_children(directory: &Path) -> io::Result<Vec<ChildEntry>> {
     let mut children = Vec::new();
 
     for child in fs::read_dir(directory)? {
@@ -459,10 +765,6 @@ fn readable_children(directory: &Path, view: TreeView) -> io::Result<Vec<ChildEn
                     .map(|metadata| metadata.is_dir())
                     .unwrap_or(false));
 
-        if !view.shows(&child.path(), &name, is_dir) {
-            continue;
-        }
-
         children.push(ChildEntry {
             path: child.path(),
             name,
@@ -471,29 +773,74 @@ fn readable_children(directory: &Path, view: TreeView) -> io::Result<Vec<ChildEn
         });
     }
 
+    Ok(children)
+}
+
+fn cached_visible_children(
+    directory: &Path,
+    view: TreeView,
+    sort: ExplorerSort,
+    directories_first: bool,
+    metadata: &HashMap<PathBuf, EntryMetadata>,
+    cache: &mut HashMap<PathBuf, Vec<ChildEntry>>,
+) -> io::Result<Vec<ChildEntry>> {
+    if !cache.contains_key(directory) {
+        cache.insert(directory.to_path_buf(), read_children(directory)?);
+    }
+    let mut children = cache
+        .get(directory)
+        .into_iter()
+        .flatten()
+        .filter(|child| view.shows(&child.path, &child.name, child.is_dir))
+        .cloned()
+        .collect::<Vec<_>>();
     children.sort_by(|left, right| {
-        right
-            .is_dir
-            .cmp(&left.is_dir)
+        let directory_order = if directories_first {
+            right.is_dir.cmp(&left.is_dir)
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        directory_order
+            .then_with(|| match sort {
+                ExplorerSort::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+                ExplorerSort::Size => metadata
+                    .get(&left.path)
+                    .map_or(0, |value| value.size)
+                    .cmp(&metadata.get(&right.path).map_or(0, |value| value.size)),
+                ExplorerSort::Modified => metadata
+                    .get(&right.path)
+                    .map_or(0, |value| value.modified_unix_secs)
+                    .cmp(
+                        &metadata
+                            .get(&left.path)
+                            .map_or(0, |value| value.modified_unix_secs),
+                    ),
+            })
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
             .then_with(|| left.name.cmp(&right.name))
     });
-
     Ok(children)
 }
 
 fn collect_entries(
     directory: &Path,
     depth: usize,
-    expanded: &HashSet<PathBuf>,
-    view: TreeView,
+    context: &ProjectionContext<'_, '_>,
+    cache: &mut HashMap<PathBuf, Vec<ChildEntry>>,
     guides: &mut Vec<bool>,
     output: &mut Vec<ProjectEntry>,
 ) -> io::Result<()> {
     if depth > MAX_TREE_DEPTH {
         return Ok(());
     }
-    let children = match readable_children(directory, view) {
+    let children = match cached_visible_children(
+        directory,
+        context.view,
+        context.sort,
+        context.directories_first,
+        context.metadata,
+        cache,
+    ) {
         Ok(children) => children,
         Err(error) if depth > 0 => {
             let _ = error;
@@ -505,22 +852,30 @@ fn collect_entries(
     let child_count = children.len();
     for (index, child) in children.into_iter().enumerate() {
         let is_last = index + 1 == child_count;
-        let is_expanded = child.is_dir && expanded.contains(&child.path);
+        let is_expanded = child.is_dir && context.expanded.contains(&child.path);
+        let hidden = context.view.is_hidden(&child.name);
+        let ignored = context.view.is_ignored(&child.path, child.is_dir);
+        let child_metadata = context.metadata.get(&child.path);
         output.push(ProjectEntry {
             path: child.path.clone(),
             name: child.name,
             depth,
             is_dir: child.is_dir,
             is_symlink: child.is_symlink,
+            hidden,
+            ignored,
+            is_executable: child_metadata.map(|value| value.is_executable),
             expanded: is_expanded,
             git_status: None,
+            size: child_metadata.map(|value| value.size),
+            modified_unix_secs: child_metadata.map(|value| value.modified_unix_secs),
             guides: guides.clone(),
             is_last,
         });
 
         if is_expanded {
             guides.push(!is_last);
-            collect_entries(&child.path, depth + 1, expanded, view, guides, output)?;
+            collect_entries(&child.path, depth + 1, context, cache, guides, output)?;
             guides.pop();
         }
     }
@@ -534,14 +889,22 @@ fn collect_filtered_entries(
     root: &Path,
     directory: &Path,
     needle: &str,
-    view: TreeView,
     depth: usize,
+    context: &ProjectionContext<'_, '_>,
+    cache: &mut HashMap<PathBuf, Vec<ChildEntry>>,
     output: &mut Vec<ProjectEntry>,
 ) {
     if depth > MAX_TREE_DEPTH || output.len() >= MAX_FILTER_RESULTS {
         return;
     }
-    let Ok(children) = readable_children(directory, view) else {
+    let Ok(children) = cached_visible_children(
+        directory,
+        context.view,
+        context.sort,
+        context.directories_first,
+        context.metadata,
+        cache,
+    ) else {
         return;
     };
 
@@ -551,7 +914,15 @@ fn collect_filtered_entries(
         }
         if child.is_dir {
             if !child.is_symlink {
-                collect_filtered_entries(root, &child.path, needle, view, depth + 1, output);
+                collect_filtered_entries(
+                    root,
+                    &child.path,
+                    needle,
+                    depth + 1,
+                    context,
+                    cache,
+                    output,
+                );
             }
             continue;
         }
@@ -562,55 +933,27 @@ fn collect_filtered_entries(
             .display()
             .to_string();
         if relative.to_lowercase().contains(needle) {
+            let hidden = context.view.is_hidden(&child.name);
+            let ignored = context.view.is_ignored(&child.path, false);
+            let child_metadata = context.metadata.get(&child.path);
             output.push(ProjectEntry {
                 path: child.path.clone(),
                 name: relative,
                 depth: 0,
                 is_dir: false,
                 is_symlink: child.is_symlink,
+                hidden,
+                ignored,
+                is_executable: child_metadata.map(|value| value.is_executable),
                 expanded: false,
                 git_status: None,
+                size: child_metadata.map(|value| value.size),
+                modified_unix_secs: child_metadata.map(|value| value.modified_unix_secs),
                 guides: Vec::new(),
                 is_last: false,
             });
         }
     }
-}
-
-fn collect_directory_paths(
-    directory: &Path,
-    view: TreeView,
-    output: &mut Vec<PathBuf>,
-    limit: usize,
-) -> io::Result<()> {
-    if output.len() >= limit {
-        return Ok(());
-    }
-
-    let children = match readable_children(directory, view) {
-        Ok(children) => children,
-        Err(_) => return Ok(()),
-    };
-
-    for child in children {
-        // Never auto-expand through symlinks; a link cycle would recurse
-        // forever.
-        if !child.is_dir || child.is_symlink {
-            continue;
-        }
-
-        output.push(child.path.clone());
-        if output.len() >= limit {
-            return Ok(());
-        }
-
-        collect_directory_paths(&child.path, view, output, limit)?;
-        if output.len() >= limit {
-            return Ok(());
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -633,9 +976,11 @@ mod tests {
         fs::write(root.join(".gitignore"), "*.log\n").unwrap();
 
         let mut tree = ProjectTree::new(root.clone()).unwrap();
+        tree.complete_pending_refresh_for_test().unwrap();
         assert!(!tree.entries.iter().any(|entry| entry.name == "build.log"));
 
         tree.toggle_hidden().unwrap();
+        tree.complete_pending_refresh_for_test().unwrap();
         assert!(tree.entries.iter().any(|entry| entry.name == "build.log"));
         let _ = fs::remove_dir_all(root);
     }
@@ -649,11 +994,13 @@ mod tests {
 
         let mut tree = ProjectTree::new(root.clone()).unwrap();
         tree.set_filter("main".to_string()).unwrap();
+        tree.complete_pending_refresh_for_test().unwrap();
         assert_eq!(tree.entries.len(), 1);
         assert!(tree.entries[0].name.contains("main.rs"));
         assert!(tree.entries[0].is_last);
 
         tree.set_filter(String::new()).unwrap();
+        tree.complete_pending_refresh_for_test().unwrap();
         assert!(tree.entries.len() > 1);
         let _ = fs::remove_dir_all(root);
     }
@@ -671,6 +1018,114 @@ mod tests {
     }
 
     #[test]
+    fn cached_directory_snapshots_change_only_after_invalidation() {
+        let root = temp_root("cached-snapshot");
+        fs::write(root.join("first.txt"), "first").unwrap();
+        let mut scanner = TreeScanner::default();
+        let mut request = TreeScanRequest {
+            root: root.clone(),
+            expanded: HashSet::from([root.clone()]),
+            show_hidden: false,
+            filter: String::new(),
+            invalidate_all: true,
+            invalidated_directories: HashSet::new(),
+            sort: ExplorerSort::Name,
+            directories_first: true,
+        };
+
+        let initial = scanner.scan(&request).unwrap();
+        assert!(initial.iter().any(|entry| entry.name == "first.txt"));
+        fs::write(root.join("second.txt"), "second").unwrap();
+
+        request.invalidate_all = false;
+        let cached = scanner.scan(&request).unwrap();
+        assert!(!cached.iter().any(|entry| entry.name == "second.txt"));
+
+        request.invalidate_all = true;
+        let refreshed = scanner.scan(&request).unwrap();
+        assert!(refreshed.iter().any(|entry| entry.name == "second.txt"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn targeted_invalidation_rescans_only_the_changed_directory() {
+        let root = temp_root("targeted-snapshot");
+        let first_dir = root.join("src");
+        let second_dir = root.join("other");
+        fs::create_dir_all(&second_dir).unwrap();
+        fs::write(first_dir.join("first.rs"), "first").unwrap();
+        fs::write(second_dir.join("stable.txt"), "stable").unwrap();
+        let mut scanner = TreeScanner::default();
+        let mut request = TreeScanRequest {
+            root: root.clone(),
+            expanded: HashSet::from([root.clone(), first_dir.clone(), second_dir.clone()]),
+            show_hidden: false,
+            filter: String::new(),
+            invalidate_all: true,
+            invalidated_directories: HashSet::new(),
+            sort: ExplorerSort::Name,
+            directories_first: true,
+        };
+        scanner.scan(&request).unwrap();
+
+        fs::write(first_dir.join("new.rs"), "new").unwrap();
+        fs::write(second_dir.join("should-stay-cached.txt"), "cached").unwrap();
+        request.invalidate_all = false;
+        request.invalidated_directories = HashSet::from([first_dir]);
+        let refreshed = scanner.scan(&request).unwrap();
+
+        assert!(refreshed.iter().any(|entry| entry.name == "new.rs"));
+        assert!(!refreshed
+            .iter()
+            .any(|entry| entry.name == "should-stay-cached.txt"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_metadata_drives_size_and_modified_sorting() {
+        let root = temp_root("metadata-sort");
+        let small = root.join("small.txt");
+        let large = root.join("large.txt");
+        fs::write(&small, "x").unwrap();
+        fs::write(&large, "0123456789").unwrap();
+        let mut scanner = TreeScanner::default();
+        let mut request = TreeScanRequest {
+            root: root.clone(),
+            expanded: HashSet::from([root.clone()]),
+            show_hidden: false,
+            filter: String::new(),
+            invalidate_all: true,
+            invalidated_directories: HashSet::new(),
+            sort: ExplorerSort::Name,
+            directories_first: false,
+        };
+        scanner.scan(&request).unwrap();
+        scanner.apply_metadata(&load_entry_metadata(&[small.clone(), large.clone()]));
+
+        request.invalidate_all = false;
+        request.sort = ExplorerSort::Size;
+        let by_size = scanner.scan(&request).unwrap();
+        let small_index = by_size
+            .iter()
+            .position(|entry| entry.path == small)
+            .unwrap();
+        let large_index = by_size
+            .iter()
+            .position(|entry| entry.path == large)
+            .unwrap();
+        assert!(small_index < large_index);
+        assert_eq!(by_size[large_index].size, Some(10));
+
+        request.sort = ExplorerSort::Modified;
+        let by_modified = scanner.scan(&request).unwrap();
+        assert!(by_modified
+            .iter()
+            .filter(|entry| entry.path == small || entry.path == large)
+            .all(|entry| entry.modified_unix_secs.is_some()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn connector_metadata_tracks_last_children() {
         let root = temp_root("guides");
         fs::create_dir_all(root.join("src/nested")).unwrap();
@@ -678,6 +1133,7 @@ mod tests {
         fs::write(root.join("src/z.rs"), "z").unwrap();
 
         let mut tree = ProjectTree::new(root.clone()).unwrap();
+        tree.complete_pending_refresh_for_test().unwrap();
         let src_index = tree
             .entries
             .iter()
@@ -685,6 +1141,7 @@ mod tests {
             .unwrap();
         tree.selected = src_index;
         tree.expand_selected().unwrap();
+        tree.complete_pending_refresh_for_test().unwrap();
 
         let children = tree
             .entries
@@ -708,6 +1165,7 @@ mod tests {
         std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
 
         let mut tree = ProjectTree::new(root.clone()).unwrap();
+        tree.complete_pending_refresh_for_test().unwrap();
         assert!(tree
             .entries
             .iter()
@@ -724,6 +1182,7 @@ mod tests {
         std::os::unix::fs::symlink(root.join("does-not-exist"), &link).unwrap();
 
         let mut tree = ProjectTree::new(root.clone()).unwrap();
+        tree.complete_pending_refresh_for_test().unwrap();
         let entry = tree
             .entries
             .iter()
@@ -747,6 +1206,7 @@ mod tests {
         fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
 
         let mut tree = ProjectTree::new(root.clone()).unwrap();
+        tree.complete_pending_refresh_for_test().unwrap();
         let index = tree
             .entries
             .iter()
@@ -766,7 +1226,8 @@ mod tests {
         let normalized_root = tree.root.clone();
         fs::remove_dir_all(&root).unwrap();
 
-        let error = tree.refresh().unwrap_err();
+        tree.refresh().unwrap();
+        let error = tree.complete_pending_refresh_for_test().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert_eq!(tree.root, normalized_root);
     }

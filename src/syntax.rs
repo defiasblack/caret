@@ -1,7 +1,10 @@
 use std::path::Path;
 
 use crossterm::style::Color;
-use tree_sitter::{Language as TreeLanguage, Node, Parser};
+use tree_sitter::{
+    InputEdit, Language as TreeLanguage, Node, Parser, Point, Query, QueryCursor,
+    StreamingIterator, Tree,
+};
 
 use crate::theme::Theme;
 
@@ -15,8 +18,102 @@ pub enum Language {
     Toml,
     Markdown,
     Python,
+    JavaScript,
+    TypeScript,
     Shell,
     Plain,
+}
+
+struct LanguageDefinition {
+    language: Language,
+    extensions: &'static [&'static str],
+    grammar: fn() -> TreeLanguage,
+    highlights: &'static str,
+    indents: &'static str,
+}
+
+const BRACE_INDENTS: &str = r#"["{" "[" "("] @indent"#;
+const COLLECTION_INDENTS: &str = r#"["{" "["] @indent"#;
+const COLON_INDENTS: &str = r#"[":" "{" "[" "("] @indent"#;
+const YAML_INDENTS: &str = r#"[":" "-" "{" "["] @indent"#;
+
+const LANGUAGE_DEFINITIONS: &[LanguageDefinition] = &[
+    LanguageDefinition {
+        language: Language::Rust,
+        extensions: &["rs"],
+        grammar: || tree_sitter_rust::LANGUAGE.into(),
+        highlights: tree_sitter_rust::HIGHLIGHTS_QUERY,
+        indents: BRACE_INDENTS,
+    },
+    LanguageDefinition {
+        language: Language::Go,
+        extensions: &["go"],
+        grammar: || tree_sitter_go::LANGUAGE.into(),
+        highlights: tree_sitter_go::HIGHLIGHTS_QUERY,
+        indents: BRACE_INDENTS,
+    },
+    LanguageDefinition {
+        language: Language::CSharp,
+        extensions: &["cs"],
+        grammar: || tree_sitter_c_sharp::LANGUAGE.into(),
+        highlights: tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
+        indents: BRACE_INDENTS,
+    },
+    LanguageDefinition {
+        language: Language::Yaml,
+        extensions: &["yaml", "yml"],
+        grammar: || tree_sitter_yaml::LANGUAGE.into(),
+        highlights: tree_sitter_yaml::HIGHLIGHTS_QUERY,
+        indents: YAML_INDENTS,
+    },
+    LanguageDefinition {
+        language: Language::Json,
+        extensions: &["json", "jsonc"],
+        grammar: || tree_sitter_json::LANGUAGE.into(),
+        highlights: tree_sitter_json::HIGHLIGHTS_QUERY,
+        indents: COLLECTION_INDENTS,
+    },
+    LanguageDefinition {
+        language: Language::Toml,
+        extensions: &["toml"],
+        grammar: || tree_sitter_toml_ng::LANGUAGE.into(),
+        highlights: tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+        indents: COLLECTION_INDENTS,
+    },
+    LanguageDefinition {
+        language: Language::Python,
+        extensions: &["py", "pyw"],
+        grammar: || tree_sitter_python::LANGUAGE.into(),
+        highlights: tree_sitter_python::HIGHLIGHTS_QUERY,
+        indents: COLON_INDENTS,
+    },
+    LanguageDefinition {
+        language: Language::JavaScript,
+        extensions: &["js", "jsx", "mjs", "cjs"],
+        grammar: || tree_sitter_javascript::LANGUAGE.into(),
+        highlights: tree_sitter_javascript::HIGHLIGHT_QUERY,
+        indents: BRACE_INDENTS,
+    },
+    LanguageDefinition {
+        language: Language::TypeScript,
+        extensions: &["ts", "tsx", "mts", "cts"],
+        grammar: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        highlights: tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        indents: BRACE_INDENTS,
+    },
+    LanguageDefinition {
+        language: Language::Shell,
+        extensions: &["sh", "bash", "zsh", "fish"],
+        grammar: || tree_sitter_bash::LANGUAGE.into(),
+        highlights: tree_sitter_bash::HIGHLIGHT_QUERY,
+        indents: BRACE_INDENTS,
+    },
+];
+
+fn language_definition(language: Language) -> Option<&'static LanguageDefinition> {
+    LANGUAGE_DEFINITIONS
+        .iter()
+        .find(|definition| definition.language == language)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +123,231 @@ pub struct Symbol {
     pub start_line: usize,
     pub end_line: usize,
     pub depth: usize,
+}
+
+pub struct SyntaxDocument {
+    language: Language,
+    parser: Parser,
+    tree: Tree,
+    highlight_query: Option<Query>,
+    indent_query: Option<Query>,
+    source: String,
+}
+
+impl SyntaxDocument {
+    pub fn new(path: Option<&Path>, source: &str) -> Option<Self> {
+        let language = Language::from_path(path);
+        let definition = language_definition(language)?;
+        let tree_language = (definition.grammar)();
+        let mut parser = Parser::new();
+        parser.set_language(&tree_language).ok()?;
+        let tree = parser.parse(source, None)?;
+        let highlight_query = Query::new(&tree_language, definition.highlights).ok();
+        let indent_query = Query::new(&tree_language, definition.indents).ok();
+        Some(Self {
+            language,
+            parser,
+            tree,
+            highlight_query,
+            indent_query,
+            source: source.to_string(),
+        })
+    }
+
+    pub fn language(&self) -> Language {
+        self.language
+    }
+
+    pub fn apply_edit(&mut self, at: usize, removed_chars: usize, inserted: &str) {
+        let start_byte = char_index_to_byte(&self.source, at);
+        let old_end_byte = char_index_to_byte(&self.source, at.saturating_add(removed_chars));
+        let start_position = point_at_byte(&self.source, start_byte);
+        let old_end_position = point_at_byte(&self.source, old_end_byte);
+        let new_end_position = point_after_text(start_position, inserted);
+        let new_end_byte = start_byte + inserted.len();
+        self.tree.edit(&InputEdit {
+            start_byte,
+            old_end_byte,
+            new_end_byte,
+            start_position,
+            old_end_position,
+            new_end_position,
+        });
+        self.source
+            .replace_range(start_byte..old_end_byte, inserted);
+        if let Some(tree) = self.parser.parse(&self.source, Some(&self.tree)) {
+            self.tree = tree;
+        }
+    }
+
+    pub fn highlight_line(&self, line_index: usize, line: &str, theme: &Theme) -> Vec<Color> {
+        let mut colors = highlight_line_base(line, self.language, theme);
+        let line_start = line_start_byte(&self.source, line_index).unwrap_or(self.source.len());
+        if let Some(query) = &self.highlight_query {
+            apply_query_highlights(
+                query,
+                self.tree.root_node(),
+                &self.source,
+                line_start,
+                line,
+                theme,
+                &mut colors,
+            );
+        } else {
+            apply_document_node_highlights(
+                self.tree.root_node(),
+                line_index,
+                line_start,
+                line,
+                theme,
+                &mut colors,
+            );
+        }
+        colors
+    }
+
+    pub fn fold_ranges(&self) -> Vec<(usize, usize)> {
+        let root = self.tree.root_node();
+        let mut ranges = Vec::new();
+        collect_fold_ranges(root, root.id(), &mut ranges);
+        ranges.sort_unstable();
+        ranges.dedup();
+        ranges
+    }
+
+    pub fn symbols(&self) -> Vec<Symbol> {
+        let mut output = Vec::new();
+        collect_symbols(self.tree.root_node(), &self.source, 0, &mut output);
+        output
+    }
+
+    pub fn matching_bracket(&self, cursor_char: usize) -> Option<usize> {
+        let characters = self.source.chars().collect::<Vec<_>>();
+        let mut index = cursor_char.min(characters.len());
+        if index >= characters.len() || !is_bracket(characters[index]) {
+            if index == 0 || !is_bracket(characters[index - 1]) {
+                return None;
+            }
+            index -= 1;
+        }
+        if !self.is_code_char(index) {
+            return None;
+        }
+
+        let (opening, closing, forward) = bracket_pair(characters[index])?;
+        let mut depth = 0usize;
+        if forward {
+            for (offset, character) in characters[index..].iter().enumerate() {
+                let target = index + offset;
+                if !self.is_code_char(target) {
+                    continue;
+                }
+                if *character == opening {
+                    depth += 1;
+                } else if *character == closing {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(target);
+                    }
+                }
+            }
+        } else {
+            for target in (0..=index).rev() {
+                if !self.is_code_char(target) {
+                    continue;
+                }
+                if characters[target] == closing {
+                    depth += 1;
+                } else if characters[target] == opening {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(target);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn indent_after(&self, cursor_char: usize) -> bool {
+        let Some(query) = &self.indent_query else {
+            return false;
+        };
+        let cursor_byte = char_index_to_byte(&self.source, cursor_char);
+        let line_start = self.source[..cursor_byte]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let mut query_cursor = QueryCursor::new();
+        query_cursor.set_byte_range(line_start..cursor_byte);
+        let mut captures =
+            query_cursor.captures(query, self.tree.root_node(), self.source.as_bytes());
+        while let Some((query_match, capture_index)) = captures.next() {
+            let node = query_match.captures[*capture_index].node;
+            if node.end_byte() <= cursor_byte
+                && self.source[node.end_byte()..cursor_byte]
+                    .chars()
+                    .all(char::is_whitespace)
+                && self.is_code_char(self.source[..node.start_byte()].chars().count())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn node_range_at(
+        &self,
+        cursor_char: usize,
+        current_range: Option<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        let byte = char_index_to_byte(&self.source, cursor_char);
+        let mut node = self
+            .tree
+            .root_node()
+            .descendant_for_byte_range(byte, byte.saturating_add(1).min(self.source.len()))?;
+        loop {
+            if node.is_named() && node.start_byte() < node.end_byte() {
+                let range = (
+                    self.source[..node.start_byte()].chars().count(),
+                    self.source[..node.end_byte()].chars().count(),
+                );
+                if current_range != Some(range) {
+                    return Some(range);
+                }
+            }
+            node = node.parent()?;
+        }
+    }
+
+    fn is_code_char(&self, char_index: usize) -> bool {
+        let byte = char_index_to_byte(&self.source, char_index);
+        let Some(mut node) = self
+            .tree
+            .root_node()
+            .descendant_for_byte_range(byte, byte.saturating_add(1))
+        else {
+            return true;
+        };
+        loop {
+            let kind = node.kind();
+            if kind.contains("comment")
+                || kind.contains("string")
+                || kind.contains("character")
+                || kind.contains("quoted")
+            {
+                return false;
+            }
+            let Some(parent) = node.parent() else {
+                return true;
+            };
+            node = parent;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn source_matches(&self, source: &str) -> bool {
+        self.source == source
+    }
 }
 
 impl Language {
@@ -40,18 +362,13 @@ impl Language {
             .unwrap_or_default()
             .to_ascii_lowercase();
 
-        match extension.as_str() {
-            "rs" => Self::Rust,
-            "go" => Self::Go,
-            "cs" => Self::CSharp,
-            "yaml" | "yml" => Self::Yaml,
-            "json" | "jsonc" => Self::Json,
-            "toml" => Self::Toml,
-            "md" | "markdown" => Self::Markdown,
-            "py" | "pyw" => Self::Python,
-            "sh" | "bash" | "zsh" | "fish" => Self::Shell,
-            _ => Self::Plain,
+        if matches!(extension.as_str(), "md" | "markdown") {
+            return Self::Markdown;
         }
+        LANGUAGE_DEFINITIONS
+            .iter()
+            .find(|definition| definition.extensions.contains(&extension.as_str()))
+            .map_or(Self::Plain, |definition| definition.language)
     }
 
     pub fn name(self) -> &'static str {
@@ -64,6 +381,8 @@ impl Language {
             Self::Toml => "TOML",
             Self::Markdown => "Markdown",
             Self::Python => "Python",
+            Self::JavaScript => "JavaScript",
+            Self::TypeScript => "TypeScript",
             Self::Shell => "Shell",
             Self::Plain => "Plain Text",
         }
@@ -71,7 +390,12 @@ impl Language {
 
     pub fn comment_delimiters(self) -> Option<(&'static str, Option<&'static str>)> {
         match self {
-            Self::Rust | Self::Go | Self::CSharp | Self::Json => Some(("//", None)),
+            Self::Rust
+            | Self::Go
+            | Self::CSharp
+            | Self::Json
+            | Self::JavaScript
+            | Self::TypeScript => Some(("//", None)),
             Self::Yaml | Self::Toml | Self::Python | Self::Shell => Some(("#", None)),
             Self::Markdown => Some(("<!--", Some("-->"))),
             Self::Plain => None,
@@ -80,6 +404,12 @@ impl Language {
 }
 
 pub fn highlight_line(line: &str, language: Language, theme: &Theme) -> Vec<Color> {
+    let mut colors = highlight_line_base(line, language, theme);
+    apply_tree_sitter_highlights(line, language, theme, &mut colors);
+    colors
+}
+
+fn highlight_line_base(line: &str, language: Language, theme: &Theme) -> Vec<Color> {
     let chars: Vec<char> = line.chars().collect();
     let mut colors = vec![theme.foreground; chars.len()];
 
@@ -97,7 +427,12 @@ pub fn highlight_line(line: &str, language: Language, theme: &Theme) -> Vec<Colo
     }
 
     let comment_marker = match language {
-        Language::Rust | Language::Go | Language::CSharp | Language::Json => Some("//"),
+        Language::Rust
+        | Language::Go
+        | Language::CSharp
+        | Language::Json
+        | Language::JavaScript
+        | Language::TypeScript => Some("//"),
         Language::Yaml | Language::Toml | Language::Python | Language::Shell => Some("#"),
         _ => None,
     };
@@ -222,7 +557,6 @@ pub fn highlight_line(line: &str, language: Language, theme: &Theme) -> Vec<Colo
         index += 1;
     }
 
-    apply_tree_sitter_highlights(line, language, theme, &mut colors);
     colors
 }
 
@@ -246,17 +580,7 @@ fn apply_tree_sitter_highlights(
 }
 
 fn tree_sitter_language(language: Language) -> Option<TreeLanguage> {
-    match language {
-        Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
-        Language::Go => Some(tree_sitter_go::LANGUAGE.into()),
-        Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
-        Language::Yaml => Some(tree_sitter_yaml::LANGUAGE.into()),
-        Language::Json => Some(tree_sitter_json::LANGUAGE.into()),
-        Language::Toml => Some(tree_sitter_toml_ng::LANGUAGE.into()),
-        Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
-        Language::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
-        Language::Markdown | Language::Plain => None,
-    }
+    language_definition(language).map(|definition| (definition.grammar)())
 }
 
 pub fn fold_ranges(source: &str, language: Language) -> Vec<(usize, usize)> {
@@ -294,6 +618,7 @@ pub fn symbols(source: &str, language: Language) -> Vec<Symbol> {
     output
 }
 
+#[cfg(test)]
 pub fn breadcrumbs(source: &str, language: Language, line: usize) -> Vec<Symbol> {
     symbols(source, language)
         .into_iter()
@@ -387,6 +712,173 @@ fn apply_node_highlights(node: Node<'_>, line: &str, theme: &Theme, colors: &mut
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         apply_node_highlights(child, line, theme, colors);
+    }
+}
+
+fn char_index_to_byte(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+fn point_at_byte(text: &str, byte: usize) -> Point {
+    let byte = byte.min(text.len());
+    let prefix = &text[..byte];
+    let row = prefix.bytes().filter(|byte| *byte == b'\n').count();
+    let column = prefix
+        .rfind('\n')
+        .map_or(prefix.len(), |newline| prefix.len() - newline - 1);
+    Point::new(row, column)
+}
+
+fn point_after_text(start: Point, text: &str) -> Point {
+    let newline_count = text.bytes().filter(|byte| *byte == b'\n').count();
+    if newline_count == 0 {
+        Point::new(start.row, start.column + text.len())
+    } else {
+        Point::new(
+            start.row + newline_count,
+            text.rsplit_once('\n').map_or(0, |(_, tail)| tail.len()),
+        )
+    }
+}
+
+fn line_start_byte(source: &str, line_index: usize) -> Option<usize> {
+    if line_index == 0 {
+        return Some(0);
+    }
+    let mut remaining = line_index;
+    for (byte, character) in source.char_indices() {
+        if character == '\n' {
+            remaining -= 1;
+            if remaining == 0 {
+                return Some(byte + 1);
+            }
+        }
+    }
+    None
+}
+
+fn apply_query_highlights(
+    query: &Query,
+    root: Node<'_>,
+    source: &str,
+    line_start_byte: usize,
+    line: &str,
+    theme: &Theme,
+    colors: &mut [Color],
+) {
+    let line_end_byte = line_start_byte.saturating_add(line.len()).min(source.len());
+    let mut cursor = QueryCursor::new();
+    cursor.set_byte_range(line_start_byte..line_end_byte.saturating_add(1).min(source.len()));
+    let mut captures = cursor.captures(query, root, source.as_bytes());
+    while let Some((query_match, capture_index)) = captures.next() {
+        let capture = query_match.captures[*capture_index];
+        let name = query.capture_names()[capture.index as usize];
+        let Some(color) = capture_color(name, theme) else {
+            continue;
+        };
+        let start_byte = capture
+            .node
+            .start_byte()
+            .max(line_start_byte)
+            .min(line_end_byte);
+        let end_byte = capture
+            .node
+            .end_byte()
+            .max(line_start_byte)
+            .min(line_end_byte);
+        let local_start = start_byte.saturating_sub(line_start_byte);
+        let local_end = end_byte.saturating_sub(line_start_byte);
+        let start = line[..local_start.min(line.len())].chars().count();
+        let end = line[..local_end.min(line.len())].chars().count();
+        let start = start.min(colors.len());
+        let end = end.min(colors.len());
+        for slot in &mut colors[start..end] {
+            *slot = color;
+        }
+    }
+}
+
+fn capture_color(name: &str, theme: &Theme) -> Option<Color> {
+    if name.contains("comment") {
+        Some(theme.comment)
+    } else if name.contains("string") || name.contains("character") {
+        Some(theme.string)
+    } else if name.contains("number") || name.contains("float") {
+        Some(theme.number)
+    } else if name.contains("type")
+        || name.contains("constructor")
+        || name.contains("namespace")
+        || name.contains("module")
+    {
+        Some(theme.type_name)
+    } else if name.contains("keyword") || name.contains("boolean") || name.contains("constant") {
+        Some(theme.keyword)
+    } else if name.contains("function") || name.contains("method") || name.contains("property") {
+        Some(theme.heading)
+    } else if name.contains("operator") || name.contains("punctuation") {
+        Some(theme.punctuation)
+    } else {
+        None
+    }
+}
+
+fn is_bracket(character: char) -> bool {
+    matches!(character, '(' | ')' | '[' | ']' | '{' | '}')
+}
+
+fn bracket_pair(character: char) -> Option<(char, char, bool)> {
+    match character {
+        '(' => Some(('(', ')', true)),
+        '[' => Some(('[', ']', true)),
+        '{' => Some(('{', '}', true)),
+        ')' => Some(('(', ')', false)),
+        ']' => Some(('[', ']', false)),
+        '}' => Some(('{', '}', false)),
+        _ => None,
+    }
+}
+
+fn apply_document_node_highlights(
+    node: Node<'_>,
+    line_index: usize,
+    line_start_byte: usize,
+    line: &str,
+    theme: &Theme,
+    colors: &mut [Color],
+) {
+    if node.start_position().row > line_index || node.end_position().row < line_index {
+        return;
+    }
+
+    let color = match node.kind() {
+        kind if kind.contains("comment") => Some(theme.comment),
+        kind if kind.contains("string") || kind.contains("quoted") => Some(theme.string),
+        kind if kind.contains("integer") || kind.contains("float") || kind.contains("number") => {
+            Some(theme.number)
+        }
+        kind if kind.contains("type") => Some(theme.type_name),
+        _ => None,
+    };
+    if let Some(color) = color {
+        let line_end_byte = line_start_byte.saturating_add(line.len());
+        let start_byte = node.start_byte().max(line_start_byte).min(line_end_byte);
+        let end_byte = node.end_byte().max(line_start_byte).min(line_end_byte);
+        let local_start = start_byte.saturating_sub(line_start_byte);
+        let local_end = end_byte.saturating_sub(line_start_byte);
+        let start = line[..local_start.min(line.len())].chars().count();
+        let end = line[..local_end.min(line.len())].chars().count();
+        let start = start.min(colors.len());
+        let end = end.min(colors.len());
+        for slot in &mut colors[start..end] {
+            *slot = color;
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        apply_document_node_highlights(child, line_index, line_start_byte, line, theme, colors);
     }
 }
 
@@ -597,6 +1089,63 @@ fn is_keyword(language: Language, token: &str) -> bool {
                 | "type"
                 | "var"
         ),
+        Language::JavaScript | Language::TypeScript => matches!(
+            token,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "debugger"
+                | "default"
+                | "delete"
+                | "do"
+                | "else"
+                | "enum"
+                | "export"
+                | "extends"
+                | "false"
+                | "finally"
+                | "for"
+                | "from"
+                | "function"
+                | "get"
+                | "if"
+                | "implements"
+                | "import"
+                | "in"
+                | "instanceof"
+                | "interface"
+                | "let"
+                | "new"
+                | "null"
+                | "of"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "readonly"
+                | "return"
+                | "set"
+                | "static"
+                | "super"
+                | "switch"
+                | "this"
+                | "throw"
+                | "true"
+                | "try"
+                | "type"
+                | "typeof"
+                | "undefined"
+                | "var"
+                | "void"
+                | "while"
+                | "with"
+                | "yield"
+        ),
         Language::Yaml => matches!(token, "true" | "false" | "null" | "yes" | "no"),
         Language::Json => matches!(token, "true" | "false" | "null"),
         Language::Toml => matches!(token, "true" | "false"),
@@ -735,6 +1284,18 @@ fn is_type_name(language: Language, token: &str) -> bool {
                 | "uintptr"
         ),
         Language::Python => false,
+        Language::JavaScript | Language::TypeScript => matches!(
+            token,
+            "any"
+                | "bigint"
+                | "boolean"
+                | "never"
+                | "number"
+                | "object"
+                | "string"
+                | "symbol"
+                | "unknown"
+        ),
         _ => false,
     }
 }
@@ -759,6 +1320,14 @@ mod tests {
             (Language::Json, r#"{"value": 42}"#),
             (Language::Toml, "value = 42"),
             (Language::Python, "def main():\n    return 42"),
+            (
+                Language::JavaScript,
+                "function main() { const value = 42; return value; }",
+            ),
+            (
+                Language::TypeScript,
+                "function main(value: number): number { return value; }",
+            ),
             (Language::Shell, "value=42\necho $value"),
         ] {
             let mut parser = Parser::new();
@@ -767,6 +1336,16 @@ mod tests {
                 .expect("load grammar");
             let tree = parser.parse(source, None).expect("parse source");
             assert!(!tree.root_node().has_error(), "{language:?}");
+            let definition = language_definition(language).expect("language definition");
+            let grammar = tree_sitter_language(language).unwrap();
+            assert!(
+                Query::new(&grammar, definition.highlights).is_ok(),
+                "highlight query for {language:?}"
+            );
+            assert!(
+                Query::new(&grammar, definition.indents).is_ok(),
+                "indent query for {language:?}"
+            );
         }
     }
 
@@ -792,6 +1371,41 @@ mod tests {
         );
         assert!(ranges.contains(&(0, 4)));
         assert!(ranges.contains(&(1, 3)));
+    }
+
+    #[test]
+    fn syntax_document_incrementally_updates_multiline_source() {
+        let mut document =
+            SyntaxDocument::new(Some(Path::new("main.rs")), "fn main() {\n    work();\n}\n")
+                .expect("Rust syntax document");
+
+        document.apply_edit(16, 7, "if ready {\n        work();\n    }");
+
+        let expected = "fn main() {\n    if ready {\n        work();\n    }\n}\n";
+        assert!(document.source_matches(expected));
+        assert!(document.fold_ranges().contains(&(0, 4)));
+    }
+
+    #[test]
+    fn syntax_aware_bracket_matching_ignores_strings_and_comments() {
+        let source = "fn main() { let text = \"}\"; /* } */ work(); }";
+        let document =
+            SyntaxDocument::new(Some(Path::new("main.rs")), source).expect("Rust syntax document");
+        let opening = source.find('{').unwrap();
+        let closing = source.rfind('}').unwrap();
+
+        assert_eq!(document.matching_bracket(opening), Some(closing));
+        assert_eq!(
+            document.matching_bracket(source.find("\"}\"").unwrap() + 1),
+            None
+        );
+        assert!(document.indent_after(opening + 1));
+
+        let cursor = source.find("work").unwrap();
+        let inner = document.node_range_at(cursor, None).unwrap();
+        let outer = document.node_range_at(cursor, Some(inner)).unwrap();
+        assert!(outer.0 <= inner.0 && outer.1 >= inner.1);
+        assert_ne!(outer, inner);
     }
 
     #[test]

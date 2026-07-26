@@ -82,7 +82,7 @@ pub fn report(version: &str) -> String {
         |error| format!("invalid · {error}"),
     );
     format!(
-        "Caret diagnostic report\nversion: {version}\nos: {} {}\nterminal: {terminal}\nterminal color: {color}\nterminal capabilities: stdin_tty={} stdout_tty={} ansi={ansi} color={color_mode} ssh={ssh} tmux={tmux}\nshell: {shell}\nconfig: {} ({configuration})\nrecovery: {}\nlog: {}\nlsp stderr: structured records in log\nfilesystem background: explorer failures are recorded in log\nwatcher: not enabled in 0.6\npreview service: not enabled in 0.6\nclipboard: desktop={desktop_clipboard} osc52_fallback={osc52} internal=available",
+        "Caret diagnostic report\nversion: {version}\nos: {} {}\nterminal: {terminal}\nterminal color: {color}\nterminal capabilities: stdin_tty={} stdout_tty={} ansi={ansi} color={color_mode} ssh={ssh} tmux={tmux}\nshell: {shell}\nconfig: {} ({configuration})\nrecovery: {}\nlog: {}\nlsp stderr: structured records in log\nfilesystem background: cached lazy explorer scans and failures are recorded in log\nwatcher: native recursive Windows/macOS/Linux notifications; debounced targeted invalidation and overflow reconciliation\npreview service: provider-based bounded cancellable background previews\nclipboard: desktop={desktop_clipboard} osc52_fallback={osc52} internal=available",
         std::env::consts::OS,
         std::env::consts::ARCH,
         std::io::stdin().is_terminal(),

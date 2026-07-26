@@ -167,6 +167,7 @@ pub enum BackgroundState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LspStatus {
     Off,
+    Missing,
     Starting,
     Loading,
     Ready,
@@ -359,9 +360,13 @@ pub struct App {
     pub manager_conflicts: usize,
     pub manager_input_kind: Option<ManagerInputKind>,
     pub manager_input: String,
+    manager_bulk_rename_plan: Vec<(PathBuf, PathBuf)>,
     pub manager_context_menu: Option<(u16, u16)>,
     handled_manager_operation: u64,
     tree_filter_active: bool,
+    pub explorer_input_kind: Option<ExplorerInputKind>,
+    pub explorer_input: String,
+    pub explorer_input_parent: Option<PathBuf>,
     keys: KeyBindings,
     pub key_browser_input: String,
     pub key_browser_scroll: usize,
@@ -378,6 +383,7 @@ pub struct App {
     pub help_page: usize,
     help_return_mode: Mode,
     pub hover_target: Option<HoverTarget>,
+    pub explorer_hovered: Option<usize>,
     settings: Settings,
     plugins: PluginRegistry,
     active_custom_theme: Option<String>,
@@ -394,6 +400,10 @@ pub struct App {
     last_editor_click: Option<(Instant, Cursor)>,
     last_project_click: Option<(Instant, PathBuf)>,
     lsp: Option<LspClient>,
+    lsp_server_id: Option<&'static str>,
+    lsp_auto_disabled: bool,
+    lsp_attempted_path: Option<PathBuf>,
+    lsp_restart_count: u8,
     lsp_version: i64,
     lsp_requests: HashMap<u64, String>,
     lsp_format_requests: HashMap<u64, (PathBuf, String)>,
@@ -445,9 +455,17 @@ pub enum ManagerConfirmation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagerInputKind {
     Rename,
+    BulkRename,
     NewFile,
     NewDirectory,
     GoTo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplorerInputKind {
+    Rename,
+    NewFile,
+    NewDirectory,
 }
 
 impl App {
@@ -543,7 +561,12 @@ impl App {
         project.visible = sidebar_visible;
         project.width = settings.tree_width.clamp(22, 80);
         project.show_hidden = settings.show_hidden_files;
+        project.sort = settings.explorer_sort;
+        project.directories_first = settings.directories_first;
+        project.show_metadata = settings.explorer_metadata;
         let _ = project.refresh();
+        #[cfg(test)]
+        project.complete_pending_refresh_for_test()?;
         let mut file_manager = FileManager::new(project.root.clone())?;
         file_manager.configure(
             settings.show_hidden_files,
@@ -551,13 +574,28 @@ impl App {
             settings.manager_preview,
             settings.preview_max_bytes,
         );
+        let restore_file_manager = restored_session
+            .as_ref()
+            .and_then(|session| session.file_manager.as_ref())
+            .is_some_and(|state| state.active);
+        if let Some(state) = restored_session
+            .as_ref()
+            .and_then(|session| session.file_manager.as_ref())
+        {
+            file_manager.restore_session_state(state);
+        }
         let show_dashboard = path.is_none() && settings.startup == StartupView::Dashboard;
-        let mode = if show_dashboard {
+        let editor_mode = if show_dashboard {
             Mode::Dashboard
         } else if explorer_focused || settings.keymap == KeymapProfile::Vim {
             Mode::Normal
         } else {
             Mode::Insert
+        };
+        let mode = if restore_file_manager {
+            Mode::FileManager
+        } else {
+            editor_mode
         };
         let initial_theme = if std::env::var_os("NO_COLOR").is_some() {
             ThemeKind::Mono
@@ -608,15 +646,19 @@ impl App {
             project_search: ProjectSearchState::default(),
             file_picker: FilePickerState::default(),
             file_manager,
-            manager_return_mode: mode,
+            manager_return_mode: editor_mode,
             manager_filter_active: false,
             manager_confirmation: None,
             manager_conflicts: 0,
             manager_input_kind: None,
             manager_input: String::new(),
+            manager_bulk_rename_plan: Vec::new(),
             manager_context_menu: None,
             handled_manager_operation: 0,
             tree_filter_active: false,
+            explorer_input_kind: None,
+            explorer_input: String::new(),
+            explorer_input_parent: None,
             keys,
             key_browser_input: String::new(),
             key_browser_scroll: 0,
@@ -643,6 +685,7 @@ impl App {
             help_page: 0,
             help_return_mode: mode,
             hover_target: None,
+            explorer_hovered: None,
             settings,
             plugins,
             active_custom_theme: initial_custom_name.clone(),
@@ -659,6 +702,10 @@ impl App {
             last_editor_click: None,
             last_project_click: None,
             lsp: None,
+            lsp_server_id: None,
+            lsp_auto_disabled: false,
+            lsp_attempted_path: None,
+            lsp_restart_count: 0,
             lsp_version: 1,
             lsp_requests: HashMap::new(),
             lsp_format_requests: HashMap::new(),
@@ -769,6 +816,7 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: Event) -> bool {
+        self.ensure_lsp_for_active_document();
         self.poll_lsp();
         self.checkpoint_persistence();
         self.dispatch_event(event)
@@ -812,6 +860,10 @@ impl App {
                 secondary_active: split.secondary_active,
                 vertical: split.vertical,
             }),
+            file_manager: Some(
+                self.file_manager
+                    .session_state(self.mode == Mode::FileManager),
+            ),
         }
     }
 
@@ -1298,13 +1350,24 @@ impl App {
         } else {
             None
         };
-
-        if self.hover_target == target {
-            false
+        let explorer_hovered = if self.sidebar_view == SidebarView::Files
+            && layout.sidebar_width > 0
+            && usize::from(column) < layout.sidebar_width
+            && row >= layout.content_top
+            && usize::from(row) < usize::from(layout.content_top) + layout.content_height
+        {
+            let screen_row = usize::from(row - layout.content_top);
+            (screen_row > 0)
+                .then(|| self.project.scroll + screen_row - 1)
+                .filter(|index| *index < self.project.entries.len())
         } else {
-            self.hover_target = target;
-            true
-        }
+            None
+        };
+
+        let changed = self.hover_target != target || self.explorer_hovered != explorer_hovered;
+        self.hover_target = target;
+        self.explorer_hovered = explorer_hovered;
+        changed
     }
 
     fn open_context_menu(&mut self, column: u16, row: u16, width: u16, height: u16) {
@@ -1419,12 +1482,8 @@ impl App {
             ContextAction::Duplicate => {
                 self.begin_context_command("copy ", "Enter the duplicate file name")
             }
-            ContextAction::NewFile => {
-                self.begin_context_command("newfile ", "Enter the new file path")
-            }
-            ContextAction::NewFolder => {
-                self.begin_context_command("newdir ", "Enter the new folder path")
-            }
+            ContextAction::NewFile => self.begin_explorer_create(ExplorerInputKind::NewFile),
+            ContextAction::NewFolder => self.begin_explorer_create(ExplorerInputKind::NewDirectory),
             ContextAction::Stage => self.git_selected(true),
             ContextAction::Unstage => self.git_selected(false),
             ContextAction::SaveTab => self.save(),
@@ -1538,8 +1597,8 @@ impl App {
             }
             if screen_row == 0 {
                 match crate::ui::explorer_header_action_at(layout.sidebar_width, column as usize) {
-                    Some('+') => self.begin_context_command("newfile ", "Enter the new file path"),
-                    Some('D') => self.begin_context_command("newdir ", "Enter the new folder path"),
+                    Some('+') => self.begin_explorer_create(ExplorerInputKind::NewFile),
+                    Some('D') => self.begin_explorer_create(ExplorerInputKind::NewDirectory),
                     Some('R') => {
                         self.message = match self.project.refresh() {
                             Ok(()) => {
@@ -1857,6 +1916,9 @@ impl App {
         const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
         match self.lsp_status {
             LspStatus::Off => None,
+            LspStatus::Missing => {
+                Some(("LSP server missing".to_string(), BackgroundState::Warning))
+            }
             LspStatus::Starting => {
                 let slow = self
                     .lsp_started_at
@@ -2867,13 +2929,12 @@ impl App {
     }
 
     fn available_fold_ranges(&self) -> Vec<(usize, usize)> {
-        let language = Language::from_path(self.editor.path.as_deref());
-        crate::syntax::fold_ranges(&self.editor.text(), language)
+        self.editor.syntax_fold_ranges()
     }
 
     pub fn current_breadcrumbs(&self) -> String {
-        let language = Language::from_path(self.editor.path.as_deref());
-        crate::syntax::breadcrumbs(&self.editor.text(), language, self.editor.cursor.line)
+        self.editor
+            .syntax_breadcrumbs(self.editor.cursor.line)
             .into_iter()
             .map(|symbol| symbol.name)
             .collect::<Vec<_>>()
@@ -2881,13 +2942,11 @@ impl App {
     }
 
     pub fn outline_symbols(&self) -> Vec<crate::syntax::Symbol> {
-        let language = Language::from_path(self.editor.path.as_deref());
-        crate::syntax::symbols(&self.editor.text(), language)
+        self.editor.syntax_symbols()
     }
 
     fn show_symbols(&mut self) {
-        let language = Language::from_path(self.editor.path.as_deref());
-        let symbols = crate::syntax::symbols(&self.editor.text(), language);
+        let symbols = self.editor.syntax_symbols();
         self.message = if symbols.is_empty() {
             "No symbols in this file".to_string()
         } else {
@@ -2926,14 +2985,14 @@ impl App {
         true
     }
 
-    fn create_project_file(&mut self, value: &str) {
+    fn create_project_file(&mut self, value: &str) -> bool {
         let Some(path) = self.project_target_path(value) else {
             self.message = "Path must be inside the project".to_string();
-            return;
+            return false;
         };
         if path.exists() {
             self.message = "File already exists".to_string();
-            return;
+            return false;
         }
         match path
             .parent()
@@ -2945,40 +3004,48 @@ impl App {
                 let _ = self.project.refresh();
                 self.project.request_git_refresh();
                 self.message = format!("Created {}", path.display());
+                true
             }
-            Err(error) => self.message = format!("Create failed: {error}"),
+            Err(error) => {
+                self.message = format!("Create failed: {error}");
+                false
+            }
         }
     }
 
-    fn create_project_directory(&mut self, value: &str) {
+    fn create_project_directory(&mut self, value: &str) -> bool {
         let Some(path) = self.project_target_path(value) else {
             self.message = "Path must be inside the project".to_string();
-            return;
+            return false;
         };
         match crate::file_ops::create_directory(&path) {
             Ok(()) => {
                 let _ = self.project.refresh();
                 self.project.request_git_refresh();
                 self.message = format!("Created {}", path.display());
+                true
             }
-            Err(error) => self.message = format!("Create failed: {error}"),
+            Err(error) => {
+                self.message = format!("Create failed: {error}");
+                false
+            }
         }
     }
 
-    fn rename_selected_project_entry(&mut self, value: &str) {
+    fn rename_selected_project_entry(&mut self, value: &str) -> bool {
         let Some(source) = self.selected_project_path() else {
             self.message = "Select a file or folder first".to_string();
-            return;
+            return false;
         };
         if value.is_empty()
             || Path::new(value).file_name().and_then(|name| name.to_str()) != Some(value)
         {
             self.message = "Usage: :rename new-name".to_string();
-            return;
+            return false;
         }
         let Some(parent) = source.parent() else {
             self.message = "Cannot rename a filesystem root".to_string();
-            return;
+            return false;
         };
         let destination = parent.join(value);
         let same_entry = destination.exists()
@@ -2989,19 +3056,23 @@ impl App {
                 .is_some_and(|(source, destination)| source == destination);
         if destination.exists() && !same_entry {
             self.message = format!("Rename failed: {} already exists", destination.display());
-            return;
+            return false;
         }
         if self.block_operation_for_dirty_path(&source, "rename") {
-            return;
+            return false;
         }
-        match crate::file_ops::rename_without_replace(&source, &destination) {
+        match crate::file_ops::rename_safely(&source, &destination) {
             Ok(()) => {
                 self.synchronize_path_change(&source, &destination);
                 let _ = self.project.refresh();
                 self.project.request_git_refresh();
                 self.message = format!("Renamed to {}", destination.display());
+                true
             }
-            Err(error) => self.message = format!("Rename failed: {error}"),
+            Err(error) => {
+                self.message = format!("Rename failed: {error}");
+                false
+            }
         }
     }
 
@@ -3014,19 +3085,104 @@ impl App {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        let prefix = "rename ";
-        self.command_input = format!("{prefix}{name}");
-        let stem_end = name
-            .rfind('.')
-            .filter(|index| *index > 0)
-            .unwrap_or(name.len());
-        self.command_cursor = prefix.len() + stem_end;
-        self.command_selection = None;
-        self.command_anchor = None;
-        self.command_suggestion = 0;
-        self.command_suggestion_scroll = 0;
-        self.mode = Mode::Command;
-        self.message = "Type a new name, then press Enter".to_string();
+        self.explorer_input_kind = Some(ExplorerInputKind::Rename);
+        self.explorer_input = name.to_string();
+        self.explorer_input_parent = path.parent().map(Path::to_path_buf);
+        self.explorer_focused = true;
+        self.mode = Mode::Normal;
+        self.message = "Rename inline · Enter applies · Esc cancels".to_string();
+    }
+
+    fn begin_explorer_create(&mut self, kind: ExplorerInputKind) {
+        let parent = self
+            .project
+            .selected_entry()
+            .map(|entry| {
+                if entry.is_dir {
+                    entry.path.clone()
+                } else {
+                    entry
+                        .path
+                        .parent()
+                        .unwrap_or(&self.project.root)
+                        .to_path_buf()
+                }
+            })
+            .unwrap_or_else(|| self.project.root.clone());
+        self.explorer_input_kind = Some(kind);
+        self.explorer_input.clear();
+        self.explorer_input_parent = Some(parent);
+        self.explorer_focused = true;
+        self.mode = Mode::Normal;
+        self.message = match kind {
+            ExplorerInputKind::NewFile => {
+                "New file inline · Enter creates · Esc cancels".to_string()
+            }
+            ExplorerInputKind::NewDirectory => {
+                "New folder inline · Enter creates · Esc cancels".to_string()
+            }
+            ExplorerInputKind::Rename => unreachable!(),
+        };
+    }
+
+    fn handle_explorer_input(&mut self, key: KeyEvent) {
+        let Some(kind) = self.explorer_input_kind else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.explorer_input_kind = None;
+                self.explorer_input.clear();
+                self.explorer_input_parent = None;
+                self.message = "Inline edit cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                let value = self.explorer_input.trim().to_string();
+                if value.is_empty()
+                    || Path::new(&value).file_name().and_then(|name| name.to_str())
+                        != Some(value.as_str())
+                {
+                    self.message =
+                        "Enter one file or folder name without path separators".to_string();
+                    return;
+                }
+                let succeeded = match kind {
+                    ExplorerInputKind::Rename => self.rename_selected_project_entry(&value),
+                    ExplorerInputKind::NewFile | ExplorerInputKind::NewDirectory => {
+                        let Some(parent) = self.explorer_input_parent.clone() else {
+                            self.message = "The target folder is no longer available".to_string();
+                            return;
+                        };
+                        let destination = parent.join(&value);
+                        let destination = destination.to_string_lossy();
+                        if kind == ExplorerInputKind::NewFile {
+                            self.create_project_file(&destination)
+                        } else {
+                            self.create_project_directory(&destination)
+                        }
+                    }
+                };
+                if succeeded {
+                    self.explorer_input_kind = None;
+                    self.explorer_input.clear();
+                    self.explorer_input_parent = None;
+                }
+            }
+            KeyCode::Backspace => {
+                self.explorer_input.pop();
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.explorer_input.clear();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.explorer_input.push(character);
+            }
+            _ => {}
+        }
     }
 
     fn replace_command_selection(&mut self) {
@@ -3562,6 +3718,7 @@ impl App {
         self.manager_conflicts = 0;
         self.manager_input_kind = None;
         self.manager_input.clear();
+        self.manager_bulk_rename_plan.clear();
         self.manager_context_menu = None;
         if !self
             .file_manager
@@ -3643,10 +3800,12 @@ impl App {
                 KeyCode::Esc => {
                     self.manager_input_kind = None;
                     self.manager_input.clear();
+                    self.manager_bulk_rename_plan.clear();
                     self.message = "File-manager input cancelled".to_string();
                 }
                 KeyCode::Enter => self.apply_manager_input(kind),
                 KeyCode::Backspace => {
+                    self.manager_bulk_rename_plan.clear();
                     self.manager_input.pop();
                 }
                 KeyCode::Char(character)
@@ -3654,6 +3813,7 @@ impl App {
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
+                    self.manager_bulk_rename_plan.clear();
                     self.manager_input.push(character);
                 }
                 _ => {}
@@ -3833,7 +3993,15 @@ impl App {
                     "No failed filesystem items to retry".to_string()
                 };
             }
+            KeyCode::Char('z') => {
+                self.message = if self.file_manager.undo_last_operation() {
+                    "Undoing the last safe filesystem operation…".to_string()
+                } else {
+                    "No safe filesystem operation is available to undo".to_string()
+                };
+            }
             KeyCode::F(2) => self.begin_manager_input(ManagerInputKind::Rename),
+            KeyCode::Char('b') => self.begin_manager_input(ManagerInputKind::BulkRename),
             KeyCode::Char('n') => self.begin_manager_input(ManagerInputKind::NewFile),
             KeyCode::Char('N') => self.begin_manager_input(ManagerInputKind::NewDirectory),
             KeyCode::Char('g') => self.begin_manager_input(ManagerInputKind::GoTo),
@@ -3939,6 +4107,7 @@ impl App {
 
     fn begin_manager_input(&mut self, kind: ManagerInputKind) {
         self.manager_input_kind = Some(kind);
+        self.manager_bulk_rename_plan.clear();
         self.manager_input = match kind {
             ManagerInputKind::Rename => self
                 .file_manager
@@ -3946,10 +4115,15 @@ impl App {
                 .map(|entry| entry.name.clone())
                 .unwrap_or_default(),
             ManagerInputKind::GoTo => self.file_manager.current_dir.display().to_string(),
-            ManagerInputKind::NewFile | ManagerInputKind::NewDirectory => String::new(),
+            ManagerInputKind::BulkRename
+            | ManagerInputKind::NewFile
+            | ManagerInputKind::NewDirectory => String::new(),
         };
         self.message = match kind {
             ManagerInputKind::Rename => "Rename selected item",
+            ManagerInputKind::BulkRename => {
+                "Bulk rename pattern: {name}, {ext}, {n} · Enter previews"
+            }
             ManagerInputKind::NewFile => "Create file in current directory",
             ManagerInputKind::NewDirectory => "Create directory in current directory",
             ManagerInputKind::GoTo => "Go to directory",
@@ -3961,6 +4135,46 @@ impl App {
         let value = self.manager_input.trim().to_string();
         if value.is_empty() {
             self.message = "A name or path is required".to_string();
+            return;
+        }
+        if kind == ManagerInputKind::BulkRename {
+            if !self.manager_bulk_rename_plan.is_empty() {
+                if self.manager_selection_has_dirty_buffer() {
+                    self.message =
+                        "Save or close dirty buffers before bulk renaming their files".to_string();
+                    return;
+                }
+                let pairs = std::mem::take(&mut self.manager_bulk_rename_plan);
+                if self.file_manager.bulk_rename(pairs) {
+                    self.manager_input_kind = None;
+                    self.manager_input.clear();
+                    self.message = "Bulk rename running in the background…".to_string();
+                } else {
+                    self.message = "Bulk rename could not start".to_string();
+                }
+                return;
+            }
+            match self.build_bulk_rename_plan(&value) {
+                Ok(plan) => {
+                    let first = plan.first().map(|(source, destination)| {
+                        format!(
+                            "{} → {}",
+                            source.file_name().unwrap_or_default().to_string_lossy(),
+                            destination
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                        )
+                    });
+                    self.message = format!(
+                        "Rename {} item(s){} · Enter confirms · edit or Esc cancels",
+                        plan.len(),
+                        first.map_or_else(String::new, |first| format!(" · {first}"))
+                    );
+                    self.manager_bulk_rename_plan = plan;
+                }
+                Err(message) => self.message = message,
+            }
             return;
         }
         let result = match kind {
@@ -3989,11 +4203,12 @@ impl App {
                         format!("{} already exists", destination.display()),
                     ))
                 } else {
-                    fs::rename(&source, &destination).map(|()| {
+                    crate::file_ops::rename_safely(&source, &destination).map(|()| {
                         self.synchronize_path_change(&source, &destination);
                     })
                 }
             }
+            ManagerInputKind::BulkRename => unreachable!(),
             ManagerInputKind::NewFile => {
                 let path = self.file_manager.current_dir.join(&value);
                 if path.exists() {
@@ -4044,6 +4259,58 @@ impl App {
             }
             Err(error) => self.message = format!("Filesystem change failed: {error}"),
         }
+    }
+
+    fn build_bulk_rename_plan(&self, pattern: &str) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+        let sources = self.file_manager.selected_or_cursor_paths();
+        if sources.len() < 2 {
+            return Err("Select at least two items before bulk rename".to_string());
+        }
+        let mut destinations = std::collections::HashSet::new();
+        let mut plan = Vec::new();
+        for (index, source) in sources.into_iter().enumerate() {
+            let name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("{} has no Unicode file name", source.display()))?;
+            let stem = Path::new(name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or(name);
+            let extension = Path::new(name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("");
+            let next = pattern
+                .replace("{name}", stem)
+                .replace("{ext}", extension)
+                .replace("{n}", &(index + 1).to_string());
+            if next.is_empty()
+                || Path::new(&next).file_name().and_then(|name| name.to_str())
+                    != Some(next.as_str())
+            {
+                return Err(format!("Invalid generated file name: {next:?}"));
+            }
+            let destination = source
+                .parent()
+                .unwrap_or(&self.file_manager.current_dir)
+                .join(next);
+            let key = if cfg!(windows) {
+                destination.to_string_lossy().to_lowercase()
+            } else {
+                destination.to_string_lossy().into_owned()
+            };
+            if !destinations.insert(key) {
+                return Err("Pattern generates duplicate names; include {name} or {n}".to_string());
+            }
+            if source != destination {
+                plan.push((source, destination));
+            }
+        }
+        if plan.is_empty() {
+            return Err("Pattern does not change any selected name".to_string());
+        }
+        Ok(plan)
     }
 
     fn activate_manager_entry(&mut self) {
@@ -4160,6 +4427,10 @@ impl App {
     }
 
     fn handle_explorer(&mut self, key: KeyEvent) {
+        if self.explorer_input_kind.is_some() {
+            self.handle_explorer_input(key);
+            return;
+        }
         // Ctrl shortcuts were already offered to the global registry; swallow
         // the rest so plain-letter tree bindings never fire with Ctrl held.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -4325,12 +4596,8 @@ impl App {
                 Err(error) => self.message = format!("Refresh failed: {error}"),
             },
             KeyCode::F(2) => self.begin_rename_selected(),
-            KeyCode::Char('n') => {
-                self.command_input = "newfile ".to_string();
-                self.command_suggestion = 0;
-                self.command_suggestion_scroll = 0;
-                self.mode = Mode::Command;
-            }
+            KeyCode::Char('n') => self.begin_explorer_create(ExplorerInputKind::NewFile),
+            KeyCode::Char('N') => self.begin_explorer_create(ExplorerInputKind::NewDirectory),
             KeyCode::Delete => self.delete_selected_project_entry(false),
             KeyCode::Char('s') => self.git_selected(true),
             KeyCode::Char('u') => self.git_selected(false),
@@ -5774,14 +6041,22 @@ impl App {
         ("foldall", "Fold everything", Some(KeyAction::FoldAll)),
         ("unfoldall", "Unfold everything", Some(KeyAction::UnfoldAll)),
         ("format", "Format the document", None),
-        ("lsp", "Start the language server", None),
+        ("lsp", "Start or re-enable the language server", None),
         ("lspstop", "Stop the language server", None),
+        ("lsprestart", "Restart the language server", None),
         (
             "complete",
             "Filter and insert completions",
             Some(KeyAction::Complete),
         ),
         ("hover", "Show type and documentation", None),
+        ("signature", "Show signature help", None),
+        (
+            "lspsymbols",
+            "Browse language-server document symbols",
+            None,
+        ),
+        ("rangeformat", "Format the selected range", None),
         (
             "definition",
             "Go to definition",
@@ -5798,6 +6073,7 @@ impl App {
             Some(KeyAction::CodeActions),
         ),
         ("diagnostics", "Browse errors and warnings", None),
+        ("problems", "Browse workspace problems", None),
         ("symbolrename", "Rename a symbol workspace-wide", None),
         ("find", "Find in the current file", Some(KeyAction::Find)),
         (
@@ -5827,6 +6103,7 @@ impl App {
             "Select every occurrence",
             Some(KeyAction::SelectOccurrences),
         ),
+        ("selectnode", "Select or expand the syntax node", None),
         (
             "addcursorabove",
             "Add a cursor on the line above",
@@ -6137,7 +6414,9 @@ impl App {
                     self.create_project_directory(&argument);
                 }
             }
-            "rename" => self.rename_selected_project_entry(&argument),
+            "rename" => {
+                self.rename_selected_project_entry(&argument);
+            }
             "copy" => self.duplicate_selected_project_file(&argument),
             "move" => {
                 if argument.is_empty() {
@@ -6246,6 +6525,13 @@ impl App {
                     format!("Selected {count} occurrences · type to replace them all")
                 } else {
                     "Select or place the cursor on a word first".to_string()
+                };
+            }
+            "selectnode" | "expandselection" => {
+                self.message = if self.editor.select_syntax_node() {
+                    "Selected syntax node · repeat to expand".to_string()
+                } else {
+                    "No larger syntax node at the cursor".to_string()
                 };
             }
             "addcursorabove" => self.add_cursor_line(false),
@@ -6446,18 +6732,24 @@ impl App {
             },
             "lsp" => self.start_lsp(),
             "lspstop" => {
-                self.lsp = None;
-                self.lsp_status = LspStatus::Off;
-                self.lsp_started_at = None;
-                self.diagnostic_count = 0;
+                self.stop_lsp(true);
                 self.message = "LSP stopped".to_string();
             }
+            "lsprestart" | "restartlsp" => {
+                self.stop_lsp(false);
+                self.lsp_attempted_path = None;
+                self.start_lsp();
+            }
             "hover" => self.request_hover(),
+            "signature" | "signaturehelp" => {
+                self.request_lsp_position("textDocument/signatureHelp")
+            }
+            "lspsymbols" | "documentsymbols" => self.request_lsp_document_symbols(),
             "complete" => self.request_lsp_position("textDocument/completion"),
             "definition" | "def" => self.request_lsp_position("textDocument/definition"),
             "references" | "refs" => self.request_lsp_position("textDocument/references"),
             "actions" => self.request_lsp_position("textDocument/codeAction"),
-            "diagnostics" => self.open_diagnostics_panel(),
+            "diagnostics" | "problems" => self.open_diagnostics_panel(),
             "symbolrename" | "lsprename" => {
                 if argument.is_empty() {
                     self.message =
@@ -6467,6 +6759,7 @@ impl App {
                 }
             }
             "format" => self.request_formatting(),
+            "rangeformat" | "formatselection" => self.request_range_formatting(),
             "help" | "h" => self.open_help(),
             _ => self.message = format!("Unknown command: {command}"),
         }
@@ -6608,7 +6901,38 @@ impl App {
     }
 
     fn start_lsp(&mut self) {
-        self.lsp = None;
+        self.lsp_auto_disabled = false;
+        self.lsp_attempted_path = None;
+        self.lsp_restart_count = 0;
+        self.start_lsp_for_active_document(false);
+    }
+
+    fn ensure_lsp_for_active_document(&mut self) {
+        if self.lsp_auto_disabled {
+            return;
+        }
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let Some(server) = lsp::server_for_extension(&path) else {
+            if self.lsp.is_some() {
+                self.stop_lsp(false);
+            }
+            return;
+        };
+        if self.lsp.is_some() && self.lsp_server_id == Some(server.id) {
+            return;
+        }
+        if self.lsp_server_id.is_some_and(|id| id != server.id) {
+            self.stop_lsp(false);
+        }
+        if self.lsp_attempted_path.as_ref() == Some(&path) {
+            return;
+        }
+        self.start_lsp_for_active_document(true);
+    }
+
+    fn start_lsp_for_active_document(&mut self, automatic: bool) {
         self.lsp_requests.clear();
         self.lsp_format_requests.clear();
         self.lsp_panel = None;
@@ -6617,15 +6941,29 @@ impl App {
         self.diagnostics.clear();
         self.lsp_open_path = None;
         let Some(path) = self.editor.path.clone() else {
-            self.message = "Save the buffer before starting LSP".to_string();
+            if !automatic {
+                self.message = "Save the buffer before starting LSP".to_string();
+            }
             return;
         };
         let Some(server) = lsp::server_for_extension(&path) else {
-            self.message = "No built-in LSP server for this file type".to_string();
+            if !automatic {
+                self.message = "No language server is configured for this file type".to_string();
+            }
             return;
         };
+        self.lsp_attempted_path = Some(path.clone());
+        self.lsp_server_id = Some(server.id);
+        if !lsp::executable_available(server.command) {
+            self.lsp_status = LspStatus::Missing;
+            self.message = format!(
+                "{} was not found on PATH. {}",
+                server.command, server.install_guidance
+            );
+            return;
+        }
         let root = lsp_workspace_root(&path).unwrap_or_else(|| self.project.root.clone());
-        match LspClient::start(server, &root) {
+        match LspClient::start_server(server, &root) {
             Ok(client) => {
                 self.lsp = Some(client);
                 self.lsp_status = LspStatus::Starting;
@@ -6637,13 +6975,33 @@ impl App {
                 // position and formatting requests, so never block on it.
                 self.lsp_workspace_ready = true;
                 self.lsp_last_text.clear();
-                self.message = format!("Starting LSP: {server}");
+                self.message = format!("Starting LSP: {}", server.id);
             }
             Err(error) => {
                 self.lsp_status = LspStatus::Error;
-                self.message = format!("Could not start {server}: {error}");
+                self.message = format!(
+                    "Could not start {}: {error}. {}",
+                    server.id, server.install_guidance
+                );
             }
         }
+    }
+
+    fn stop_lsp(&mut self, disable_auto: bool) {
+        if let Some(mut client) = self.lsp.take() {
+            client.stop_gracefully();
+        }
+        self.lsp_server_id = None;
+        self.lsp_auto_disabled = disable_auto;
+        self.lsp_initialized = false;
+        self.lsp_workspace_ready = false;
+        self.lsp_status = LspStatus::Off;
+        self.lsp_started_at = None;
+        self.lsp_open_path = None;
+        self.lsp_requests.clear();
+        self.lsp_format_requests.clear();
+        self.diagnostic_count = 0;
+        self.diagnostics.clear();
     }
 
     fn handle_lsp_panel_key(&mut self, key: KeyEvent) {
@@ -6718,7 +7076,7 @@ impl App {
             })
             .collect();
         self.lsp_panel = Some(LspPanel {
-            title: format!("Diagnostics ({})", self.diagnostics.len()),
+            title: format!("Problems ({})", self.diagnostics.len()),
             items,
             selected: 0,
             kind: LspPanelKind::Diagnostics,
@@ -6968,15 +7326,16 @@ impl App {
         if text == self.lsp_last_text {
             return;
         }
+        let change = lsp_incremental_change(&self.lsp_last_text, &text);
         self.lsp_version += 1;
         let _ = lsp.notify(
             "textDocument/didChange",
             json!({
                 "textDocument": { "uri": lsp::file_uri(path), "version": self.lsp_version },
-                "contentChanges": [{ "text": text }]
+                "contentChanges": [change]
             }),
         );
-        self.lsp_last_text = self.editor.text();
+        self.lsp_last_text = text;
     }
 
     fn sync_lsp_active_file(&mut self) {
@@ -7049,6 +7408,71 @@ impl App {
         }
     }
 
+    fn request_lsp_document_symbols(&mut self) {
+        if !self.lsp_initialized {
+            self.message = "Language server is not ready yet".to_string();
+            return;
+        }
+        let Some(path) = self.editor.path.as_ref() else {
+            self.message = "Save the buffer before requesting symbols".to_string();
+            return;
+        };
+        let params = json!({ "textDocument": { "uri": lsp::file_uri(path) } });
+        match self
+            .lsp
+            .as_mut()
+            .and_then(|client| client.request("textDocument/documentSymbol", params).ok())
+        {
+            Some(id) => {
+                self.lsp_requests
+                    .insert(id, "textDocument/documentSymbol".to_string());
+                self.message = "Document symbols requested".to_string();
+            }
+            None => self.message = "Document symbol request failed".to_string(),
+        }
+    }
+
+    fn request_range_formatting(&mut self) {
+        if !self.lsp_initialized {
+            self.message = "Language server is not ready yet".to_string();
+            return;
+        }
+        let Some((start, end)) = self.editor.selection_range() else {
+            self.message = "Select text before formatting a range".to_string();
+            return;
+        };
+        let Some(path) = self.editor.path.clone() else {
+            self.message = "Save the buffer before formatting".to_string();
+            return;
+        };
+        let requested_text = self.editor.text();
+        let start_byte = char_index_to_byte(&requested_text, start);
+        let end_byte = char_index_to_byte(&requested_text, end);
+        let (start_line, start_character) = lsp_position_at_byte(&requested_text, start_byte);
+        let (end_line, end_character) = lsp_position_at_byte(&requested_text, end_byte);
+        let params = json!({
+            "textDocument": { "uri": lsp::file_uri(&path) },
+            "range": {
+                "start": { "line": start_line, "character": start_character },
+                "end": { "line": end_line, "character": end_character }
+            },
+            "options": { "tabSize": self.editor.tab_width, "insertSpaces": true }
+        });
+        match self
+            .lsp
+            .as_mut()
+            .and_then(|client| client.request("textDocument/rangeFormatting", params).ok())
+        {
+            Some(id) => {
+                self.lsp_requests
+                    .insert(id, "textDocument/rangeFormatting".to_string());
+                self.lsp_format_requests.insert(id, (path, requested_text));
+                self.message = "Selection formatting requested".to_string();
+            }
+            None => self.message = "Selection formatting request failed".to_string(),
+        }
+    }
+
     fn request_formatting(&mut self) {
         if !self.lsp_initialized {
             self.message = "Start LSP first with :lsp and wait until it is ready".to_string();
@@ -7086,6 +7510,32 @@ impl App {
     }
 
     fn poll_lsp(&mut self) {
+        let process_state = self
+            .lsp
+            .as_mut()
+            .and_then(|client| match client.try_wait() {
+                Ok(Some(status)) => Some(format!("language server exited with {status}")),
+                Ok(None) => None,
+                Err(error) => Some(format!("could not inspect language server: {error}")),
+            });
+        if let Some(reason) = process_state {
+            self.lsp = None;
+            self.lsp_initialized = false;
+            self.lsp_workspace_ready = false;
+            self.lsp_open_path = None;
+            self.lsp_requests.clear();
+            self.lsp_format_requests.clear();
+            if !self.lsp_auto_disabled && self.lsp_restart_count < 3 {
+                self.lsp_restart_count += 1;
+                self.lsp_attempted_path = None;
+                self.lsp_status = LspStatus::Starting;
+                self.message = format!("{reason}; restarting LSP ({}/3)", self.lsp_restart_count);
+            } else {
+                self.lsp_status = LspStatus::Error;
+                self.message = format!("{reason}; automatic restart limit reached");
+            }
+            return;
+        }
         let Some(lsp) = &self.lsp else {
             return;
         };
@@ -7170,6 +7620,7 @@ impl App {
             let language_id = lsp_language_id(crate::syntax::Language::from_path(Some(path)));
             if lsp.notify("textDocument/didOpen", json!({ "textDocument": { "uri": lsp::file_uri(path), "languageId": language_id, "version": 1, "text": self.editor.text() } })).is_ok() {
                 self.lsp_initialized = true;
+                self.lsp_restart_count = 0;
                 self.lsp_status = LspStatus::Ready;
                 self.lsp_last_text = self.editor.text();
                 self.lsp_open_path = Some(path.clone());
@@ -7248,6 +7699,67 @@ impl App {
             }
             return;
         }
+        if request.as_deref() == Some("textDocument/signatureHelp") {
+            let items = message["result"]["signatures"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|signature| LspPanelItem {
+                    label: signature["label"]
+                        .as_str()
+                        .unwrap_or("signature")
+                        .to_string(),
+                    detail: signature["documentation"]["value"]
+                        .as_str()
+                        .or_else(|| signature["documentation"].as_str())
+                        .unwrap_or_default()
+                        .replace('\n', " "),
+                    payload: Value::Null,
+                })
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                self.message = "No signature help at cursor".to_string();
+            } else {
+                self.lsp_panel = Some(LspPanel {
+                    title: "Signature Help".to_string(),
+                    items,
+                    selected: 0,
+                    kind: LspPanelKind::Hover,
+                });
+                self.message = "Esc closes signature help".to_string();
+            }
+            return;
+        }
+        if request.as_deref() == Some("textDocument/documentSymbol") {
+            let uri = self
+                .editor
+                .path
+                .as_deref()
+                .map(lsp::file_uri)
+                .unwrap_or_default();
+            let mut items = Vec::new();
+            collect_lsp_document_symbols(
+                message["result"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &uri,
+                0,
+                &mut items,
+            );
+            if items.is_empty() {
+                self.message = "No document symbols reported".to_string();
+            } else {
+                self.lsp_panel = Some(LspPanel {
+                    title: format!("Document Symbols ({})", items.len()),
+                    items,
+                    selected: 0,
+                    kind: LspPanelKind::Locations,
+                });
+                self.message = "↑↓ select · Enter jumps · Esc closes".to_string();
+            }
+            return;
+        }
         if request.as_deref() == Some("textDocument/references") {
             let values = message["result"].as_array().cloned().unwrap_or_default();
             let items = values
@@ -7314,7 +7826,10 @@ impl App {
             }
             return;
         }
-        if request.as_deref() == Some("textDocument/formatting") {
+        if matches!(
+            request.as_deref(),
+            Some("textDocument/formatting" | "textDocument/rangeFormatting")
+        ) {
             let Some((path, requested_text)) = format_request else {
                 self.message = "Formatting response had no document context".to_string();
                 return;
@@ -7702,6 +8217,38 @@ fn parse_diff_range(value: &str, prefix: char) -> Option<(usize, usize)> {
     Some((start.parse().ok()?, count.parse().ok()?))
 }
 
+fn collect_lsp_document_symbols(
+    symbols: &[Value],
+    document_uri: &str,
+    depth: usize,
+    items: &mut Vec<LspPanelItem>,
+) {
+    for symbol in symbols {
+        let location = symbol.get("location").cloned().unwrap_or_else(|| {
+            json!({
+                "uri": document_uri,
+                "range": symbol
+                    .get("selectionRange")
+                    .or_else(|| symbol.get("range"))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            })
+        });
+        items.push(LspPanelItem {
+            label: format!(
+                "{}{}",
+                "  ".repeat(depth.min(8)),
+                symbol["name"].as_str().unwrap_or("symbol")
+            ),
+            detail: symbol["detail"].as_str().unwrap_or_default().to_string(),
+            payload: location,
+        });
+        if let Some(children) = symbol["children"].as_array() {
+            collect_lsp_document_symbols(children, document_uri, depth + 1, items);
+        }
+    }
+}
+
 fn lsp_workspace_root(path: &Path) -> Option<PathBuf> {
     let mut directory = path.parent()?.to_path_buf();
     let mut project_root = None;
@@ -7919,12 +8466,63 @@ fn lexically_normalized_path(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
+fn lsp_incremental_change(previous: &str, current: &str) -> Value {
+    let mut prefix = 0usize;
+    for (left, right) in previous.chars().zip(current.chars()) {
+        if left != right {
+            break;
+        }
+        prefix += left.len_utf8();
+    }
+
+    let remaining_previous = previous.len().saturating_sub(prefix);
+    let remaining_current = current.len().saturating_sub(prefix);
+    let mut suffix = 0usize;
+    for (left, right) in previous[prefix..]
+        .chars()
+        .rev()
+        .zip(current[prefix..].chars().rev())
+    {
+        if left != right || suffix + left.len_utf8() > remaining_previous.min(remaining_current) {
+            break;
+        }
+        suffix += left.len_utf8();
+    }
+
+    let previous_end = previous.len().saturating_sub(suffix);
+    let current_end = current.len().saturating_sub(suffix);
+    let (start_line, start_character) = lsp_position_at_byte(previous, prefix);
+    let (end_line, end_character) = lsp_position_at_byte(previous, previous_end);
+    json!({
+        "range": {
+            "start": { "line": start_line, "character": start_character },
+            "end": { "line": end_line, "character": end_character }
+        },
+        "text": &current[prefix..current_end]
+    })
+}
+
+fn lsp_position_at_byte(text: &str, byte_offset: usize) -> (usize, usize) {
+    let prefix = &text[..byte_offset.min(text.len())];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+    let line_text = prefix.rsplit_once('\n').map_or(prefix, |(_, line)| line);
+    (line, line_text.encode_utf16().count())
+}
+
+fn char_index_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(offset, _)| offset)
+}
+
 fn lsp_language_id(language: crate::syntax::Language) -> &'static str {
     match language {
         crate::syntax::Language::CSharp => "csharp",
         crate::syntax::Language::Go => "go",
         crate::syntax::Language::Rust => "rust",
         crate::syntax::Language::Python => "python",
+        crate::syntax::Language::JavaScript => "javascript",
+        crate::syntax::Language::TypeScript => "typescript",
         crate::syntax::Language::Json => "json",
         crate::syntax::Language::Yaml => "yaml",
         crate::syntax::Language::Toml => "toml",
@@ -8396,11 +8994,13 @@ mod tests {
 
         let mut app = App::new(None).expect("create app");
         app.project.set_root(root.clone()).expect("set root");
+        app.project.complete_pending_refresh_for_test().unwrap();
         app.explorer_focused = true;
         app.mode = Mode::Normal;
 
         app.handle_key(key('/'));
         type_text(&mut app, "target");
+        app.project.complete_pending_refresh_for_test().unwrap();
         assert_eq!(app.project.entries.len(), 1);
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app
@@ -8460,7 +9060,7 @@ mod tests {
         assert_eq!(app.mode, Mode::SettingsBrowser);
 
         let all = app.setting_rows();
-        assert_eq!(all.len(), 25);
+        assert_eq!(all.len(), 27);
 
         type_text(&mut app, "undo");
         let filtered = app.setting_rows();
@@ -8824,6 +9424,21 @@ mod tests {
     }
 
     #[test]
+    fn incremental_lsp_changes_use_minimal_utf16_ranges() {
+        let change = lsp_incremental_change("let value = \"😀\";\n", "let result = \"😀!\";\n");
+        assert_eq!(change["range"]["start"]["line"], 0);
+        assert_eq!(change["range"]["start"]["character"], 4);
+        assert_eq!(change["range"]["end"]["line"], 0);
+        assert_eq!(change["range"]["end"]["character"], 15);
+        assert_eq!(change["text"], "result = \"😀!");
+
+        let insertion = lsp_incremental_change("😀x", "😀yx");
+        assert_eq!(insertion["range"]["start"]["character"], 2);
+        assert_eq!(insertion["range"]["end"]["character"], 2);
+        assert_eq!(insertion["text"], "y");
+    }
+
+    #[test]
     fn applies_lsp_edits_from_the_end_and_expands_snippets() {
         let edits = vec![
             json!({ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }, "newText": "A" }),
@@ -8958,6 +9573,50 @@ mod tests {
         assert!(app
             .project_target_path(&root.join("../outside.txt").display().to_string())
             .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explorer_create_and_rename_use_inline_fields() {
+        let root = std::env::temp_dir().join(format!("caret-inline-tree-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("old.txt"), "content").unwrap();
+        let mut app = App::new(None).expect("create app");
+        app.project.set_root(root.clone()).unwrap();
+        app.project.complete_pending_refresh_for_test().unwrap();
+        app.project.selected = app
+            .project
+            .entries
+            .iter()
+            .position(|entry| entry.name == "old.txt")
+            .unwrap();
+
+        app.begin_rename_selected();
+        assert_eq!(app.explorer_input_kind, Some(ExplorerInputKind::Rename));
+        assert_eq!(app.mode, Mode::Normal);
+        app.handle_explorer_input(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        for character in "renamed.txt".chars() {
+            app.handle_explorer_input(key(character));
+        }
+        app.handle_explorer_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(root.join("renamed.txt").is_file());
+        assert!(app.explorer_input_kind.is_none());
+
+        app.project.complete_pending_refresh_for_test().unwrap();
+        app.project.selected = app
+            .project
+            .entries
+            .iter()
+            .position(|entry| entry.name == "src")
+            .unwrap();
+        app.begin_explorer_create(ExplorerInputKind::NewFile);
+        for character in "main.rs".chars() {
+            app.handle_explorer_input(key(character));
+        }
+        app.handle_explorer_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(root.join("src/main.rs").is_file());
+        assert!(app.explorer_input_kind.is_none());
         let _ = fs::remove_dir_all(root);
     }
 

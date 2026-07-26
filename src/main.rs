@@ -12,6 +12,7 @@ mod keys;
 mod lsp;
 mod platform;
 mod plugin;
+mod preview;
 mod project;
 mod project_search;
 mod recovery;

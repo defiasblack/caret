@@ -5,7 +5,11 @@ use std::{
     time::SystemTime,
 };
 
-use crate::document::{self, FileFormat, FinalNewline, LineEnding};
+use crate::{
+    document::{self, FileFormat, FinalNewline, LineEnding},
+    syntax::{self, SyntaxDocument},
+    theme::Theme,
+};
 use ropey::Rope;
 use unicode_width::UnicodeWidthChar;
 
@@ -90,6 +94,7 @@ pub struct SecondaryCursor {
 
 pub struct Editor {
     buffer: Rope,
+    syntax: Option<SyntaxDocument>,
     pub path: Option<PathBuf>,
     pub cursor: Cursor,
     pub selection_anchor: Option<Cursor>,
@@ -121,6 +126,7 @@ impl Editor {
             Some(path) if path.exists() => Self::from_file(path),
             Some(path) => Ok(Self {
                 buffer: Rope::new(),
+                syntax: SyntaxDocument::new(Some(path), ""),
                 path: Some(path.to_path_buf()),
                 cursor: Cursor::default(),
                 selection_anchor: None,
@@ -156,6 +162,7 @@ impl Editor {
     pub fn blank() -> Self {
         Self {
             buffer: Rope::new(),
+            syntax: None,
             path: None,
             cursor: Cursor::default(),
             selection_anchor: None,
@@ -190,6 +197,7 @@ impl Editor {
         let (contents, format) = document::read_text(path)?;
         Ok(Self {
             buffer: Rope::from_str(&contents),
+            syntax: SyntaxDocument::new(Some(path), &contents),
             path: Some(path.to_path_buf()),
             cursor: Cursor::default(),
             selection_anchor: None,
@@ -309,6 +317,14 @@ impl Editor {
         }
 
         self.path = Some(path.to_path_buf());
+        let source = self.buffer.to_string();
+        if self
+            .syntax
+            .as_ref()
+            .is_none_or(|syntax| syntax.language() != syntax::Language::from_path(Some(path)))
+        {
+            self.syntax = SyntaxDocument::new(Some(path), &source);
+        }
         self.dirty = false;
         self.disk_modified = fs::metadata(path)
             .and_then(|metadata| metadata.modified())
@@ -474,6 +490,12 @@ impl Editor {
         let end = at
             .saturating_add(removed_chars)
             .min(self.buffer.len_chars());
+        if end == at && inserted.is_empty() {
+            return;
+        }
+        if let Some(syntax) = self.syntax.as_mut() {
+            syntax.apply_edit(at, end - at, inserted);
+        }
         let removed = if end > at {
             let text = self.buffer.slice(at..end).to_string();
             self.buffer.remove(at..end);
@@ -483,9 +505,6 @@ impl Editor {
         };
         if !inserted.is_empty() {
             self.buffer.insert(at, inserted);
-        }
-        if removed.is_empty() && inserted.is_empty() {
-            return;
         }
         self.dirty = true;
         if let Some(transaction) = self.open_transaction.as_mut() {
@@ -554,6 +573,9 @@ impl Editor {
 
         for op in transaction.ops.iter().rev() {
             let inserted_chars = op.inserted.chars().count();
+            if let Some(syntax) = self.syntax.as_mut() {
+                syntax.apply_edit(op.at, inserted_chars, &op.removed);
+            }
             if inserted_chars > 0 {
                 self.buffer.remove(op.at..op.at + inserted_chars);
             }
@@ -577,6 +599,9 @@ impl Editor {
 
         for op in &transaction.ops {
             let removed_chars = op.removed.chars().count();
+            if let Some(syntax) = self.syntax.as_mut() {
+                syntax.apply_edit(op.at, removed_chars, &op.inserted);
+            }
             if removed_chars > 0 {
                 self.buffer.remove(op.at..op.at + removed_chars);
             }
@@ -590,6 +615,62 @@ impl Editor {
         self.undo.push(transaction);
         self.clamp_cursor();
         true
+    }
+
+    pub fn syntax_colors_for_line(
+        &self,
+        line_index: usize,
+        line: &str,
+        theme: &Theme,
+    ) -> Vec<crossterm::style::Color> {
+        self.syntax.as_ref().map_or_else(
+            || {
+                syntax::highlight_line(
+                    line,
+                    syntax::Language::from_path(self.path.as_deref()),
+                    theme,
+                )
+            },
+            |syntax| syntax.highlight_line(line_index, line, theme),
+        )
+    }
+
+    pub fn syntax_fold_ranges(&self) -> Vec<(usize, usize)> {
+        self.syntax.as_ref().map_or_else(
+            || {
+                syntax::fold_ranges(
+                    &self.text(),
+                    syntax::Language::from_path(self.path.as_deref()),
+                )
+            },
+            SyntaxDocument::fold_ranges,
+        )
+    }
+
+    pub fn syntax_symbols(&self) -> Vec<syntax::Symbol> {
+        self.syntax.as_ref().map_or_else(
+            || {
+                syntax::symbols(
+                    &self.text(),
+                    syntax::Language::from_path(self.path.as_deref()),
+                )
+            },
+            SyntaxDocument::symbols,
+        )
+    }
+
+    pub fn syntax_breadcrumbs(&self, line: usize) -> Vec<syntax::Symbol> {
+        self.syntax_symbols()
+            .into_iter()
+            .filter(|symbol| symbol.start_line <= line && line <= symbol.end_line)
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn syntax_source_matches_buffer(&self) -> bool {
+        self.syntax
+            .as_ref()
+            .is_none_or(|syntax| syntax.source_matches(&self.text()))
     }
 
     pub fn len_chars(&self) -> usize {
@@ -720,6 +801,19 @@ impl Editor {
         }
         self.set_cursor_from_char_index(end);
         self.selection_anchor = Some(self.cursor_from_char_index(start));
+        true
+    }
+
+    pub fn select_syntax_node(&mut self) -> bool {
+        self.finish_undo_group();
+        let Some((start, end)) = self.syntax.as_ref().and_then(|syntax| {
+            syntax.node_range_at(self.current_char_index(), self.selection_range())
+        }) else {
+            return false;
+        };
+        self.selection_anchor = Some(self.cursor_from_char_index(start));
+        self.set_cursor_from_char_index(end);
+        self.preferred_column = None;
         true
     }
 
@@ -908,13 +1002,24 @@ impl Editor {
             return;
         }
 
-        let indent: String = self
+        let mut indent: String = self
             .line_text(self.cursor.line)
             .chars()
             .take(self.cursor.column)
             .take_while(|character| *character == ' ' || *character == '\t')
             .collect();
         let index = self.current_char_index();
+        if self
+            .syntax
+            .as_ref()
+            .is_some_and(|syntax| syntax.indent_after(index))
+        {
+            if indent.contains('\t') {
+                indent.push('\t');
+            } else {
+                indent.push_str(&" ".repeat(self.tab_width));
+            }
+        }
         self.edit(index, 0, &format!("{ending}{indent}"));
         self.cursor.line += 1;
         self.cursor.column = indent.chars().count();
@@ -1833,6 +1938,17 @@ impl Editor {
 
     pub fn jump_to_matching_bracket(&mut self) -> bool {
         self.finish_undo_group();
+        if let Some(target) = self
+            .syntax
+            .as_ref()
+            .and_then(|syntax| syntax.matching_bracket(self.current_char_index()))
+        {
+            self.set_cursor_from_char_index(target);
+            return true;
+        }
+        if self.syntax.is_some() {
+            return false;
+        }
         let characters = self.buffer.chars().collect::<Vec<_>>();
         let mut index = self.current_char_index();
         if index >= characters.len() || !is_bracket(characters[index]) {
@@ -2362,6 +2478,24 @@ mod tests {
         editor.set_cursor_from_char_index(0);
         assert_eq!(editor.sort_selected_lines(), 1);
         assert_eq!(editor.buffer.to_string(), "beta alpha\nbeta\ngamma");
+    }
+
+    #[test]
+    fn incremental_syntax_stays_synchronized_through_undo_and_redo() {
+        let path =
+            std::env::temp_dir().join(format!("caret-syntax-undo-{}.rs", std::process::id()));
+        fs::write(&path, "fn main() {}\n").unwrap();
+        let mut editor = Editor::from_file(&path).unwrap();
+        editor.set_cursor_from_char_index(11);
+
+        editor.insert_char('\n');
+        assert!(editor.syntax_source_matches_buffer());
+        assert!(editor.undo());
+        assert!(editor.syntax_source_matches_buffer());
+        assert!(editor.redo());
+        assert!(editor.syntax_source_matches_buffer());
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

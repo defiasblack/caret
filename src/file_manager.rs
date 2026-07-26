@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    fs,
-    io::{self, Read},
+    fs, io,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -12,14 +11,21 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::file_ops::{self, ConflictPolicy, OperationKind, OperationRequest, OperationSummary};
+use crate::file_ops::{
+    self, ConflictPolicy, OperationKind, OperationRequest, OperationSummary, UndoRecord,
+};
+pub use crate::preview::Preview;
+use crate::preview::{self, PreviewRequest};
+use serde::{Deserialize, Serialize};
 
 const MAX_DIRECTORY_ENTRIES: usize = 50_000;
 const MAX_CACHED_DIRECTORIES: usize = 128;
 const PREVIEW_TIMEOUT: Duration = Duration::from_millis(1_500);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SortMode {
+    #[default]
     Name,
     Size,
     Modified,
@@ -55,35 +61,6 @@ pub struct FileEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Preview {
-    Loading,
-    Empty,
-    Directory {
-        children: usize,
-        directories: usize,
-        files: usize,
-        total_bytes: u64,
-        truncated: bool,
-    },
-    Text {
-        lines: Vec<String>,
-        truncated: bool,
-        structured: Option<&'static str>,
-    },
-    Binary {
-        size: u64,
-        header: String,
-        kind: &'static str,
-        dimensions: Option<(u32, u32)>,
-    },
-    Symlink {
-        target: PathBuf,
-        exists: bool,
-    },
-    Error(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationProgress {
     pub id: u64,
     pub kind: OperationKind,
@@ -109,12 +86,20 @@ enum Request {
     },
     Preview {
         generation: u64,
-        path: PathBuf,
-        max_bytes: usize,
-        max_lines: usize,
+        request: PreviewRequest,
     },
     Operation {
         request: OperationRequest,
+        cancelled: Arc<AtomicBool>,
+    },
+    Undo {
+        id: u64,
+        record: UndoRecord,
+        cancelled: Arc<AtomicBool>,
+    },
+    BulkRename {
+        id: u64,
+        pairs: Vec<(PathBuf, PathBuf)>,
         cancelled: Arc<AtomicBool>,
     },
     Stop,
@@ -186,29 +171,26 @@ impl Worker {
                             }
                             Request::Preview {
                                 generation,
-                                path,
-                                max_bytes,
-                                max_lines,
+                                request,
                             } => {
                                 let (preview_tx, preview_rx) = mpsc::sync_channel(1);
-                                let preview_path = path.clone();
+                                let path = request.path.clone();
+                                let thread_request = request.clone();
                                 let spawn = thread::Builder::new()
                                     .name("caret-file-preview".to_string())
                                     .spawn(move || {
-                                        let _ = preview_tx.send(build_preview(
-                                            &preview_path,
-                                            max_bytes,
-                                            max_lines,
-                                        ));
+                                        let _ = preview_tx.send(preview::generate(&thread_request));
                                     });
                                 let preview = match spawn {
-                                    Ok(_) => preview_rx
-                                        .recv_timeout(PREVIEW_TIMEOUT)
-                                        .unwrap_or_else(|_| {
+                                    Ok(_) => match preview_rx.recv_timeout(PREVIEW_TIMEOUT) {
+                                        Ok(preview) => preview,
+                                        Err(_) => {
+                                            request.cancel();
                                             Preview::Error(
                                                 "preview timed out after 1.5 seconds".to_string(),
                                             )
-                                        }),
+                                        }
+                                    },
                                     Err(error) => Preview::Error(format!(
                                         "could not start preview worker: {error}"
                                     )),
@@ -230,6 +212,52 @@ impl Worker {
                                             OperationProgress {
                                                 id,
                                                 kind,
+                                                completed,
+                                                total,
+                                                current: path.to_path_buf(),
+                                            },
+                                        ));
+                                    },
+                                );
+                                let _ = event_tx.send(WorkerEvent::OperationFinished(summary));
+                            }
+                            Request::Undo {
+                                id,
+                                record,
+                                cancelled,
+                            } => {
+                                let summary = file_ops::execute_undo(
+                                    id,
+                                    &record,
+                                    &cancelled,
+                                    |completed, total, path| {
+                                        let _ = event_tx.send(WorkerEvent::Progress(
+                                            OperationProgress {
+                                                id,
+                                                kind: OperationKind::Undo,
+                                                completed,
+                                                total,
+                                                current: path.to_path_buf(),
+                                            },
+                                        ));
+                                    },
+                                );
+                                let _ = event_tx.send(WorkerEvent::OperationFinished(summary));
+                            }
+                            Request::BulkRename {
+                                id,
+                                pairs,
+                                cancelled,
+                            } => {
+                                let summary = file_ops::execute_bulk_rename(
+                                    id,
+                                    &pairs,
+                                    &cancelled,
+                                    |completed, total, path| {
+                                        let _ = event_tx.send(WorkerEvent::Progress(
+                                            OperationProgress {
+                                                id,
+                                                kind: OperationKind::BulkRename,
                                                 completed,
                                                 total,
                                                 current: path.to_path_buf(),
@@ -303,6 +331,7 @@ pub struct FileManager {
     history_forward: Vec<PathBuf>,
     generation: u64,
     preview_generation: u64,
+    preview_cancel: Option<Arc<AtomicBool>>,
     operation_id: u64,
     cancel_operation: Option<Arc<AtomicBool>>,
     last_operation_request: Option<OperationRequest>,
@@ -310,6 +339,8 @@ pub struct FileManager {
     max_preview_lines: usize,
     worker: Worker,
     snapshots: HashMap<PathBuf, Vec<FileEntry>>,
+    pending_selection: Option<PathBuf>,
+    undo_stack: Vec<UndoRecord>,
 }
 
 impl FileManager {
@@ -339,6 +370,7 @@ impl FileManager {
             history_forward: Vec::new(),
             generation: 0,
             preview_generation: 0,
+            preview_cancel: None,
             operation_id: 0,
             cancel_operation: None,
             last_operation_request: None,
@@ -346,6 +378,8 @@ impl FileManager {
             max_preview_lines: 200,
             worker: Worker::new(),
             snapshots: HashMap::new(),
+            pending_selection: None,
+            undo_stack: Vec::new(),
         };
         manager.refresh();
         Ok(manager)
@@ -369,6 +403,50 @@ impl FileManager {
         } else {
             self.request_preview();
         }
+    }
+
+    pub fn session_state(&self, active: bool) -> crate::session::FileManagerState {
+        crate::session::FileManagerState {
+            active,
+            current_dir: self.current_dir.clone(),
+            selected_path: self.selected_path().map(Path::to_path_buf),
+            history_back: self.history_back.clone(),
+            history_forward: self.history_forward.clone(),
+            filter: self.filter.clone(),
+            sort: self.sort,
+        }
+    }
+
+    pub fn restore_session_state(&mut self, state: &crate::session::FileManagerState) {
+        let Ok(current_dir) = normalize_directory(state.current_dir.clone()) else {
+            return;
+        };
+        self.current_dir = current_dir;
+        self.history_back = valid_history(&state.history_back);
+        self.history_forward = valid_history(&state.history_forward);
+        self.filter = state
+            .filter
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(256)
+            .collect();
+        self.sort = state.sort;
+        self.selected = 0;
+        self.scroll = 0;
+        self.selected_paths.clear();
+        self.anchor = None;
+        self.pending_selection = state
+            .selected_path
+            .as_ref()
+            .and_then(|path| fs::canonicalize(path).ok())
+            .filter(|path| {
+                path.parent()
+                    .is_some_and(|parent| parent == self.current_dir)
+            });
+        self.entries.clear();
+        self.parent_entries.clear();
+        self.snapshots.clear();
+        self.refresh();
     }
 
     pub fn refresh(&mut self) {
@@ -398,7 +476,10 @@ impl FileManager {
                 {
                     match (pane, result) {
                         (Pane::Current, Ok(entries)) => {
-                            let selected_path = self.selected_path().map(Path::to_path_buf);
+                            let selected_path = self
+                                .pending_selection
+                                .take()
+                                .or_else(|| self.selected_path().map(Path::to_path_buf));
                             self.cache_snapshot(self.current_dir.clone(), entries.clone());
                             self.entries = entries;
                             self.loading = false;
@@ -437,6 +518,12 @@ impl FileManager {
                 Ok(WorkerEvent::OperationFinished(summary)) => {
                     self.progress = None;
                     self.cancel_operation = None;
+                    if let Some(undo) = summary.undo.clone() {
+                        if self.undo_stack.len() >= 20 {
+                            self.undo_stack.remove(0);
+                        }
+                        self.undo_stack.push(undo);
+                    }
                     self.last_operation = Some(summary);
                     self.refresh();
                     changed = true;
@@ -719,6 +806,58 @@ impl FileManager {
         )
     }
 
+    pub fn undo_last_operation(&mut self) -> bool {
+        if self.cancel_operation.is_some() {
+            return false;
+        }
+        let Some(record) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.operation_id = self.operation_id.wrapping_add(1);
+        let id = self.operation_id;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if self
+            .worker
+            .tx
+            .send(Request::Undo {
+                id,
+                record: record.clone(),
+                cancelled: cancelled.clone(),
+            })
+            .is_err()
+        {
+            self.undo_stack.push(record);
+            return false;
+        }
+        self.cancel_operation = Some(cancelled);
+        self.last_operation = None;
+        true
+    }
+
+    pub fn bulk_rename(&mut self, pairs: Vec<(PathBuf, PathBuf)>) -> bool {
+        if pairs.is_empty() || self.cancel_operation.is_some() {
+            return false;
+        }
+        self.operation_id = self.operation_id.wrapping_add(1);
+        let id = self.operation_id;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if self
+            .worker
+            .tx
+            .send(Request::BulkRename {
+                id,
+                pairs,
+                cancelled: cancelled.clone(),
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.cancel_operation = Some(cancelled);
+        self.last_operation = None;
+        true
+    }
+
     pub fn cycle_sort(&mut self) {
         self.sort = self.sort.next();
         self.refresh();
@@ -806,6 +945,9 @@ impl FileManager {
     }
 
     fn request_preview(&mut self) {
+        if let Some(cancelled) = self.preview_cancel.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
         self.preview_generation = self.preview_generation.wrapping_add(1);
         if !self.preview_enabled {
             self.preview = Preview::Empty;
@@ -816,11 +958,17 @@ impl FileManager {
             return;
         };
         self.preview = Preview::Loading;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.preview_cancel = Some(cancelled.clone());
         let _ = self.worker.tx.send(Request::Preview {
             generation: self.preview_generation,
-            path,
-            max_bytes: self.max_preview_bytes,
-            max_lines: self.max_preview_lines,
+            request: PreviewRequest::new(
+                path,
+                self.max_preview_bytes,
+                self.max_preview_lines,
+                PREVIEW_TIMEOUT,
+                cancelled,
+            ),
         });
     }
 
@@ -874,6 +1022,18 @@ fn normalize_directory(path: PathBuf) -> io::Result<PathBuf> {
             format!("{} is not a directory", path.display()),
         ))
     }
+}
+
+fn valid_history(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .rev()
+        .take(64)
+        .filter_map(|path| normalize_directory(path.clone()).ok())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 fn scan_directory(
@@ -971,208 +1131,15 @@ fn is_hidden(path: &Path, name: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn build_preview(path: &Path, max_bytes: usize, max_lines: usize) -> Preview {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) => return Preview::Error(error.to_string()),
-    };
-    if metadata.file_type().is_symlink() {
-        return match fs::read_link(path) {
-            Ok(target) => {
-                let resolved = path
-                    .parent()
-                    .map(|parent| parent.join(&target))
-                    .unwrap_or_else(|| target.clone());
-                Preview::Symlink {
-                    target,
-                    exists: resolved.exists(),
-                }
-            }
-            Err(error) => Preview::Error(error.to_string()),
-        };
-    }
-    if metadata.is_dir() {
-        return preview_directory(path);
-    }
-
-    let mut file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) => return Preview::Error(error.to_string()),
-    };
-    let mut bytes = Vec::with_capacity(max_bytes.min(metadata.len() as usize));
-    if let Err(error) = file
-        .by_ref()
-        .take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)
-    {
-        return Preview::Error(error.to_string());
-    }
-    let truncated_bytes = bytes.len() > max_bytes;
-    bytes.truncate(max_bytes);
-    if looks_binary(&bytes) {
-        return Preview::Binary {
-            size: metadata.len(),
-            header: hex_header(&bytes),
-            kind: binary_kind(path, &bytes),
-            dimensions: image_dimensions(&bytes),
-        };
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines = text
-        .lines()
-        .take(max_lines + 1)
-        .map(|line| line.chars().take(240).collect())
-        .collect::<Vec<String>>();
-    let truncated_lines = lines.len() > max_lines;
-    lines.truncate(max_lines);
-    let structured = structured_kind(path, &text);
-    Preview::Text {
-        lines,
-        truncated: truncated_bytes || truncated_lines,
-        structured,
-    }
-}
-
-fn preview_directory(path: &Path) -> Preview {
-    let mut children = 0usize;
-    let mut directories = 0usize;
-    let mut files = 0usize;
-    let mut total_bytes = 0u64;
-    let Ok(read_dir) = fs::read_dir(path) else {
-        return Preview::Error("directory is not readable".to_string());
-    };
-    for result in read_dir.take(MAX_DIRECTORY_ENTRIES + 1) {
-        let Ok(entry) = result else {
-            continue;
-        };
-        children += 1;
-        if let Ok(metadata) = entry.metadata() {
-            if metadata.is_dir() {
-                directories += 1;
-            } else {
-                files += 1;
-                total_bytes = total_bytes.saturating_add(metadata.len());
-            }
-        }
-    }
-    Preview::Directory {
-        children: children.min(MAX_DIRECTORY_ENTRIES),
-        directories,
-        files,
-        total_bytes,
-        truncated: children > MAX_DIRECTORY_ENTRIES,
-    }
-}
-
-fn looks_binary(bytes: &[u8]) -> bool {
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return false;
-    }
-    bytes.iter().take(8_192).any(|byte| *byte == 0) || std::str::from_utf8(bytes).is_err()
-}
-
-fn hex_header(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .take(32)
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn binary_kind(path: &Path, bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
-        "PNG image"
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        "JPEG image"
-    } else if bytes.starts_with(b"GIF8") {
-        "GIF image"
-    } else if bytes.starts_with(b"%PDF") {
-        "PDF document"
-    } else if bytes.starts_with(b"PK\x03\x04") {
-        "ZIP archive"
-    } else if path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
-    {
-        "Windows executable"
-    } else {
-        "binary file"
-    }
-}
-
-fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1A\n") && bytes.len() >= 24 {
-        return Some((
-            u32::from_be_bytes(bytes[16..20].try_into().ok()?),
-            u32::from_be_bytes(bytes[20..24].try_into().ok()?),
-        ));
-    }
-    if bytes.starts_with(b"GIF8") && bytes.len() >= 10 {
-        return Some((
-            u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32,
-            u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32,
-        ));
-    }
-    if !bytes.starts_with(&[0xFF, 0xD8]) {
-        return None;
-    }
-    let mut offset = 2usize;
-    while offset + 4 <= bytes.len() {
-        if bytes[offset] != 0xFF {
-            offset += 1;
-            continue;
-        }
-        let marker = bytes[offset + 1];
-        offset += 2;
-        if matches!(marker, 0xD8 | 0xD9) || (0xD0..=0xD7).contains(&marker) {
-            continue;
-        }
-        if offset + 2 > bytes.len() {
-            break;
-        }
-        let length = u16::from_be_bytes(bytes[offset..offset + 2].try_into().ok()?) as usize;
-        if length < 2 || offset + length > bytes.len() {
-            break;
-        }
-        if matches!(
-            marker,
-            0xC0 | 0xC1
-                | 0xC2
-                | 0xC3
-                | 0xC5
-                | 0xC6
-                | 0xC7
-                | 0xC9
-                | 0xCA
-                | 0xCB
-                | 0xCD
-                | 0xCE
-                | 0xCF
-        ) && length >= 7
-        {
-            let height = u16::from_be_bytes(bytes[offset + 3..offset + 5].try_into().ok()?) as u32;
-            let width = u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?) as u32;
-            return Some((width, height));
-        }
-        offset += length;
-    }
-    None
-}
-
-fn structured_kind(path: &Path, text: &str) -> Option<&'static str> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())?
-        .to_ascii_lowercase();
-    match extension.as_str() {
-        "json" if serde_json::from_str::<serde_json::Value>(text).is_ok() => Some("JSON"),
-        "toml" if toml::from_str::<toml::Value>(text).is_ok() => Some("TOML"),
-        "yaml" | "yml" => Some("YAML"),
-        "md" | "markdown" => Some("Markdown source"),
-        _ => None,
-    }
+    preview::generate(&PreviewRequest::new(
+        path.to_path_buf(),
+        max_bytes,
+        max_lines,
+        PREVIEW_TIMEOUT,
+        Arc::new(AtomicBool::new(false)),
+    ))
 }
 
 pub fn human_size(bytes: u64) -> String {
@@ -1246,6 +1213,85 @@ mod tests {
         assert_eq!(manager.entries.len(), 2);
         assert_eq!(manager.entries[0].name, "folder");
         assert!(manager.entries[0].is_dir);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_restore_keeps_safe_manager_navigation_state() {
+        let root = temp_dir("session-state");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let selected = nested.join("target.txt");
+        fs::write(&selected, "target").unwrap();
+        let missing = root.join("missing");
+        let mut manager = FileManager::new(root.clone()).unwrap();
+        manager.restore_session_state(&crate::session::FileManagerState {
+            active: true,
+            current_dir: nested.clone(),
+            selected_path: Some(selected.clone()),
+            history_back: vec![root.clone(), missing],
+            history_forward: Vec::new(),
+            filter: "target\n".to_string(),
+            sort: SortMode::Size,
+        });
+
+        for _ in 0..100 {
+            manager.poll();
+            if !manager.loading {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(manager.current_dir, nested.canonicalize().unwrap());
+        let expected_selected = selected.canonicalize().unwrap();
+        assert_eq!(manager.selected_path(), Some(expected_selected.as_path()));
+        assert_eq!(manager.filter, "target");
+        assert_eq!(manager.sort, SortMode::Size);
+        assert_eq!(manager.history_back, vec![root.canonicalize().unwrap()]);
+        assert!(manager.selected_paths.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn safe_operation_undo_runs_through_the_background_manager() {
+        let root = temp_dir("operation-undo");
+        fs::write(root.join("note.txt"), "content").unwrap();
+        let mut manager = FileManager::new(root.clone()).unwrap();
+        poll_until_loaded(&mut manager);
+        manager.selected = manager
+            .visible_entries()
+            .iter()
+            .position(|entry| entry.name == "note.txt")
+            .unwrap();
+        assert!(manager.duplicate(ConflictPolicy::Rename));
+        for _ in 0..100 {
+            manager.poll();
+            if manager.last_operation.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let copy = root.join("note copy.txt");
+        assert!(copy.exists());
+
+        assert!(manager.undo_last_operation());
+        for _ in 0..100 {
+            manager.poll();
+            if manager
+                .last_operation
+                .as_ref()
+                .is_some_and(|summary| summary.kind == OperationKind::Undo)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!copy.exists());
+        assert_eq!(
+            manager.last_operation.as_ref().map(|summary| summary.kind),
+            Some(OperationKind::Undo)
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,22 +1,171 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fmt, io,
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
     thread,
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use crate::project::{GitStatus, ProjectTree};
+use crate::project::{
+    load_entry_metadata, EntryMetadata, GitStatus, ProjectEntry, ProjectTree, TreeScanRequest,
+    TreeScanner,
+};
 
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 const GIT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(150);
+const WATCH_WAIT: Duration = Duration::from_millis(200);
+
+#[derive(Debug)]
+enum WatchSignal {
+    Changed { paths: Vec<PathBuf>, rescan: bool },
+    Failed(String),
+}
+
+struct NativeWatcher {
+    events: Receiver<WatchSignal>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl fmt::Debug for NativeWatcher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeWatcher")
+            .field("running", &self.thread.is_some())
+            .finish()
+    }
+}
+
+impl NativeWatcher {
+    fn new(root: PathBuf) -> io::Result<Self> {
+        let (event_sender, events) = mpsc::channel();
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let watcher_thread = thread::Builder::new()
+            .name("caret-fs-watch".to_string())
+            .spawn(move || watch_directory(root, event_sender, ready_sender, thread_stop))?;
+
+        match ready_receiver.recv() {
+            Ok(Ok(())) => Ok(Self {
+                events,
+                stop,
+                thread: Some(watcher_thread),
+            }),
+            Ok(Err(message)) => {
+                let _ = watcher_thread.join();
+                Err(io::Error::other(message))
+            }
+            Err(_) => {
+                let _ = watcher_thread.join();
+                Err(io::Error::other(
+                    "filesystem watcher stopped during startup",
+                ))
+            }
+        }
+    }
+
+    fn try_recv(&self) -> Option<WatchSignal> {
+        self.events.try_recv().ok()
+    }
+}
+
+impl Drop for NativeWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn watch_directory(
+    root: PathBuf,
+    events: Sender<WatchSignal>,
+    ready: mpsc::SyncSender<Result<(), String>>,
+    stop: Arc<AtomicBool>,
+) {
+    use notify::{EventKind, RecursiveMode, Watcher};
+
+    let (native_sender, native_events) = mpsc::channel();
+    let mut watcher = match notify::recommended_watcher(native_sender) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            let _ = ready.send(Err(error.to_string()));
+            return;
+        }
+    };
+    if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
+        let _ = ready.send(Err(error.to_string()));
+        return;
+    }
+    let _ = ready.send(Ok(()));
+
+    while !stop.load(Ordering::Acquire) {
+        match native_events.recv_timeout(WATCH_WAIT) {
+            Ok(Ok(event)) => {
+                if matches!(event.kind, EventKind::Access(_)) {
+                    continue;
+                }
+                if events
+                    .send(WatchSignal::Changed {
+                        rescan: event.need_rescan(),
+                        paths: event.paths,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Err(error)) => {
+                // Backend errors can represent queue overflow or a lost native
+                // watch. Force a full reconciliation before restarting.
+                let _ = events.send(WatchSignal::Changed {
+                    paths: Vec::new(),
+                    rescan: true,
+                });
+                let _ = events.send(WatchSignal::Failed(error.to_string()));
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = events.send(WatchSignal::Changed {
+                    paths: Vec::new(),
+                    rescan: true,
+                });
+                let _ = events.send(WatchSignal::Failed(
+                    "native filesystem event channel disconnected".to_string(),
+                ));
+                break;
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 enum ExplorerRequest {
-    RefreshGit { generation: u64, root: PathBuf },
+    RefreshGit {
+        generation: u64,
+        root: PathBuf,
+    },
+    RefreshTree {
+        generation: u64,
+        request: TreeScanRequest,
+    },
+    LoadMetadata {
+        generation: u64,
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[derive(Debug)]
@@ -30,6 +179,22 @@ enum ExplorerEvent {
         generation: u64,
         root: PathBuf,
         message: String,
+    },
+    TreeReady {
+        generation: u64,
+        root: PathBuf,
+        entries: Vec<ProjectEntry>,
+    },
+    TreeFailed {
+        generation: u64,
+        root: PathBuf,
+        kind: io::ErrorKind,
+        message: String,
+    },
+    MetadataReady {
+        generation: u64,
+        root: PathBuf,
+        metadata: HashMap<PathBuf, EntryMetadata>,
     },
 }
 
@@ -56,6 +221,7 @@ impl ExplorerWorker {
         thread::Builder::new()
             .name("caret-explorer".to_string())
             .spawn(move || {
+                let mut tree_scanner = TreeScanner::default();
                 while let Ok(request) = request_receiver.recv() {
                     match request {
                         ExplorerRequest::RefreshGit { generation, root } => {
@@ -86,6 +252,57 @@ impl ExplorerWorker {
                                 break;
                             }
                         }
+                        ExplorerRequest::RefreshTree {
+                            generation,
+                            request,
+                        } => {
+                            let root = request.root.clone();
+                            let event = match tree_scanner.scan(&request) {
+                                Ok(entries) => ExplorerEvent::TreeReady {
+                                    generation,
+                                    root,
+                                    entries,
+                                },
+                                Err(error) => {
+                                    let kind = error.kind();
+                                    let message = error.to_string();
+                                    let _ = crate::diagnostics::append(
+                                        "filesystem",
+                                        &format!(
+                                            "background project scan failed for {}: {message}",
+                                            root.display()
+                                        ),
+                                    );
+                                    ExplorerEvent::TreeFailed {
+                                        generation,
+                                        root,
+                                        kind,
+                                        message,
+                                    }
+                                }
+                            };
+                            if event_sender.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        ExplorerRequest::LoadMetadata {
+                            generation,
+                            root,
+                            paths,
+                        } => {
+                            let metadata = load_entry_metadata(&paths);
+                            tree_scanner.apply_metadata(&metadata);
+                            if event_sender
+                                .send(ExplorerEvent::MetadataReady {
+                                    generation,
+                                    root,
+                                    metadata,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
                 }
             })?;
@@ -99,6 +316,25 @@ impl ExplorerWorker {
     fn refresh_git(&self, generation: u64, root: PathBuf) -> bool {
         self.requests
             .send(ExplorerRequest::RefreshGit { generation, root })
+            .is_ok()
+    }
+
+    fn refresh_tree(&self, generation: u64, request: TreeScanRequest) -> bool {
+        self.requests
+            .send(ExplorerRequest::RefreshTree {
+                generation,
+                request,
+            })
+            .is_ok()
+    }
+
+    fn load_metadata(&self, generation: u64, root: PathBuf, paths: Vec<PathBuf>) -> bool {
+        self.requests
+            .send(ExplorerRequest::LoadMetadata {
+                generation,
+                root,
+                paths,
+            })
             .is_ok()
     }
 
@@ -120,10 +356,31 @@ pub struct ExplorerService {
     refresh_queued: bool,
     last_request: Option<Instant>,
     last_error: Option<String>,
+    tree_generation: u64,
+    tree_request_pending: bool,
+    queued_tree_request: Option<TreeScanRequest>,
+    watcher: Option<NativeWatcher>,
+    watcher_error: Option<String>,
+    watch_dirty_since: Option<Instant>,
+    watch_last_event: Option<Instant>,
+    watch_paths: HashSet<PathBuf>,
+    watch_rescan: bool,
+    last_watcher_retry: Option<Instant>,
 }
 
 impl ExplorerService {
     pub fn new(root: PathBuf) -> io::Result<Self> {
+        let (watcher, watcher_error) = match NativeWatcher::new(root.clone()) {
+            Ok(watcher) => (Some(watcher), None),
+            Err(error) => {
+                let message = error.to_string();
+                let _ = crate::diagnostics::append(
+                    "filesystem",
+                    &format!("native watcher failed for {}: {message}", root.display()),
+                );
+                (None, Some(message))
+            }
+        };
         Ok(Self {
             worker: ExplorerWorker::new()?,
             root,
@@ -133,6 +390,16 @@ impl ExplorerService {
             refresh_queued: false,
             last_request: None,
             last_error: None,
+            tree_generation: 0,
+            tree_request_pending: false,
+            queued_tree_request: None,
+            watcher,
+            watcher_error,
+            watch_dirty_since: None,
+            watch_last_event: None,
+            watch_paths: HashSet::new(),
+            watch_rescan: false,
+            last_watcher_retry: None,
         })
     }
 
@@ -143,6 +410,7 @@ impl ExplorerService {
         if root_changed {
             self.reset_for_root(project.root.clone());
         }
+        self.poll_watcher(project);
 
         let refresh_requested = project.take_git_refresh_request();
         if root_changed || refresh_requested {
@@ -153,7 +421,16 @@ impl ExplorerService {
             }
         }
 
+        if let Some(request) = project.take_tree_refresh_request() {
+            if self.tree_request_pending {
+                self.queued_tree_request = Some(request);
+            } else {
+                self.schedule_tree_refresh(request);
+            }
+        }
+
         let mut changed = false;
+        let mut metadata_request = None;
         while let Some(event) = self.worker.try_recv() {
             match event {
                 ExplorerEvent::GitStatusReady {
@@ -176,9 +453,50 @@ impl ExplorerService {
                     self.request_pending = false;
                     self.last_error = Some(message);
                 }
+                ExplorerEvent::TreeReady {
+                    generation,
+                    root,
+                    entries,
+                } if generation == self.tree_generation && root == self.root => {
+                    self.tree_request_pending = false;
+                    let paths = entries.iter().map(|entry| entry.path.clone()).collect();
+                    changed |= project.apply_tree_snapshot(entries);
+                    metadata_request = Some((generation, root, paths));
+                }
+                ExplorerEvent::TreeFailed {
+                    generation,
+                    root,
+                    kind,
+                    message,
+                } if generation == self.tree_generation && root == self.root => {
+                    self.tree_request_pending = false;
+                    changed |= project.fail_tree_refresh(kind, message);
+                }
+                ExplorerEvent::MetadataReady {
+                    generation,
+                    root,
+                    metadata,
+                } if generation == self.tree_generation && root == self.root => {
+                    let metadata_changed = project.apply_tree_metadata(&metadata);
+                    changed |= metadata_changed;
+                    if metadata_changed {
+                        project.resort_after_metadata();
+                    }
+                }
                 // The project changed, or a newer request superseded this one.
                 // Stale results must never overwrite the active project.
                 _ => {}
+            }
+        }
+        if let Some((generation, root, paths)) = metadata_request {
+            let _ = self.worker.load_metadata(generation, root, paths);
+        }
+
+        if !self.tree_request_pending {
+            if let Some(request) = self.queued_tree_request.take() {
+                self.schedule_tree_refresh(request);
+            } else if let Some(request) = project.take_tree_refresh_request() {
+                self.schedule_tree_refresh(request);
             }
         }
 
@@ -197,13 +515,31 @@ impl ExplorerService {
     }
 
     fn reset_for_root(&mut self, root: PathBuf) {
-        self.root = root;
+        self.root = root.clone();
         self.statuses.clear();
         self.last_error = None;
         self.last_request = None;
         self.request_pending = false;
         self.refresh_queued = false;
         self.generation = self.generation.wrapping_add(1);
+        self.tree_generation = self.tree_generation.wrapping_add(1);
+        self.tree_request_pending = false;
+        self.queued_tree_request = None;
+        self.watch_dirty_since = None;
+        self.watch_last_event = None;
+        self.watch_paths.clear();
+        self.watch_rescan = false;
+        self.last_watcher_retry = None;
+        match NativeWatcher::new(root) {
+            Ok(watcher) => {
+                self.watcher = Some(watcher);
+                self.watcher_error = None;
+            }
+            Err(error) => {
+                self.watcher = None;
+                self.watcher_error = Some(error.to_string());
+            }
+        }
     }
 
     fn apply_statuses(&self, project: &mut ProjectTree) -> bool {
@@ -255,6 +591,82 @@ impl ExplorerService {
             self.last_request = Some(Instant::now());
         } else {
             self.last_error = Some("explorer background worker stopped".to_string());
+        }
+    }
+
+    fn schedule_tree_refresh(&mut self, request: TreeScanRequest) {
+        self.tree_generation = self.tree_generation.wrapping_add(1);
+        if self.worker.refresh_tree(self.tree_generation, request) {
+            self.tree_request_pending = true;
+        }
+    }
+
+    fn poll_watcher(&mut self, project: &mut ProjectTree) {
+        let mut watcher_failed = None;
+        if let Some(watcher) = &self.watcher {
+            while let Some(event) = watcher.try_recv() {
+                match event {
+                    WatchSignal::Changed { paths, rescan } => {
+                        let now = Instant::now();
+                        self.watch_dirty_since.get_or_insert(now);
+                        self.watch_last_event = Some(now);
+                        if rescan {
+                            self.watch_rescan = true;
+                            self.watch_paths.clear();
+                        } else if !self.watch_rescan {
+                            self.watch_paths.extend(paths);
+                        }
+                    }
+                    WatchSignal::Failed(message) => watcher_failed = Some(message),
+                }
+            }
+        }
+
+        if let Some(message) = watcher_failed {
+            let _ = crate::diagnostics::append(
+                "filesystem",
+                &format!(
+                    "native watcher failed for {}: {message}",
+                    self.root.display()
+                ),
+            );
+            self.watcher = None;
+            self.watcher_error = Some(message);
+            self.last_watcher_retry = Some(Instant::now());
+        }
+
+        let settled = self
+            .watch_last_event
+            .is_some_and(|event| event.elapsed() >= WATCH_DEBOUNCE);
+        let maximum_delay_reached = self
+            .watch_dirty_since
+            .is_some_and(|first| first.elapsed() >= Duration::from_secs(1));
+        if self.watch_dirty_since.is_some() && (settled || maximum_delay_reached) {
+            if self.watch_rescan || self.watch_paths.is_empty() {
+                let _ = project.refresh();
+            } else {
+                let paths = self.watch_paths.drain().collect::<Vec<_>>();
+                let _ = project.refresh_paths(&paths);
+            }
+            project.request_git_refresh();
+            self.watch_dirty_since = None;
+            self.watch_last_event = None;
+            self.watch_rescan = false;
+        }
+
+        let should_retry = self.watcher.is_none()
+            && self
+                .last_watcher_retry
+                .is_none_or(|attempt| attempt.elapsed() >= GIT_RETRY_INTERVAL);
+        if should_retry {
+            self.last_watcher_retry = Some(Instant::now());
+            match NativeWatcher::new(self.root.clone()) {
+                Ok(watcher) => {
+                    self.watcher = Some(watcher);
+                    self.watcher_error = None;
+                }
+                Err(error) => self.watcher_error = Some(error.to_string()),
+            }
         }
     }
 }
@@ -326,7 +738,10 @@ fn status_from_code(code: &[u8]) -> Option<GitStatus> {
     }
 
     if code.contains(&b'U') || matches!(code, b"AA" | b"DD" | b"AU" | b"UA" | b"DU" | b"UD") {
-        return Some(GitStatus::Modified);
+        return Some(GitStatus::Conflicted);
+    }
+    if code.contains(&b'R') {
+        return Some(GitStatus::Renamed);
     }
     if code.contains(&b'D') {
         return Some(GitStatus::Deleted);
@@ -334,8 +749,7 @@ fn status_from_code(code: &[u8]) -> Option<GitStatus> {
     if code.contains(&b'A') {
         return Some(GitStatus::Added);
     }
-    if code.contains(&b'M') || code.contains(&b'T') || code.contains(&b'R') || code.contains(&b'C')
-    {
+    if code.contains(&b'M') || code.contains(&b'T') || code.contains(&b'C') {
         return Some(GitStatus::Modified);
     }
 
@@ -379,6 +793,8 @@ fn status_priority(status: GitStatus) -> u8 {
         GitStatus::Modified => 2,
         GitStatus::Added => 3,
         GitStatus::Deleted => 4,
+        GitStatus::Renamed => 5,
+        GitStatus::Conflicted => 6,
     }
 }
 
@@ -396,6 +812,76 @@ fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "caret-explorer-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn background_tree_scan_then_loads_metadata_progressively() {
+        let root = temp_root("background-tree");
+        std::fs::write(root.join("note.txt"), "hello").unwrap();
+        let mut project = ProjectTree::new(root.clone()).unwrap();
+        let mut service = ExplorerService::new(root.clone()).unwrap();
+        assert!(project.entries.is_empty());
+        assert!(project.tree_loading);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_snapshot_without_metadata = false;
+        let mut loaded_metadata = false;
+        while Instant::now() < deadline {
+            service.poll(&mut project);
+            if let Some(entry) = project
+                .entries
+                .iter()
+                .find(|entry| entry.name == "note.txt")
+            {
+                saw_snapshot_without_metadata |= entry.size.is_none();
+                if entry.size == Some(5) {
+                    loaded_metadata = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(saw_snapshot_without_metadata);
+        assert!(loaded_metadata);
+        assert!(!project.tree_loading);
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_watcher_reports_filesystem_changes() {
+        let root = temp_root("native-watch");
+        let watcher = NativeWatcher::new(root.clone()).unwrap();
+        std::fs::write(root.join("created.txt"), "created").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut changed = false;
+        while Instant::now() < deadline {
+            if matches!(watcher.try_recv(), Some(WatchSignal::Changed { .. })) {
+                changed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(changed);
+        drop(watcher);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn parses_nul_delimited_paths_and_aggregates_directories() {
@@ -431,7 +917,7 @@ mod tests {
 
         assert_eq!(
             statuses.get(&root.join("src/new.rs")),
-            Some(&GitStatus::Modified)
+            Some(&GitStatus::Renamed)
         );
         assert!(!statuses.contains_key(&root.join("src/old.rs")));
         assert_eq!(
@@ -483,5 +969,24 @@ mod tests {
         let statuses = parse_git_status(root, b"?? src/new.rs\0D  src/removed.rs\0");
 
         assert_eq!(statuses.get(&root.join("src")), Some(&GitStatus::Deleted));
+    }
+
+    #[test]
+    fn conflicts_and_renames_keep_distinct_git_states() {
+        let root = Path::new("/work");
+        let statuses = parse_git_status(root, b"UU src/conflict.rs\0R  src/new.rs\0src/old.rs\0");
+
+        assert_eq!(
+            statuses.get(&root.join("src/conflict.rs")),
+            Some(&GitStatus::Conflicted)
+        );
+        assert_eq!(
+            statuses.get(&root.join("src/new.rs")),
+            Some(&GitStatus::Renamed)
+        );
+        assert_eq!(
+            statuses.get(&root.join("src")),
+            Some(&GitStatus::Conflicted)
+        );
     }
 }

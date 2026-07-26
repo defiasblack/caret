@@ -121,18 +121,18 @@ Automated release-candidate baseline: `0.6.0-rc.2`,
   application.
 - [x] Preserve project selection by path on refresh and protect recursive tree
   walks with depth/result limits and symlink-cycle rules.
-- [ ] Replace the synchronous flattened `ProjectTree` authority with cached
+- [x] Replace the synchronous flattened `ProjectTree` authority with cached
   per-directory snapshots and a presentation-only flattened projection.
-- [ ] Load directories lazily and perform directory scans outside rendering and
+- [x] Load directories lazily and perform directory scans outside rendering and
   keyboard handling.
-- [ ] Add request/generation identifiers for directory scans, metadata, and
+- [x] Add request/generation identifiers for directory scans, metadata, and
   previews, not only Git status.
-- [ ] Add a debounced cross-platform filesystem watcher with targeted directory
+- [x] Add a debounced cross-platform filesystem watcher with targeted directory
   invalidation, overflow recovery, and stale-event rejection.
-- [ ] Add progressive background metadata loading for visible and selected
+- [x] Add progressive background metadata loading for visible and selected
   entries.
-- [ ] Support cancellation or replacement of obsolete scan and preview work.
-- [ ] Model explicit loading, empty, permission-denied, missing, and error
+- [x] Support cancellation or replacement of obsolete scan and preview work.
+- [x] Model explicit loading, empty, permission-denied, missing, and error
   states.
 
 ### Project explorer sidebar
@@ -150,20 +150,19 @@ Automated release-candidate baseline: `0.6.0-rc.2`,
 - [x] Add a project header with discoverable new-file, new-folder, refresh, and
   collapse controls.
 - [x] Add configurable Unicode, Nerd Font, and ASCII icon modes.
-- [ ] Add distinct visual roles for file types, directories, executables,
+- [x] Add distinct visual roles for file types, directories, executables,
   symlinks, hidden entries, and ignored entries.
-- [ ] Represent renamed and conflicted Git states distinctly instead of folding
+- [x] Represent renamed and conflicted Git states distinctly instead of folding
   them into the basic modified state.
-- [ ] Separate keyboard focus, selection, hover, and active-file styling.
-- [ ] Highlight matched characters in explorer filtering; compact breadcrumbs
+- [x] Separate keyboard focus, selection, hover, and active-file styling.
+- [x] Highlight matched characters in explorer filtering; compact breadcrumbs
   for the selected filesystem path are complete.
-  for the selected filesystem path.
-- [ ] Replace command-prompt create/rename flows with true inline new-file,
+- [x] Replace command-prompt create/rename flows with true inline new-file,
   new-folder, and rename fields.
 - [ ] Back explorer context menus and shortcuts with one shared command
   registry.
-- [ ] Add optional size and modified-time columns for wide layouts.
-- [ ] Add configurable sorting and directories-first behavior.
+- [x] Add optional size and modified-time columns for wide layouts.
+- [x] Add configurable sorting and directories-first behavior.
 - [ ] Verify explorer behavior for Windows drive/UNC roots, macOS/Linux
   symlinks, Unicode filenames, SSH, tmux, monochrome, ASCII, mouse-disabled,
   and narrow-terminal sessions.
@@ -179,7 +178,7 @@ Automated release-candidate baseline: `0.6.0-rc.2`,
 - [x] Add single, range, all, invert, and clear selection workflows.
 - [x] Open files in the current tab or a split, and open a terminal
   at the selected directory.
-- [ ] Persist safe file-manager workspace state in sessions; reuse of Caret's
+- [x] Persist safe file-manager workspace state in sessions; reuse of Caret's
   themes, commands, settings, and status conventions.
 
 ### Safe filesystem operations
@@ -193,14 +192,14 @@ not satisfy the roadmap's safe operation layer.
   safety boundary.
 - [x] Implement new file/folder, rename, duplicate, copy, cut/move, paste,
   platform trash, explicit permanent delete, and multi-item operations.
-- [ ] Add bulk rename after the core operations are stable.
+- [x] Add bulk rename after the core operations are stable.
 - [x] Add progress, safe cancellation, retry, and completed/cancelled/partial/
   failed result summaries.
 - [x] Add overwrite, skip, rename, and cancel conflict handling.
-- [ ] Add cross-device move fallback and safe operation undo where trustworthy.
+- [x] Add cross-device move fallback and safe operation undo where trustworthy.
 - [x] Reject copies/moves into the source or its descendants and preserve
   permissions and timestamps where practical.
-- [ ] Handle locked, read-only, unavailable, case-only, and partially copied
+- [x] Handle locked, read-only, unavailable, case-only, and partially copied
   paths explicitly.
 - [x] Require exact-path or item-count confirmation for destructive actions and
   explicit confirmation before deleting/replacing an open dirty file.
@@ -210,15 +209,15 @@ not satisfy the roadmap's safe operation layer.
 
 ### Preview system
 
-- [ ] Create a provider-based, background preview API with size/time limits,
+- [x] Create a provider-based, background preview API with size/time limits,
   cancellation, generation IDs, and explicit unsupported/error states.
-- [ ] Add syntax-colored text/source and Markdown-source previews.
+- [x] Add syntax-colored text/source and Markdown-source previews.
 - [x] Add directory summaries and readable JSON, TOML, and YAML previews.
 - [x] Add binary metadata plus a bounded hexadecimal header.
 - [x] Add symlink target/status and basic image metadata previews.
 - [x] Guarantee that previews never execute untrusted files or block editor
   input.
-- [ ] Defer terminal images, PDF/archive previews, media metadata, and
+- [x] Defer terminal images, PDF/archive previews, media metadata, and
   extension-provided previewers until the initial provider API is stable.
 
 ### UI, settings, and test completion
@@ -258,26 +257,33 @@ not satisfy the roadmap's safe operation layer.
 
 ### Remaining work
 
-- [ ] Store one persistent full-document tree-sitter tree per open document and
+- [x] Store one persistent full-document tree-sitter tree per open document and
   update it incrementally instead of creating parsers during line rendering and
   feature requests.
-- [ ] Move highlighting to queries and add indentation queries plus bracket/
+- [x] Move highlighting to queries and add indentation queries plus bracket/
   syntax-node matching.
-- [ ] Create a data-driven language registry for extensions, comments, grammar,
-  queries, server, formatter, and platform-specific executable guidance.
-- [ ] Deliver complete Rust, C#, Python, Go, and JavaScript/TypeScript language
-  experiences; JavaScript/TypeScript parsing and LSP support are not present.
-- [ ] Detect and start available language servers automatically with visible
-  startup/indexing state, restart/stop, per-project disable, per-language
-  configuration, actionable missing-server guidance, and platform-aware
-  executable discovery.
-- [ ] Add signature help, selection formatting, document/workspace symbols, and
-  robust diagnostics/problems workflows.
-- [ ] Negotiate UTF-8/UTF-16/UTF-32 position encodings and replace
-  full-document `didChange` updates with incremental synchronization.
-- [ ] Add request cancellation, graceful restart, multiple simultaneous
-  servers, progress/configuration handling, and cross-platform integration
-  tests for all five official languages.
+- [x] Create a data-driven syntax registry for extensions, grammars, highlight
+  queries, and indentation queries.
+- [ ] Unify comments, server, formatter, and platform-specific executable
+  guidance with the syntax registry instead of maintaining adjacent registries.
+- [x] Add JavaScript/TypeScript parsing and automatic LSP support alongside
+  Rust, C#, Python, and Go.
+- [ ] Complete cross-platform integration and quality sign-off for all five
+  official language experiences.
+- [x] Detect and start available language servers automatically with visible
+  state, restart/stop controls, actionable missing-server guidance, and
+  platform-aware executable discovery.
+- [ ] Add persisted per-project LSP disable and per-language configuration.
+- [x] Add signature help, selection formatting, document symbols, and a
+  diagnostics/problems browser.
+- [ ] Add workspace-symbol search and complete problems workflow integration.
+- [x] Replace full-document `didChange` updates with minimal incremental
+  synchronization.
+- [ ] Negotiate and consistently apply UTF-8/UTF-16/UTF-32 position encodings.
+- [x] Add graceful language-server shutdown and bounded crash restart.
+- [ ] Add request cancellation, multiple simultaneous servers,
+  progress/configuration handling, and cross-platform integration tests for all
+  five official languages.
 - [ ] Keep explorer rename/move operations synchronized with LSP workspaces and
   open documents.
 
