@@ -319,8 +319,9 @@ fn repeated_edits_and_atomic_saves_remain_stable_in_a_real_pty() {
 
     for count in 1..=25 {
         process.send(b"x");
-        process.send(&[0x13]); // Ctrl-S
         let expected = format!("{}base", "x".repeat(count));
+        process.wait_for_output(expected.as_bytes(), Duration::from_secs(5));
+        process.send(&[0x13]); // Ctrl-S
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && fs::read_to_string(&file).unwrap() != expected {
             thread::sleep(Duration::from_millis(10));
