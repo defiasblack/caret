@@ -401,6 +401,7 @@ pub struct App {
     pub terminal_focused: bool,
     last_recovery_checkpoint: Instant,
     last_session_checkpoint: Instant,
+    last_session_state: Option<crate::session::SessionState>,
 }
 
 impl App {
@@ -635,6 +636,7 @@ impl App {
             terminal_focused: false,
             last_recovery_checkpoint: Instant::now(),
             last_session_checkpoint: Instant::now(),
+            last_session_state: None,
         };
         if let Some(session) = restored_session {
             app.project.visible = session.sidebar_visible;
@@ -706,6 +708,11 @@ impl App {
 
     pub fn handle_event(&mut self, event: Event) -> bool {
         self.poll_lsp();
+        self.checkpoint_persistence();
+        self.dispatch_event(event)
+    }
+
+    fn checkpoint_persistence(&mut self) {
         if self.last_recovery_checkpoint.elapsed() >= Duration::from_secs(2) {
             let entries = self.editor.dirty_recovery_entries();
             if entries.is_empty() {
@@ -741,11 +748,17 @@ impl App {
                     vertical: split.vertical,
                 }),
             };
-            if let Err(error) = crate::session::save(&session) {
-                self.message = format!("Session checkpoint failed: {error}");
+            if self.last_session_state.as_ref() != Some(&session) {
+                match crate::session::save(&session) {
+                    Ok(()) => self.last_session_state = Some(session),
+                    Err(error) => self.message = format!("Session checkpoint failed: {error}"),
+                }
             }
             self.last_session_checkpoint = Instant::now();
         }
+    }
+
+    fn dispatch_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.activate_focused_view();
@@ -896,6 +909,7 @@ impl App {
             changed |= terminal.poll();
         }
         self.poll_lsp();
+        self.checkpoint_persistence();
         if self.mode != Mode::ReloadConfirm && self.editor.changed_on_disk() {
             // Record the conflict immediately. Choosing "Later" must not
             // acknowledge the new disk version and silently allow a later

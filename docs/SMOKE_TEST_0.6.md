@@ -7,8 +7,10 @@ the editor without allowing normal cleanup.
 The automated suite now covers the durable save failure paths, BOM/line-ending
 handling, Unicode cell positioning, external-change protection, invalid
 configuration, session serialization, platform replacement, LSP stderr
-capture, and a process-level recovery kill/startup test. The checklist below
-remains the release sign-off for real terminals and filesystems.
+capture, and real-PTY edit/save/quit, repeated-save, external-conflict,
+forced-termination, recovery, and re-save workflows. The checklist below
+remains the human release sign-off for platform terminal and filesystem
+differences that automation can miss.
 
 1. Open a UTF-8 file with CRLF endings and a BOM. Edit and save it. Confirm the
    BOM, CRLF endings, and final-newline state are unchanged.

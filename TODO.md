@@ -58,6 +58,10 @@ It was reconciled against the repository on 2026-07-25.
   regression coverage, including forced process termination, broken symlinks,
   permission-denied/disappearing directories, unsafe path traversal, and
   destructive-operation guards.
+- [x] End-to-end real-PTY release tests for edit/save/clean exit, repeated
+  atomic saves, external-change confirmation, idle recovery checkpointing,
+  forced termination, recovery discovery, restore, and re-save on every CI
+  platform.
 - [x] Windows, macOS, and Linux CI build/test/diagnostic matrix plus Ubuntu
   install and PTY startup smoke coverage.
 
@@ -67,7 +71,7 @@ It was reconciled against the repository on 2026-07-25.
   sign-off on Windows, macOS, and Linux, including a slow/network-mounted
   directory where practical, using `docs/SMOKE_TEST_0.6.md`.
 - [ ] Complete a sustained dogfooding pass with no unresolved data-loss defect;
-  any data-loss issue blocks the release.
+  record it in `docs/DOGFOOD_0.6.md`; any data-loss issue blocks the release.
 
 ---
 

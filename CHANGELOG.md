@@ -45,6 +45,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Recovery journals are unique per Caret process instance, are discovered
   together, and a damaged journal no longer hides valid recovery data from
   another instance.
+- Recovery and session checkpoints now run while the editor is idle instead of
+  depending on a later input event. Cross-platform PTY tests exercise real
+  edit/save/quit, repeated-save, external-conflict, forced-termination, startup
+  discovery, recovery, and re-save workflows. Unchanged session snapshots are
+  not rewritten during idle polling.
 - Existing project-tree mutations now refuse destination replacement at the
   filesystem boundary, reject project-root traversal, and block permanent
   deletion of an open dirty file.

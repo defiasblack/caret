@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{document, editor::Cursor};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabState {
     pub path: PathBuf,
     pub cursor: CursorState,
@@ -14,7 +14,7 @@ pub struct TabState {
     pub scroll_column: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorState {
     pub line: usize,
     pub column: usize,
@@ -37,7 +37,7 @@ impl From<CursorState> for Cursor {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
     pub project_root: PathBuf,
     pub tabs: Vec<TabState>,
@@ -48,7 +48,7 @@ pub struct SessionState {
     pub split: Option<SplitState>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewState {
     pub tab_index: usize,
     pub cursor: CursorState,
@@ -56,7 +56,7 @@ pub struct ViewState {
     pub scroll_column: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitState {
     pub primary: ViewState,
     pub secondary: ViewState,

@@ -344,6 +344,8 @@ The release smoke checklist for atomic saves, recovery, external changes, and
 session restoration is in [Milestone 0.6 smoke tests](docs/SMOKE_TEST_0.6.md).
 The requirement-by-requirement automated and manual status is in
 [Milestone 0.6 release evidence](docs/RELEASE_0.6_EVIDENCE.md).
+Sustained release-candidate sessions are recorded in the
+[Milestone 0.6 dogfooding record](docs/DOGFOOD_0.6.md).
 The everyday-editing release checklist is in
 [Milestone 0.7 smoke tests](docs/SMOKE_TEST_0.7.md).
 The module boundaries are documented in [the architecture guide](docs/ARCHITECTURE.md).
