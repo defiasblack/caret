@@ -727,7 +727,7 @@ mod tests {
         let entry = tree
             .entries
             .iter()
-            .find(|entry| entry.path == link)
+            .find(|entry| entry.name == "missing-link")
             .expect("broken symlink should remain visible");
         assert!(entry.is_symlink);
         assert!(!entry.is_dir);
@@ -750,7 +750,7 @@ mod tests {
         let index = tree
             .entries
             .iter()
-            .position(|entry| entry.path == denied)
+            .position(|entry| entry.name == "denied")
             .expect("denied directory should still be listed");
         tree.selected = index;
         assert!(tree.expand_selected().is_ok());
