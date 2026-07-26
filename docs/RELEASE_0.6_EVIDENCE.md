@@ -16,7 +16,8 @@ for real-terminal validation.
 | Sessions restore safe workspace state | Project, tabs, active view, cursor/scroll, split, and sidebar serialization tests; clean exit forces the final checkpoint and removes its journal; missing tabs preserve the intended surviving active tab; stale positions are clamped; terminal processes are excluded | Pass |
 | Platform and filesystem failures are recoverable | Windows replacement, application paths, shell/PTY, symlink loop/broken link, permission-denied, disappearing-root, read-only, deleted-file, and no-replace operation tests | Pass |
 | Diagnostics are actionable | Structured log, configuration/OS/terminal/shell/recovery/clipboard report, explicit terminal/SSH/tmux/color capability report, background explorer failure logging, watcher/preview status, LSP stderr, and panic-terminal restoration coverage | Pass |
-| Supported-platform automation passes | [CI run 30183093386](https://github.com/defiasblack/caret/actions/runs/30183093386) on code commit `f112da9a3637e70c1b10789f75ddb9944403c529`: warning-denied format/lint/tests, release build, and `caret doctor` on Windows, macOS, and Ubuntu, plus locked Unix installation | Pass |
+| C# definition navigation reaches loaded solutions | Workspace discovery prefers an ancestor `.sln`/`.slnx` over a nested `.csproj`; existing Windows drive and UNC paths have URI round-trip tests; a real `csharp-ls 0.24.0` definition request against a loaded solution passed locally | Pass |
+| Supported-platform automation passes | [CI run 30183710766](https://github.com/defiasblack/caret/actions/runs/30183710766) on code commit `bf5883d1a5b8e83a2b3843e9d7b5620a91262c2f`: warning-denied format/lint/tests, release build, and `caret doctor` on Windows, macOS, and Ubuntu, plus locked Unix installation | Pass |
 | Real-terminal core safety paths work | The same candidate CI run passes cross-platform PTY tests for edit/save/quit, 25 synchronized complete saves, external-change refusal and explicit confirmation, idle checkpointing, forced termination, path-targeted recovery discovery, restore, and re-save | Pass |
 
 Local Windows verification on 2026-07-25 must include:
@@ -29,11 +30,13 @@ cargo build --release --locked
 target\release\caret.exe doctor
 ```
 
-Result on 2026-07-25: pass — formatting and Clippy were clean, 189 tests
-passed with one environment-dependent `rust-analyzer` integration test skipped,
-the release build completed, and the release binary produced a valid diagnostic
-report. The build used `target\verification` because another running Caret
-process held the ordinary release executable open.
+Result on 2026-07-25: pass — formatting and Clippy were clean, the default suite
+passed 188 unit tests and four real-PTY tests with the environment-dependent
+`rust-analyzer` and `csharp-ls` integrations skipped, and the opt-in real
+`csharp-ls 0.24.0` definition round trip also passed. The release build
+completed, reported `0.6.0-rc.2`, and produced a valid diagnostic report. The
+build used `target\verification` because another running Caret process held the
+ordinary release executable open.
 
 ## Manual release gates
 

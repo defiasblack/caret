@@ -12,6 +12,10 @@ forced-termination, recovery, and re-save workflows. The checklist below
 remains the human release sign-off for platform terminal and filesystem
 differences that automation can miss.
 
+Test only candidate `0.6.0-rc.2`, code commit
+`bf5883d1a5b8e83a2b3843e9d7b5620a91262c2f`, which passed
+[CI run 30183710766](https://github.com/defiasblack/caret/actions/runs/30183710766).
+
 1. Open a UTF-8 file with CRLF endings and a BOM. Edit and save it. Confirm the
    BOM, CRLF endings, and final-newline state are unchanged.
 2. Start editing a named file, wait at least two seconds, then forcibly stop
