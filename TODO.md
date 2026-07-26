@@ -71,6 +71,10 @@ It was reconciled against the repository on 2026-07-25.
 
 ### Remaining release work
 
+Automated release-candidate baseline: `0.6.0-rc.1`,
+`f112da9a3637e70c1b10789f75ddb9944403c529`, green on
+[CI run 30183093386](https://github.com/defiasblack/caret/actions/runs/30183093386).
+
 - [ ] Complete and record the interactive forced-termination and core-workflow
   sign-off on Windows, macOS, and Linux, including a slow/network-mounted
   directory where practical, using `docs/SMOKE_TEST_0.6.md`.

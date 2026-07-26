@@ -16,8 +16,8 @@ for real-terminal validation.
 | Sessions restore safe workspace state | Project, tabs, active view, cursor/scroll, split, and sidebar serialization tests; clean exit forces the final checkpoint and removes its journal; missing tabs preserve the intended surviving active tab; stale positions are clamped; terminal processes are excluded | Pass |
 | Platform and filesystem failures are recoverable | Windows replacement, application paths, shell/PTY, symlink loop/broken link, permission-denied, disappearing-root, read-only, deleted-file, and no-replace operation tests | Pass |
 | Diagnostics are actionable | Structured log, configuration/OS/terminal/shell/recovery/clipboard report, explicit terminal/SSH/tmux/color capability report, background explorer failure logging, watcher/preview status, LSP stderr, and panic-terminal restoration coverage | Pass |
-| Supported-platform automation passes | GitHub Actions format, Clippy, full tests, release build, and `caret doctor` on Windows, macOS, and Linux | Must pass on the release-candidate commit |
-| Real-terminal core safety paths work | Cross-platform PTY tests cover edit/save/quit, 25 consecutive complete saves, external-change refusal and explicit confirmation, idle checkpointing, forced termination, recovery discovery, restore, and re-save | Must pass on the release-candidate commit |
+| Supported-platform automation passes | [CI run 30183093386](https://github.com/defiasblack/caret/actions/runs/30183093386) on code commit `f112da9a3637e70c1b10789f75ddb9944403c529`: warning-denied format/lint/tests, release build, and `caret doctor` on Windows, macOS, and Ubuntu, plus locked Unix installation | Pass |
+| Real-terminal core safety paths work | The same candidate CI run passes cross-platform PTY tests for edit/save/quit, 25 synchronized complete saves, external-change refusal and explicit confirmation, idle checkpointing, forced termination, path-targeted recovery discovery, restore, and re-save | Pass |
 
 Local Windows verification on 2026-07-25 must include:
 
