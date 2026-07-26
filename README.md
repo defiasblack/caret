@@ -32,8 +32,6 @@ undo/redo.
 ## Build and install
 
 ```bash
-cargo build --release
-chmod +x install.sh
 ./install.sh
 ```
 
