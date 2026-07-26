@@ -4,9 +4,9 @@ Milestone 0.6 is not complete until Caret has been used for sustained real
 editing with no unresolved data-loss defect. Automated PTY and failure-path
 tests are prerequisites, not substitutes for this gate.
 
-Release-candidate version: **0.6.0-rc.1**  
-Tested code commit: **`f112da9a3637e70c1b10789f75ddb9944403c529`**  
-Candidate CI: **[run 30183093386](https://github.com/defiasblack/caret/actions/runs/30183093386) — Pass**
+- Release-candidate version: **0.6.0-rc.1**
+- Tested code commit: **`f112da9a3637e70c1b10789f75ddb9944403c529`**
+- Candidate CI: **[run 30183093386](https://github.com/defiasblack/caret/actions/runs/30183093386) — Pass**
 
 Use that code commit for every timed session. Documentation-only commits after
 it do not change the candidate binary.
