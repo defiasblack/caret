@@ -3,10 +3,15 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct PtyProcess {
     _master: Box<dyn MasterPty + Send>,
@@ -137,8 +142,9 @@ fn temp_root() -> PathBuf {
         .unwrap_or_default()
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "caret-pty-editor-smoke-{}-{unique}",
-        std::process::id()
+        "caret-pty-editor-smoke-{}-{unique}-{}",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
