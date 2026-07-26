@@ -14,6 +14,7 @@ struct PtyProcess {
     input: Box<dyn Write + Send>,
     output: Receiver<Vec<u8>>,
     captured: Vec<u8>,
+    parser: vt100::Parser,
 }
 
 impl PtyProcess {
@@ -60,6 +61,7 @@ impl PtyProcess {
             input,
             output,
             captured: Vec::new(),
+            parser: vt100::Parser::new(30, 100, 0),
         }
     }
 
@@ -77,12 +79,20 @@ impl PtyProcess {
                     // delivering application input.
                     self.send(b"\x1b[1;1R");
                 }
+                self.parser.process(&bytes);
                 self.captured.extend_from_slice(&bytes);
-                if self
+                let matched_output = self
                     .captured
                     .windows(needle.len())
-                    .any(|window| window == needle)
-                {
+                    .any(|window| window == needle);
+                let matched_screen = self
+                    .parser
+                    .screen()
+                    .contents()
+                    .as_bytes()
+                    .windows(needle.len())
+                    .any(|window| window == needle);
+                if matched_output || matched_screen {
                     return;
                 }
             }
