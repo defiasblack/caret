@@ -59,7 +59,7 @@ files. CI's runner temp directories are already isolated.
   throttling, and rejection of obsolete paths/save generations. Background polling
   continues during input activity.
 - Office supervision tests cover cancellation, obsolete generations, deadlines,
-  malformed/oversized responses and prelaunch input rejection. Integration tests
+  malformed/oversized responses and input rejection before parsing. Integration tests
   invoke the actual helper with malformed archives, oversized inputs, and a sparse
   A1-to-XFD1048576 range that would request billions of dense cells. Allocation
   fails inside the helper before the OS allocation; a subsequent normal load

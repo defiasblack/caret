@@ -76,11 +76,8 @@ impl OfficeLoader {
 
     fn start_with(&mut self, executable: &Path, path: &Path) -> io::Result<()> {
         self.cancel();
-        if std::fs::metadata(path)?.len() > crate::office_viewer::MAX_INPUT_BYTES {
-            return Err(io::Error::other(
-                "Office file exceeds the 32 MiB input budget",
-            ));
-        }
+        // Input validation belongs to the helper too: metadata on a slow
+        // filesystem must be covered by the deadline without blocking the UI.
         let started = Instant::now();
         let mut command = Command::new(executable);
         command.arg(WORKER_ARGUMENT).arg(path);
@@ -207,6 +204,19 @@ mod tests {
         loader
             .launch(&mut sleeping_command(), Instant::now())
             .unwrap();
+        assert!(loader
+            .start_with(
+                Path::new("missing-caret-test-worker"),
+                Path::new("superseded.xlsx")
+            )
+            .is_err());
+        assert!(
+            loader.job.is_none(),
+            "failed supersession must still cancel the old helper"
+        );
+        loader
+            .launch(&mut sleeping_command(), Instant::now())
+            .unwrap();
         loader.generation += 1;
         assert!(loader.poll().is_none());
         assert!(loader.job.is_none());
@@ -220,20 +230,17 @@ mod tests {
         assert!(loader.job.is_none());
     }
     #[test]
-    fn oversized_input_is_rejected_before_launching_a_child() {
+    fn oversized_input_is_rejected_before_parsing() {
         let path =
             std::env::temp_dir().join(format!("caret-office-size-{}.xlsx", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(crate::office_viewer::MAX_INPUT_BYTES + 1)
             .unwrap();
         drop(file);
-        let mut loader = OfficeLoader::default();
-        assert!(loader
-            .start_with(Path::new("nonexistent-worker"), &path)
+        assert!(OfficeViewer::open(&path)
             .unwrap_err()
             .to_string()
             .contains("32 MiB"));
-        assert!(loader.job.is_none());
         std::fs::remove_file(path).unwrap();
     }
 }

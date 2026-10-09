@@ -4383,7 +4383,13 @@ impl App {
                 self.mode = Mode::OfficeViewer;
                 self.message = format!("Loading {} · Esc cancels", path.display());
             }
-            Err(error) => self.message = format!("Could not open {}: {error}", path.display()),
+            Err(error) => {
+                self.office_loading = None;
+                if self.mode == Mode::OfficeViewer && self.office_viewer.is_none() {
+                    self.mode = self.preferred_editor_mode();
+                }
+                self.message = format!("Could not open {}: {error}", path.display());
+            }
         }
         true
     }
