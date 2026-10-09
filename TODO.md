@@ -93,9 +93,9 @@ It was reconciled against the repository on 2026-07-25.
 - [x] Supervise cancellable Office helper loads, reject obsolete results, and
   enforce input, allocation, deadline, cell-count, and response budgets; document
   the defaults and retain supported formats and display limits.
-- [ ] Record Windows/Linux/macOS formatting, warnings-denied Clippy, full tests,
+- [x] Record Windows/Linux/macOS formatting, warnings-denied Clippy, full tests,
   release builds, PTY smoke tests, and release performance measurements for these
-  repairs.
+  repairs in `docs/RELIABILITY_VALIDATION.md`.
 
 ### Remaining release work
 

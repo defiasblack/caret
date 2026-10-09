@@ -277,6 +277,15 @@ impl Editor {
     }
 
     fn save_to(&mut self, path: &Path, overwrite_confirmed: bool) -> io::Result<()> {
+        self.save_to_with(path, overwrite_confirmed, || {})
+    }
+
+    fn save_to_with(
+        &mut self,
+        path: &Path,
+        overwrite_confirmed: bool,
+        after_write: impl FnOnce(),
+    ) -> io::Result<()> {
         let saving_current_path = self
             .path
             .as_deref()
@@ -344,6 +353,7 @@ impl Editor {
             document::atomic_write_if_unchanged(path, expected_fingerprint, &bytes)?;
         }
 
+        after_write();
         self.path = Some(path.to_path_buf());
         let source = self.buffer.to_string();
         if self
@@ -3383,6 +3393,32 @@ mod tests {
         let mut editor = Editor::from_snapshot(&path, snapshot).unwrap();
         assert_eq!(editor.text(), "original");
         editor.insert_char('!');
+        assert!(editor.save().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn undo_save_redo_and_post_save_external_edits_remain_dirty_or_protected() {
+        let path = std::env::temp_dir().join(format!("caret-save-baseline-{}", std::process::id()));
+        fs::write(&path, "original").unwrap();
+        let mut editor = Editor::from_file(&path).unwrap();
+        editor.insert_char('!');
+        editor.finish_undo_group();
+        editor.undo();
+        editor.save().unwrap();
+        assert!(!editor.dirty);
+        editor.redo();
+        assert!(editor.dirty);
+        let saved = editor.text();
+        editor
+            .save_to_with(&path, false, || fs::write(&path, "external").unwrap())
+            .unwrap();
+        assert_eq!(
+            editor.expected_disk_state().fingerprint,
+            Some(document::fingerprint_bytes(saved.as_bytes()))
+        );
+        assert_eq!(editor.expected_disk_state().len, Some(saved.len() as u64));
+        assert!(editor.changed_on_disk());
         assert!(editor.save().is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "external");
         fs::remove_file(path).unwrap();
