@@ -334,6 +334,20 @@ Press `v`, double-click, or open a supported document with `Enter`, `:e`,
 `:tabnew`, the project tree, the file picker, or Caret's command line. No
 Office, `xleak`, or `doxx` installation is required.
 
+Native Office loading runs in a disposable helper process. The editor shows a
+loading state and remains responsive; `Esc` cancels loading. Each load has a
+32 MiB input limit, a five-second deadline, a 512 MiB live Rust allocation
+budget enforced before parser allocations, a combined one-million populated
+value/formula-cell limit across the workbook, and a 64 MiB serialized response
+limit. Files exceeding these budgets are rejected with an error. Parser crashes
+and memory exhaustion affect only the helper. The allocation budget excludes
+OS/runtime overhead; it is not a total resident-memory limit. Workbook content
+retains the existing 100,000-row, 512-column, and 512-character-per-cell limits;
+content beyond those display limits is marked as truncated. Sparse sheets keep
+absolute cell addresses without allocating a padded editor grid. DOCX text
+extraction also retains its existing byte, line, and time limits.
+
+
 Inside the viewer, use arrows or `h/j/k/l` to navigate, Page Up/Down for larger
 moves, `/` to search, `n`/`N` for the next/previous match, `c` or `Ctrl-C` to
 copy the current cell or line, `Enter` for full details, and `q` or `Esc` to

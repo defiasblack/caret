@@ -1,10 +1,12 @@
 use std::{
+    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
 };
 
-use calamine::{open_workbook_auto, Reader};
+use calamine::{open_workbook_auto_from_rs, DataType, Reader};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::{Deserialize, Serialize};
 
 use crate::preview;
 
@@ -12,7 +14,7 @@ const MAX_SHEET_ROWS: usize = 100_000;
 const MAX_SHEET_COLUMNS: usize = 512;
 const MAX_CELL_CHARACTERS: usize = 512;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfficeViewer {
     pub path: PathBuf,
     pub title: String,
@@ -22,13 +24,13 @@ pub struct OfficeViewer {
     pub status: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OfficeContent {
     Spreadsheet(SpreadsheetView),
     Document(DocumentView),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpreadsheetView {
     pub sheets: Vec<SheetView>,
     pub active_sheet: usize,
@@ -39,15 +41,17 @@ pub struct SpreadsheetView {
     pub detail_open: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SheetView {
     pub name: String,
-    pub cells: Vec<Vec<String>>,
-    pub formulas: Vec<Vec<String>>,
+    pub cells: BTreeMap<usize, BTreeMap<usize, String>>,
+    pub formulas: BTreeMap<usize, BTreeMap<usize, String>>,
+    pub row_count: usize,
+    pub column_count: usize,
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentView {
     pub lines: Vec<String>,
     pub cursor_line: usize,
@@ -62,8 +66,37 @@ pub enum ViewerAction {
     Copy(String),
 }
 
+pub const ROW_HEADER_WIDTH: usize = 7;
+pub const CELL_WIDTH: usize = 24;
+pub const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_CELLS: usize = 1_000_000;
+#[derive(Debug, Clone, Copy)]
+pub struct ViewerViewport {
+    pub rows: usize,
+    pub columns: usize,
+}
+impl ViewerViewport {
+    pub fn spreadsheet(height: usize, width: usize) -> Self {
+        Self {
+            rows: height.saturating_sub(5),
+            columns: width.saturating_sub(ROW_HEADER_WIDTH) / CELL_WIDTH,
+        }
+    }
+    pub fn document(height: usize) -> Self {
+        Self {
+            rows: height.saturating_sub(3),
+            columns: 1,
+        }
+    }
+}
+
 impl OfficeViewer {
     pub fn open(path: &Path) -> io::Result<Self> {
+        if std::fs::metadata(path)?.len() > MAX_INPUT_BYTES {
+            return Err(io::Error::other(
+                "Office file exceeds the 32 MiB input budget",
+            ));
+        }
         let extension = extension(path);
         let content = if extension == "docx" {
             OfficeContent::Document(load_document(path)?)
@@ -247,17 +280,18 @@ impl SpreadsheetView {
     }
 
     fn ensure_visible(&mut self, rows: usize, columns: usize) {
-        let visible_rows = rows.saturating_sub(4).max(1);
+        let viewport = ViewerViewport::spreadsheet(rows, columns);
+        let visible_rows = viewport.rows.max(1);
         if self.row < self.scroll_row {
             self.scroll_row = self.row;
         } else if self.row >= self.scroll_row + visible_rows {
             self.scroll_row = self.row + 1 - visible_rows;
         }
-        let approximate_visible_columns = (columns.saturating_sub(8) / 14).max(1);
+        let visible_columns = viewport.columns.max(1);
         if self.column < self.scroll_column {
             self.scroll_column = self.column;
-        } else if self.column >= self.scroll_column + approximate_visible_columns {
-            self.scroll_column = self.column + 1 - approximate_visible_columns;
+        } else if self.column >= self.scroll_column + visible_columns {
+            self.scroll_column = self.column + 1 - visible_columns;
         }
     }
 
@@ -269,53 +303,78 @@ impl SpreadsheetView {
         if row_count == 0 || column_count == 0 {
             return false;
         }
-        let total = row_count.saturating_mul(column_count);
-        let start = self
-            .row
-            .saturating_mul(column_count)
-            .saturating_add(self.column);
-        for offset in 1..=total {
-            let index = if reverse {
-                (start + total - (offset % total)) % total
-            } else {
-                (start + offset) % total
-            };
-            let row = index / column_count;
-            let column = index % column_count;
-            if sheet
-                .cell(row, column)
-                .is_some_and(|cell| cell.to_ascii_lowercase().contains(needle))
-            {
-                self.row = row;
-                self.column = column;
-                return true;
-            }
+        let start = (self.row, self.column);
+        let matching = sheet
+            .cells
+            .iter()
+            .flat_map(|(row, values)| {
+                values
+                    .iter()
+                    .map(move |(column, value)| ((*row, *column), value))
+            })
+            .filter(|(_, value)| value.to_ascii_lowercase().contains(needle))
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        let next = if reverse {
+            matching
+                .iter()
+                .rev()
+                .find(|position| **position < start)
+                .or_else(|| matching.last())
+        } else {
+            matching
+                .iter()
+                .find(|position| **position > start)
+                .or_else(|| matching.first())
+        };
+        if let Some(&(row, column)) = next {
+            self.row = row;
+            self.column = column;
+            return true;
         }
         false
     }
 }
 
 impl SheetView {
-    pub fn dimensions(&self) -> (usize, usize) {
-        (
-            self.cells.len(),
-            self.cells.iter().map(Vec::len).max().unwrap_or(0),
-        )
+    fn empty(name: String) -> Self {
+        Self {
+            name,
+            cells: BTreeMap::new(),
+            formulas: BTreeMap::new(),
+            row_count: 0,
+            column_count: 0,
+            truncated: false,
+        }
     }
-
+    #[cfg(test)]
+    pub fn from_rows(name: &str, rows: Vec<Vec<String>>) -> Self {
+        let mut sheet = Self::empty(name.to_string());
+        for (row, cells) in rows.into_iter().enumerate() {
+            sheet.row_count = row + 1;
+            sheet.column_count = sheet.column_count.max(cells.len());
+            for (column, text) in cells.into_iter().enumerate() {
+                if !text.is_empty() {
+                    sheet.cells.entry(row).or_default().insert(column, text);
+                }
+            }
+        }
+        sheet
+    }
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.row_count, self.column_count)
+    }
     pub fn cell(&self, row: usize, column: usize) -> Option<&str> {
         self.cells
-            .get(row)
-            .and_then(|values| values.get(column))
+            .get(&row)
+            .and_then(|values| values.get(&column))
             .map(String::as_str)
     }
-
     pub fn formula(&self, row: usize, column: usize) -> Option<&str> {
         self.formulas
-            .get(row)
-            .and_then(|values| values.get(column))
+            .get(&row)
+            .and_then(|values| values.get(&column))
             .map(String::as_str)
-            .filter(|formula| !formula.is_empty())
     }
 }
 
@@ -341,7 +400,7 @@ impl DocumentView {
     }
 
     fn ensure_visible(&mut self, rows: usize) {
-        let visible = rows.saturating_sub(3).max(1);
+        let visible = ViewerViewport::document(rows).rows.max(1);
         if self.cursor_line < self.scroll_line {
             self.scroll_line = self.cursor_line;
         } else if self.cursor_line >= self.scroll_line + visible {
@@ -370,55 +429,60 @@ impl DocumentView {
 }
 
 fn load_spreadsheet(path: &Path) -> io::Result<SpreadsheetView> {
-    let mut workbook =
-        open_workbook_auto(path).map_err(|error| io::Error::other(error.to_string()))?;
-    let names = workbook.sheet_names();
-    let mut sheets = Vec::with_capacity(names.len());
-    for name in names {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(io::Error::other(
+            "Office file exceeds the 32 MiB input budget",
+        ));
+    }
+    let mut workbook = open_workbook_auto_from_rs(std::io::Cursor::new(bytes))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut sheets = Vec::new();
+    let mut cell_count = 0;
+    for name in workbook.sheet_names() {
+        let mut sheet = SheetView::empty(name.clone());
         let range = workbook
             .worksheet_range(&name)
             .map_err(|error| io::Error::other(error.to_string()))?;
-        let formulas = workbook.worksheet_formula(&name).unwrap_or_default();
-        let source_rows = range.rows().take(MAX_SHEET_ROWS + 1).collect::<Vec<_>>();
-        let truncated_rows = source_rows.len() > MAX_SHEET_ROWS;
-        let cells = source_rows
-            .iter()
-            .take(MAX_SHEET_ROWS)
-            .map(|row| {
-                row.iter()
-                    .take(MAX_SHEET_COLUMNS)
-                    .map(|cell| bounded_cell(&cell.to_string()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let formula_rows = formulas
-            .rows()
-            .take(MAX_SHEET_ROWS)
-            .map(|row| {
-                row.iter()
-                    .take(MAX_SHEET_COLUMNS)
-                    .map(|formula| bounded_cell(formula))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let truncated_columns = source_rows
-            .iter()
-            .take(MAX_SHEET_ROWS)
-            .any(|row| row.len() > MAX_SHEET_COLUMNS);
-        sheets.push(SheetView {
-            name,
-            cells,
-            formulas: formula_rows,
-            truncated: truncated_rows || truncated_columns,
-        });
+        let (start_row, start_column) = range.start().unwrap_or((0, 0));
+        for (row, column, cell) in range.used_cells() {
+            if cell.is_empty() {
+                continue;
+            }
+            add_cell(
+                &mut sheet,
+                row + start_row as usize,
+                column + start_column as usize,
+                &cell.to_string(),
+                false,
+                &mut cell_count,
+            )?;
+        }
+        drop(range);
+        let formulas = workbook
+            .worksheet_formula(&name)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let (start_row, start_column) = formulas.start().unwrap_or((0, 0));
+        for (row, column, formula) in formulas.used_cells() {
+            if !formula.is_empty() {
+                add_cell(
+                    &mut sheet,
+                    row + start_row as usize,
+                    column + start_column as usize,
+                    formula,
+                    true,
+                    &mut cell_count,
+                )?;
+            }
+        }
+        sheets.push(sheet);
     }
     if sheets.is_empty() {
-        sheets.push(SheetView {
-            name: "Sheet1".to_string(),
-            cells: vec![Vec::new()],
-            formulas: Vec::new(),
-            truncated: false,
-        });
+        sheets.push(SheetView::empty("Sheet1".into()));
     }
     Ok(SpreadsheetView {
         sheets,
@@ -429,6 +493,41 @@ fn load_spreadsheet(path: &Path) -> io::Result<SpreadsheetView> {
         scroll_column: 0,
         detail_open: false,
     })
+}
+
+fn add_cell(
+    sheet: &mut SheetView,
+    row: usize,
+    column: usize,
+    value: &str,
+    formula: bool,
+    count: &mut usize,
+) -> io::Result<()> {
+    *count += 1;
+    if *count > MAX_CELLS {
+        return Err(io::Error::other(
+            "workbook exceeds the one million cell budget",
+        ));
+    }
+    if row >= MAX_SHEET_ROWS || column >= MAX_SHEET_COLUMNS {
+        sheet.truncated = true;
+        return Ok(());
+    }
+    sheet.row_count = sheet.row_count.max(row + 1);
+    sheet.column_count = sheet.column_count.max(column + 1);
+    let cells = if formula {
+        &mut sheet.formulas
+    } else {
+        &mut sheet.cells
+    };
+    if value.chars().count() > MAX_CELL_CHARACTERS {
+        sheet.truncated = true;
+    }
+    cells
+        .entry(row)
+        .or_default()
+        .insert(column, bounded_cell(value));
+    Ok(())
 }
 
 fn load_document(path: &Path) -> io::Result<DocumentView> {
@@ -499,15 +598,13 @@ mod tests {
     #[test]
     fn spreadsheet_navigation_and_search_are_bounded() {
         let mut view = SpreadsheetView {
-            sheets: vec![SheetView {
-                name: "Orders".to_string(),
-                cells: vec![
+            sheets: vec![SheetView::from_rows(
+                "Orders",
+                vec![
                     vec!["ID".to_string(), "Description".to_string()],
                     vec!["42".to_string(), "Blue widget".to_string()],
                 ],
-                formulas: Vec::new(),
-                truncated: false,
-            }],
+            )],
             active_sheet: 0,
             row: 0,
             column: 0,
@@ -536,5 +633,81 @@ mod tests {
         assert!(view.find("alpha", false));
         assert_eq!(view.cursor_line, 0);
         assert!(!view.find("missing", false));
+    }
+
+    #[test]
+    fn offset_value_and_formula_ranges_keep_absolute_coordinates() {
+        let path = std::env::temp_dir().join(format!("caret-offset-{}.xlsx", std::process::id()));
+        crate::test_support::write_workbook(
+            &path,
+            r#"<row r="3"><c r="B3"><v>7</v></c></row><row r="5"><c r="D5"><f>SUM(B3)</f></c></row>"#,
+        );
+        let viewer = OfficeViewer::open(&path).unwrap();
+        let OfficeContent::Spreadsheet(view) = viewer.content else {
+            panic!("spreadsheet");
+        };
+        let sheet = view.active().unwrap();
+        assert_eq!(sheet.cell(2, 1), Some("7"));
+        assert_eq!(sheet.formula(4, 3), Some("SUM(B3)"));
+        assert_eq!(sheet.cell(0, 0), None);
+        assert_eq!(sheet.formula(0, 0), None);
+        assert_eq!(sheet.dimensions(), (5, 4));
+        assert_eq!(sheet.cells.values().map(BTreeMap::len).sum::<usize>(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn sparse_formula_only_and_empty_sheets_obey_budgets() {
+        let mut sheet = SheetView::empty("empty".into());
+        let mut count = 0;
+        assert_eq!(sheet.dimensions(), (0, 0));
+        add_cell(&mut sheet, 99_999, 511, "A1", true, &mut count).unwrap();
+        assert_eq!(sheet.dimensions(), (100_000, 512));
+        assert!(sheet.cells.is_empty());
+        assert_eq!(sheet.formulas.len(), 1);
+        add_cell(&mut sheet, 100_000, 512, "hidden", false, &mut count).unwrap();
+        assert!(sheet.truncated);
+        count = MAX_CELLS;
+        assert!(add_cell(&mut sheet, 0, 0, "too many", false, &mut count).is_err());
+    }
+    #[test]
+    fn paging_and_resizing_keep_selection_inside_the_drawn_viewport() {
+        let mut viewer = OfficeViewer {
+            path: PathBuf::from("big.xlsx"),
+            title: "big".into(),
+            content: OfficeContent::Spreadsheet(SpreadsheetView {
+                sheets: vec![SheetView::from_rows("big", vec![vec!["x".into(); 50]; 100])],
+                active_sheet: 0,
+                row: 0,
+                column: 0,
+                scroll_row: 0,
+                scroll_column: 0,
+                detail_open: false,
+            }),
+            search_query: String::new(),
+            search_editing: false,
+            status: String::new(),
+        };
+        for (height, width) in [(40, 120), (9, 55), (6, 31), (4, 5), (30, 200)] {
+            let viewport = ViewerViewport::spreadsheet(height, width);
+            viewer.handle_key(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                viewport.rows,
+            );
+            viewer.handle_key(
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+                viewport.rows,
+            );
+            viewer.ensure_visible(height, width);
+            let OfficeContent::Spreadsheet(view) = &viewer.content else {
+                unreachable!()
+            };
+            assert!(
+                view.row >= view.scroll_row && view.row < view.scroll_row + viewport.rows.max(1)
+            );
+            assert!(
+                view.column >= view.scroll_column
+                    && view.column < view.scroll_column + viewport.columns.max(1)
+            );
+        }
     }
 }

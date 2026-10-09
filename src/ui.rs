@@ -60,8 +60,8 @@ struct ManagerPanel {
     width: usize,
 }
 
-const OFFICE_ROW_HEADER_WIDTH: usize = 7;
-const OFFICE_CELL_WIDTH: usize = 24;
+const OFFICE_ROW_HEADER_WIDTH: usize = crate::office_viewer::ROW_HEADER_WIDTH;
+const OFFICE_CELL_WIDTH: usize = crate::office_viewer::CELL_WIDTH;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OfficeViewerHit {
@@ -157,8 +157,19 @@ pub fn office_viewer_hit_at(
     match &viewer.content {
         OfficeContent::Spreadsheet(view) => {
             if local_row < 3
-                || local_row >= layout.content_height.saturating_sub(2)
+                || local_row - 3
+                    >= crate::office_viewer::ViewerViewport::spreadsheet(
+                        layout.content_height,
+                        layout.editor_width,
+                    )
+                    .rows
                 || local_column < OFFICE_ROW_HEADER_WIDTH
+                || (local_column - OFFICE_ROW_HEADER_WIDTH) / OFFICE_CELL_WIDTH
+                    >= crate::office_viewer::ViewerViewport::spreadsheet(
+                        layout.content_height,
+                        layout.editor_width,
+                    )
+                    .columns
             {
                 return None;
             }
@@ -1499,6 +1510,27 @@ fn draw_office_viewer<W: Write>(
     width: u16,
 ) -> io::Result<()> {
     let Some(viewer) = app.office_viewer.as_ref() else {
+        for offset in 0..rows {
+            queue!(
+                out,
+                MoveTo(x, top + offset as u16),
+                SetBackgroundColor(app.theme.background),
+                SetForegroundColor(app.theme.foreground),
+                Print(" ".repeat(width as usize))
+            )?;
+        }
+        let label = app
+            .office_loading
+            .as_ref()
+            .map(|path| format!(" Loading {} · Esc cancels", path.display()))
+            .unwrap_or_default();
+        if rows > 0 {
+            queue!(
+                out,
+                MoveTo(x, top),
+                Print(pad_or_truncate(&label, width as usize))
+            )?;
+        }
         return Ok(());
     };
     let width = width as usize;
@@ -1559,6 +1591,13 @@ fn draw_spreadsheet_viewer<W: Write>(
         x,
         width,
     } = area;
+    if rows < 5 || width < OFFICE_ROW_HEADER_WIDTH + OFFICE_CELL_WIDTH {
+        return queue!(
+            out,
+            MoveTo(x, top),
+            Print(pad_or_truncate(" Enlarge terminal to view cells", width))
+        );
+    }
     let Some(sheet) = view.active() else {
         return Ok(());
     };
@@ -1586,8 +1625,9 @@ fn draw_spreadsheet_viewer<W: Write>(
         ))
     )?;
 
-    let visible_columns = width.saturating_sub(OFFICE_ROW_HEADER_WIDTH) / OFFICE_CELL_WIDTH;
-    let data_rows = rows.saturating_sub(5);
+    let viewport = crate::office_viewer::ViewerViewport::spreadsheet(rows, width);
+    let visible_columns = viewport.columns;
+    let data_rows = viewport.rows;
     queue!(
         out,
         MoveTo(x, top + 2),
@@ -1702,7 +1742,7 @@ fn draw_spreadsheet_viewer<W: Write>(
         MoveTo(x, footer_y),
         SetBackgroundColor(app.theme.overlay),
         SetForegroundColor(app.theme.overlay_text),
-        Print(pad_or_truncate(&detail, width))
+        Print(pad_or_truncate(&manager_display_line(&detail), width))
     )?;
     if view.detail_open && rows >= 8 {
         draw_viewer_detail(
@@ -1753,7 +1793,7 @@ fn draw_document_viewer<W: Write>(
         x,
         width,
     } = area;
-    let content_rows = rows.saturating_sub(3);
+    let content_rows = crate::office_viewer::ViewerViewport::document(rows).rows;
     for offset in 0..content_rows {
         let line_index = view.scroll_line + offset;
         let y = top + 1 + offset as u16;

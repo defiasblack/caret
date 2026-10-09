@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs, io,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -255,7 +255,10 @@ impl PluginRegistry {
             })
             .ok_or_else(|| format!("Unknown plugin command: {name}"))?;
         let program = resolve_program(&plugin.directory, &command.program);
-        let mut child = Command::new(&program)
+        let payload =
+            serde_json::to_vec(context).map_err(|error| format!("Plugin input failed: {error}"))?;
+        let deadline = Instant::now() + Duration::from_millis(command.timeout_ms.max(100));
+        let child = Command::new(&program)
             .args(&command.args)
             .current_dir(&plugin.directory)
             .stdin(Stdio::piped())
@@ -263,32 +266,50 @@ impl PluginRegistry {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("Could not start plugin command {name}: {error}"))?;
-        if let Some(mut input) = child.stdin.take() {
-            serde_json::to_writer(&mut input, context)
-                .map_err(|error| format!("Plugin input failed: {error}"))?;
-            input
-                .flush()
-                .map_err(|error| format!("Plugin input failed: {error}"))?;
-        }
-        let deadline = Instant::now() + Duration::from_millis(command.timeout_ms.max(100));
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "Plugin {name} timed out after {} ms",
-                        command.timeout_ms.max(100)
-                    ));
-                }
-                Err(error) => return Err(format!("Plugin command failed: {error}")),
+        let mut guard = PluginChild(child);
+        let mut input = guard.0.stdin.take().expect("piped stdin");
+        let output = guard.0.stdout.take().expect("piped stdout");
+        let errors = guard.0.stderr.take().expect("piped stderr");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let writer_sender = sender.clone();
+        thread::spawn(move || {
+            let result = input
+                .write_all(&payload)
+                .and_then(|()| input.flush())
+                .map(|()| Vec::new());
+            drop(input);
+            let _ = writer_sender.send((0, result));
+        });
+        drain_plugin_pipe(output, sender.clone(), 1);
+        drain_plugin_pipe(errors, sender, 2);
+        let mut streams: [Option<Vec<u8>>; 3] = [None, None, None];
+        let status = loop {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Plugin {name} timed out after {} ms",
+                    command.timeout_ms.max(100)
+                ));
             }
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("Plugin command failed: {error}"))?;
+            while let Ok((index, result)) = receiver.try_recv() {
+                streams[index] =
+                    Some(result.map_err(|error| format!("Plugin I/O failed: {error}"))?);
+            }
+            let exited = guard
+                .0
+                .try_wait()
+                .map_err(|error| format!("Plugin command failed: {error}"))?;
+            if let Some(status) = exited {
+                if streams.iter().all(Option::is_some) {
+                    break status;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        let output = std::process::Output {
+            status,
+            stdout: streams[1].take().unwrap_or_default(),
+            stderr: streams[2].take().unwrap_or_default(),
+        };
         if !output.status.success() {
             return Err(format!(
                 "Plugin {name} failed: {}",
@@ -301,6 +322,26 @@ impl PluginRegistry {
         serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("Plugin {name} returned invalid JSON: {error}"))
     }
+}
+
+struct PluginChild(std::process::Child);
+impl Drop for PluginChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn drain_plugin_pipe(
+    mut pipe: impl Read + Send + 'static,
+    sender: std::sync::mpsc::Sender<(usize, io::Result<Vec<u8>>)>,
+    index: usize,
+) {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send((index, result));
+    });
 }
 
 fn default_timeout_ms() -> u64 {
@@ -412,5 +453,109 @@ mod tests {
             .run("uppercase", &context)
             .expect("run sample plugin");
         assert_eq!(response.replace_selection.as_deref(), Some("HELLO"));
+    }
+
+    fn shell_registry(script: &str, timeout_ms: u64) -> (PluginRegistry, PluginContext) {
+        #[cfg(windows)]
+        let (program, args) = (
+            "powershell.exe",
+            vec!["-NoProfile", "-NonInteractive", "-Command", script],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = ("/bin/sh", vec!["-c", script]);
+        let directory = std::env::temp_dir();
+        let registry = PluginRegistry {
+            plugins: vec![LoadedPlugin {
+                directory: directory.clone(),
+                manifest: PluginManifest {
+                    name: "test".into(),
+                    commands: vec![PluginCommand {
+                        name: "test".into(),
+                        description: String::new(),
+                        program: program.into(),
+                        args: args.into_iter().map(str::to_string).collect(),
+                        timeout_ms,
+                    }],
+                    ..Default::default()
+                },
+            }],
+            errors: vec![],
+        };
+        let context = PluginContext {
+            project: directory.display().to_string(),
+            file: None,
+            language: "Text".into(),
+            text: "x".repeat(2 * 1024 * 1024),
+            selection: None,
+            cursor_line: 0,
+            cursor_column: 0,
+            arguments: vec![],
+            event: "command".into(),
+        };
+        (registry, context)
+    }
+    #[test]
+    fn drains_both_large_pipes_while_sending_large_input() {
+        #[cfg(windows)]
+        let script = r#"[Console]::Out.Write('{"message":"'); [Console]::Out.Write(('x' * 1048576)); [Console]::Error.Write(('e' * 1048576)); $inputText = [Console]::In.ReadToEnd(); if ($inputText.Length -lt 2097152) { exit 2 }; [Console]::Out.Write('"}')"#;
+        #[cfg(not(windows))]
+        let script = r#"printf '{"message":"'; head -c 1048576 /dev/zero | tr '\000' x; head -c 1048576 /dev/zero | tr '\000' e >&2; cat >/dev/null; printf '"}'"#;
+        let (registry, context) = shell_registry(script, 15000);
+        let response = registry.run("test", &context).unwrap();
+        assert_eq!(response.message.unwrap().len(), 1048576);
+    }
+    #[test]
+    fn malformed_plugin_responses_are_reported() {
+        #[cfg(windows)]
+        let script = "[Console]::In.ReadToEnd() | Out-Null; [Console]::Out.Write('invalid')";
+        #[cfg(not(windows))]
+        let script = "cat >/dev/null; printf invalid";
+        let (registry, context) = shell_registry(script, 10000);
+        assert!(registry
+            .run("test", &context)
+            .unwrap_err()
+            .contains("invalid JSON"));
+    }
+    #[test]
+    fn timeout_covers_blocked_stdin_and_reaps_the_child() {
+        #[cfg(windows)]
+        let script = "Start-Sleep -Seconds 30";
+        #[cfg(not(windows))]
+        let script = "exec sleep 30";
+        let (registry, context) = shell_registry(script, 1000);
+        let started = Instant::now();
+        assert!(registry
+            .run("test", &context)
+            .unwrap_err()
+            .contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let command = &registry.plugins[0].manifest.commands[0];
+        let child = Command::new(&command.program)
+            .args(&command.args)
+            .spawn()
+            .unwrap();
+        let id = child.id();
+        drop(PluginChild(child));
+        #[cfg(unix)]
+        unsafe {
+            assert_eq!(
+                libc::waitpid(id as i32, std::ptr::null_mut(), libc::WNOHANG),
+                -1
+            );
+        }
+        #[cfg(windows)]
+        {
+            let status = Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "if (Get-Process -Id {id} -ErrorAction SilentlyContinue) {{ exit 1 }}"
+                    ),
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success(), "timed-out child still running");
+        }
     }
 }

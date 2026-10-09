@@ -149,13 +149,39 @@ fn rename_without_replace_platform(source: &Path, destination: &Path) -> io::Res
 }
 
 pub fn copy_file_without_replace(source: &Path, destination: &Path) -> io::Result<u64> {
+    copy_file_with_progress(source, destination, &AtomicBool::new(false), |_| {})
+}
+
+fn copy_file_with_progress(
+    source: &Path,
+    destination: &Path,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(u64),
+) -> io::Result<u64> {
+    use std::io::Read;
     let mut input = fs::File::open(source)?;
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(destination)?;
     let result = (|| {
-        let copied = io::copy(&mut input, &mut output)?;
+        let mut copied = 0;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    ErrorKind::Interrupted,
+                    "operation cancelled",
+                ));
+            }
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count])?;
+            copied += count as u64;
+            progress(copied);
+        }
         output.flush()?;
         output.sync_all()?;
         if let Ok(metadata) = input.metadata() {
@@ -678,10 +704,10 @@ fn transfer_one(
     if kind == OperationKind::Move {
         if overwrite {
             copy_path_safely(source, &destination, true, cancelled)?;
-            remove_path(source)?;
+            finish_move(source, &destination, remove_path)?;
             return Ok(Some(destination));
         }
-        match fs::rename(source, &destination) {
+        match rename_without_replace(source, &destination) {
             Ok(()) => return Ok(Some(destination)),
             Err(error) if is_cross_device(&error) => {}
             Err(error) => return Err(error),
@@ -690,16 +716,7 @@ fn transfer_one(
 
     copy_path_safely(source, &destination, overwrite, cancelled)?;
     if kind == OperationKind::Move {
-        if let Err(error) = remove_path(source) {
-            let _ = remove_path(&destination);
-            return Err(io::Error::new(
-                error.kind(),
-                format!(
-                    "copied to {}, but could not remove source: {error}",
-                    destination.display()
-                ),
-            ));
-        }
+        finish_move(source, &destination, remove_path)?;
     }
     Ok(Some(destination))
 }
@@ -776,19 +793,89 @@ fn copy_path_safely(
     overwrite: bool,
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
-    if !overwrite {
-        if let Err(error) = copy_path(source, destination, cancelled) {
-            return Err(cleanup_failed_copy(destination, error));
-        }
-        return Ok(());
-    }
+    copy_path_safely_with(source, destination, overwrite, cancelled, || {})
+}
 
+fn copy_path_safely_with(
+    source: &Path,
+    destination: &Path,
+    overwrite: bool,
+    cancelled: &AtomicBool,
+    before_install: impl FnOnce(),
+) -> io::Result<()> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let temporary = unique_temporary_path(parent);
+    let staging = reserve_copy_directory(parent)?;
+    let temporary = staging.join("payload");
     if let Err(error) = copy_path(source, &temporary, cancelled) {
-        return Err(cleanup_failed_copy(&temporary, error));
+        // This directory was created exclusively by this operation. Never
+        // clean up the public destination after a failed copy.
+        return Err(cleanup_failed_copy(&staging, error));
     }
-    install_completed_replacement(&temporary, destination)
+    before_install();
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(cleanup_failed_copy(
+            &staging,
+            io::Error::new(ErrorKind::Interrupted, "operation cancelled"),
+        ));
+    }
+    let result = if overwrite {
+        install_completed_replacement(&temporary, destination)
+    } else {
+        rename_without_replace(&temporary, destination)
+    };
+    if let Err(error) = result {
+        if !overwrite {
+            return Err(cleanup_failed_copy(&staging, error));
+        }
+        // Replacement failures may leave a valuable completed copy here.
+        let _ = fs::remove_dir(&staging);
+        return Err(error);
+    }
+    let _ = fs::remove_dir(&staging);
+    Ok(())
+}
+
+fn reserve_copy_directory(parent: &Path) -> io::Result<PathBuf> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..128 {
+        let candidate = parent.join(format!(
+            ".caret-stage-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        #[allow(unused_mut)]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        ErrorKind::AlreadyExists,
+        "could not reserve copy staging directory",
+    ))
+}
+
+fn finish_move(
+    source: &Path,
+    destination: &Path,
+    remove: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    remove(source).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "copied to {}, but source removal failed; completed copy was retained: {error}",
+                destination.display(),
+            ),
+        )
+    })
 }
 
 fn cleanup_failed_copy(partial: &Path, error: io::Error) -> io::Error {
@@ -893,7 +980,6 @@ fn copy_path(source: &Path, destination: &Path, cancelled: &AtomicBool) -> io::R
     }
     if metadata.is_dir() {
         fs::create_dir(destination)?;
-        fs::set_permissions(destination, metadata.permissions())?;
         for entry in fs::read_dir(source)? {
             let entry = entry?;
             copy_path(
@@ -902,9 +988,10 @@ fn copy_path(source: &Path, destination: &Path, cancelled: &AtomicBool) -> io::R
                 cancelled,
             )?;
         }
+        fs::set_permissions(destination, metadata.permissions())?;
         return Ok(());
     }
-    fs::copy(source, destination)?;
+    copy_file_with_progress(source, destination, cancelled, |_| {})?;
     fs::set_permissions(destination, metadata.permissions())?;
     Ok(())
 }
@@ -972,11 +1059,8 @@ fn move_back_without_replace(source: &Path, destination: &Path) -> io::Result<()
         Ok(()) => Ok(()),
         Err(error) if is_cross_device(&error) => {
             let cancelled = AtomicBool::new(false);
-            copy_path(source, destination, &cancelled)?;
-            if let Err(error) = remove_path(source) {
-                let _ = remove_path(destination);
-                return Err(error);
-            }
+            copy_path_safely(source, destination, false, &cancelled)?;
+            finish_move(source, destination, remove_path)?;
             Ok(())
         }
         Err(error) => Err(error),
@@ -1156,11 +1240,8 @@ fn move_or_copy_to_trash(source: &Path, destination: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(error) if is_cross_device(&error) => {
             let cancelled = AtomicBool::new(false);
-            copy_path(source, destination, &cancelled)?;
-            if let Err(error) = remove_path(source) {
-                let _ = remove_path(destination);
-                return Err(error);
-            }
+            copy_path_safely(source, destination, false, &cancelled)?;
+            finish_move(source, destination, remove_path)?;
             Ok(())
         }
         Err(error) => Err(error),
@@ -1628,5 +1709,85 @@ mod tests {
         assert_eq!(fs::read_to_string(second).unwrap(), "second");
         assert_eq!(fs::read_to_string(occupied).unwrap(), "important");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installation_races_and_cancellation_clean_only_owned_staging() {
+        let root = temp_dir("staging-races");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, "source bytes").unwrap();
+        let cancelled = AtomicBool::new(false);
+        let error = copy_path_safely_with(&source, &destination, false, &cancelled, || {
+            fs::create_dir(&destination).unwrap();
+            fs::write(destination.join("precious"), "keep").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(destination.join("precious")).unwrap(),
+            "keep"
+        );
+        let target = root.join("cancelled");
+        let error = copy_path_safely_with(&source, &target, false, &cancelled, || {
+            cancelled.store(true, Ordering::Relaxed)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Interrupted);
+        assert!(!target.exists());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".caret-stage-")));
+        assert!(copy_path_safely(
+            &root.join("missing"),
+            &destination,
+            false,
+            &AtomicBool::new(false)
+        )
+        .is_err());
+        assert!(destination.join("precious").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cross_device_partial_removal_retains_the_completed_destination() {
+        let root = temp_dir("partial-removal");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("one"), "one").unwrap();
+        fs::write(source.join("two"), "two").unwrap();
+        copy_path_safely(&source, &destination, false, &AtomicBool::new(false)).unwrap();
+        let error = finish_move(&source, &destination, |source| {
+            fs::remove_file(source.join("one"))?;
+            Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "injected removal failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("retained"));
+        assert_eq!(fs::read_to_string(destination.join("one")).unwrap(), "one");
+        assert_eq!(fs::read_to_string(destination.join("two")).unwrap(), "two");
+        assert!(source.join("two").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cancellation_during_a_large_file_copy_removes_only_its_output() {
+        let root = temp_dir("cancel-mid-copy");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, vec![b'x'; 256 * 1024]).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let error = copy_file_with_progress(&source, &destination, &cancelled, |count| {
+            assert_eq!(count, 64 * 1024);
+            cancelled.store(true, Ordering::Relaxed);
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Interrupted);
+        assert!(!destination.exists());
+        assert_eq!(fs::metadata(&source).unwrap().len(), 256 * 1024);
+        fs::remove_dir_all(root).unwrap();
     }
 }

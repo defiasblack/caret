@@ -343,3 +343,21 @@ fn repeated_edits_and_atomic_saves_remain_stable_in_a_real_pty() {
     assert!(process.wait_for_exit(Duration::from_secs(10)).success());
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn office_helper_loads_and_closes_in_a_real_pty() {
+    let root = temp_root();
+    fs::create_dir_all(&root).unwrap();
+    let file = root.join("sheet.xlsx");
+    test_support::write_workbook(&file, r#"<row r="3"><c r="B3"><v>7</v></c></row>"#);
+    let mut process = PtyProcess::start(&file, &root.join("data"), &root.join("config"));
+    process.wait_for_output(b"SPREADSHEET", Duration::from_secs(10));
+    process.send(&[0x1b]);
+    process.wait_for_output(b"Closed Office viewer", Duration::from_secs(5));
+    process.send(&[0x11]);
+    assert!(process.wait_for_exit(Duration::from_secs(10)).success());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[path = "../src/test_support.rs"]
+mod test_support;

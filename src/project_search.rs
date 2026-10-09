@@ -142,8 +142,9 @@ pub fn replace_in_file(
     replacement: &str,
     excluded: &HashSet<(usize, usize)>,
 ) -> io::Result<usize> {
-    let expected_fingerprint = crate::document::fingerprint(path)?;
-    let (text, format) = crate::document::read_text(path)?;
+    let snapshot = crate::document::read_snapshot(path)?;
+    let expected_fingerprint = snapshot.fingerprint;
+    let (text, format) = (snapshot.text, snapshot.format);
     let (new_text, replaced) = replace_in_text(&text, query, replacement, excluded);
     if replaced > 0 && new_text != text {
         // read_text strips a BOM; put it back so the file round-trips.
