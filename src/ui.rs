@@ -21,6 +21,7 @@ use crate::{
     config::{IconMode, KeymapProfile},
     editor::display_width,
     file_manager::{human_size, unix_time_label, FileEntry, Preview},
+    office_viewer::{column_label, OfficeContent},
     project::{GitStatus, TreeLoadState},
     syntax::{self, Language},
     theme::ThemeKind,
@@ -57,6 +58,15 @@ struct ManagerPanel {
     rows: usize,
     x: usize,
     width: usize,
+}
+
+const OFFICE_ROW_HEADER_WIDTH: usize = 7;
+const OFFICE_CELL_WIDTH: usize = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfficeViewerHit {
+    SpreadsheetCell { row: usize, column: usize },
+    DocumentLine(usize),
 }
 
 impl FileManagerLayout {
@@ -130,6 +140,45 @@ pub fn screen_layout(app: &App, width: u16, height: u16) -> ScreenLayout {
     }
 }
 
+pub fn office_viewer_hit_at(
+    app: &App,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<OfficeViewerHit> {
+    let viewer = app.office_viewer.as_ref()?;
+    let layout = screen_layout(app, width, height);
+    let local_column = usize::from(column).checked_sub(layout.editor_x)?;
+    let local_row = usize::from(row).checked_sub(usize::from(layout.content_top))?;
+    if local_column >= layout.editor_width || local_row >= layout.content_height {
+        return None;
+    }
+    match &viewer.content {
+        OfficeContent::Spreadsheet(view) => {
+            if local_row < 3
+                || local_row >= layout.content_height.saturating_sub(2)
+                || local_column < OFFICE_ROW_HEADER_WIDTH
+            {
+                return None;
+            }
+            let row = view.scroll_row + local_row - 3;
+            let column =
+                view.scroll_column + (local_column - OFFICE_ROW_HEADER_WIDTH) / OFFICE_CELL_WIDTH;
+            let (rows, columns) = view.dimensions();
+            (row < rows && column < columns)
+                .then_some(OfficeViewerHit::SpreadsheetCell { row, column })
+        }
+        OfficeContent::Document(view) => {
+            if local_row < 1 || local_row >= layout.content_height.saturating_sub(2) {
+                return None;
+            }
+            let line = view.scroll_line + local_row - 1;
+            (line < view.lines.len()).then_some(OfficeViewerHit::DocumentLine(line))
+        }
+    }
+}
+
 pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     let (width, height) = terminal::size()?;
 
@@ -166,6 +215,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
 
     app.viewport_rows = content_height.max(1);
     app.viewport_columns = content_width.max(1);
+    if let Some(viewer) = app.office_viewer.as_mut() {
+        viewer.ensure_visible(content_height, editor_width);
+    }
     if app.follow_cursor {
         app.editor
             .ensure_cursor_visible(app.viewport_rows, app.viewport_columns);
@@ -276,6 +328,16 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
             editor_x as u16,
             editor_width as u16,
             gutter_width,
+        )?;
+    }
+    if app.mode == Mode::OfficeViewer {
+        draw_office_viewer(
+            out,
+            app,
+            content_top,
+            content_height,
+            editor_x as u16,
+            editor_width as u16,
         )?;
     }
     if layout.terminal_height > 0 {
@@ -508,6 +570,22 @@ fn draw_tab_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io::R
         SetForegroundColor(app.theme.muted),
         Print(" ".repeat(available))
     )?;
+
+    if app.mode == Mode::OfficeViewer {
+        if let Some(viewer) = app.office_viewer.as_ref() {
+            let label = format!(" 1  {} ", compact_text(&viewer.title, 32));
+            queue!(
+                out,
+                MoveTo(0, row),
+                SetBackgroundColor(app.theme.current_line),
+                SetForegroundColor(app.theme.top_bar_text),
+                SetAttribute(Attribute::Bold),
+                Print(pad_or_truncate(&label, available)),
+                SetAttribute(Attribute::Reset)
+            )?;
+        }
+        return Ok(());
+    }
 
     if available == 0 || app.editor.is_empty() {
         return Ok(());
@@ -1372,9 +1450,452 @@ fn draw_editor<W: Write>(
                 }
             }
         }
+
+        for secondary in app
+            .editor
+            .secondary_cursors
+            .iter()
+            .filter(|secondary| secondary.cursor.line == line_index)
+        {
+            let (display_column, glyph) =
+                secondary_cursor_cell(&line, secondary.cursor.column, app.editor.tab_width);
+            if display_column < app.editor.scroll_column {
+                continue;
+            }
+            let screen_column = display_column - app.editor.scroll_column;
+            if screen_column >= text_width {
+                continue;
+            }
+            queue!(
+                out,
+                MoveTo(
+                    editor_x + gutter_width as u16 + screen_column as u16,
+                    terminal_row
+                ),
+                SetForegroundColor(app.theme.background),
+                SetBackgroundColor(app.theme.command_mode),
+                Print(glyph)
+            )?;
+        }
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct OfficeViewerArea {
+    top: u16,
+    rows: usize,
+    x: u16,
+    width: usize,
+}
+
+fn draw_office_viewer<W: Write>(
+    out: &mut W,
+    app: &App,
+    top: u16,
+    rows: usize,
+    x: u16,
+    width: u16,
+) -> io::Result<()> {
+    let Some(viewer) = app.office_viewer.as_ref() else {
+        return Ok(());
+    };
+    let width = width as usize;
+    if width == 0 || rows == 0 {
+        return Ok(());
+    }
+    for offset in 0..rows {
+        queue!(
+            out,
+            MoveTo(x, top + offset as u16),
+            SetBackgroundColor(app.theme.background),
+            SetForegroundColor(app.theme.foreground),
+            Print(" ".repeat(width))
+        )?;
+    }
+    let heading = format!(" {}  {} ", viewer.kind_label(), viewer.title);
+    let location = format!(
+        " {}  ·  READ ONLY ",
+        manager_breadcrumb(&viewer.path, width.saturating_sub(heading.len() + 18))
+    );
+    queue!(
+        out,
+        MoveTo(x, top),
+        SetBackgroundColor(app.theme.top_bar),
+        SetForegroundColor(app.theme.heading),
+        SetAttribute(Attribute::Bold),
+        Print(fit_bar(&heading, &location, width)),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    let area = OfficeViewerArea {
+        top,
+        rows,
+        x,
+        width,
+    };
+    match &viewer.content {
+        OfficeContent::Spreadsheet(view) => {
+            draw_spreadsheet_viewer(out, app, viewer, view, area)?;
+        }
+        OfficeContent::Document(view) => {
+            draw_document_viewer(out, app, viewer, view, area)?;
+        }
+    }
+    Ok(())
+}
+
+fn draw_spreadsheet_viewer<W: Write>(
+    out: &mut W,
+    app: &App,
+    viewer: &crate::office_viewer::OfficeViewer,
+    view: &crate::office_viewer::SpreadsheetView,
+    area: OfficeViewerArea,
+) -> io::Result<()> {
+    let OfficeViewerArea {
+        top,
+        rows,
+        x,
+        width,
+    } = area;
+    let Some(sheet) = view.active() else {
+        return Ok(());
+    };
+    let sheet_tabs = view
+        .sheets
+        .iter()
+        .enumerate()
+        .map(|(index, sheet)| {
+            if index == view.active_sheet {
+                format!("[{}]", sheet.name)
+            } else {
+                sheet.name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    queue!(
+        out,
+        MoveTo(x, top + 1),
+        SetBackgroundColor(app.theme.background),
+        SetForegroundColor(app.theme.heading),
+        Print(pad_or_truncate(
+            &format!(" Sheets: {sheet_tabs}  ·  Tab/Shift-Tab switches "),
+            width
+        ))
+    )?;
+
+    let visible_columns = width.saturating_sub(OFFICE_ROW_HEADER_WIDTH) / OFFICE_CELL_WIDTH;
+    let data_rows = rows.saturating_sub(5);
+    queue!(
+        out,
+        MoveTo(x, top + 2),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.muted),
+        Print(pad_or_truncate(" # ", OFFICE_ROW_HEADER_WIDTH))
+    )?;
+    for visible in 0..visible_columns {
+        let column = view.scroll_column + visible;
+        let label = format!(" {} ", column_label(column));
+        queue!(
+            out,
+            MoveTo(
+                (x as usize + OFFICE_ROW_HEADER_WIDTH + visible * OFFICE_CELL_WIDTH) as u16,
+                top + 2
+            ),
+            SetBackgroundColor(if column == view.column {
+                app.theme.current_line
+            } else {
+                app.theme.overlay
+            }),
+            SetForegroundColor(app.theme.heading),
+            SetAttribute(Attribute::Bold),
+            Print(pad_or_truncate(&label, OFFICE_CELL_WIDTH - 1)),
+            SetForegroundColor(app.theme.border),
+            Print("│"),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
+    let (sheet_rows, _) = sheet.dimensions();
+    for visible_row in 0..data_rows {
+        let row = view.scroll_row + visible_row;
+        if row >= sheet_rows {
+            break;
+        }
+        let y = top + 3 + visible_row as u16;
+        queue!(
+            out,
+            MoveTo(x, y),
+            SetBackgroundColor(if row == view.row {
+                app.theme.overlay
+            } else {
+                app.theme.background
+            }),
+            SetForegroundColor(if row == view.row {
+                app.theme.heading
+            } else {
+                app.theme.gutter
+            }),
+            SetAttribute(if row == view.row {
+                Attribute::Bold
+            } else {
+                Attribute::Reset
+            }),
+            Print(pad_or_truncate(
+                &format!(" {:>4} ", row + 1),
+                OFFICE_ROW_HEADER_WIDTH - 1
+            )),
+            SetForegroundColor(app.theme.border),
+            Print("│"),
+            SetAttribute(Attribute::Reset)
+        )?;
+        for visible_column in 0..visible_columns {
+            let column = view.scroll_column + visible_column;
+            let selected = row == view.row && column == view.column;
+            let value = sheet.cell(row, column).unwrap_or_default();
+            queue!(
+                out,
+                MoveTo(
+                    (x as usize + OFFICE_ROW_HEADER_WIDTH + visible_column * OFFICE_CELL_WIDTH)
+                        as u16,
+                    y
+                ),
+                SetBackgroundColor(if selected {
+                    app.theme.command_mode
+                } else if row % 2 == 1 {
+                    app.theme.prompt_bar
+                } else {
+                    app.theme.background
+                }),
+                SetForegroundColor(if selected {
+                    app.theme.background
+                } else {
+                    app.theme.foreground
+                }),
+                SetAttribute(if selected {
+                    Attribute::Bold
+                } else {
+                    Attribute::Reset
+                }),
+                Print(pad_or_truncate(
+                    &format!(" {}", manager_display_line(value)),
+                    OFFICE_CELL_WIDTH - 1
+                )),
+                SetForegroundColor(app.theme.border),
+                Print("│"),
+                SetAttribute(Attribute::Reset)
+            )?;
+        }
+    }
+    let cell_name = format!("{}{}", column_label(view.column), view.row + 1);
+    let value = sheet.cell(view.row, view.column).unwrap_or_default();
+    let formula = sheet.formula(view.row, view.column);
+    let detail = if let Some(formula) = formula {
+        format!(" {cell_name}  Value: {value}  Formula: ={formula}")
+    } else {
+        format!(" {cell_name}  {value}")
+    };
+    let footer_y = top + rows.saturating_sub(2) as u16;
+    queue!(
+        out,
+        MoveTo(x, footer_y),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.overlay_text),
+        Print(pad_or_truncate(&detail, width))
+    )?;
+    if view.detail_open && rows >= 8 {
+        draw_viewer_detail(
+            out,
+            app,
+            top + 3,
+            x + 2,
+            width.saturating_sub(4),
+            rows.saturating_sub(7).min(8),
+            &format!(
+                "{cell_name}\nValue: {value}\nFormula: {}",
+                formula.unwrap_or("(none)")
+            ),
+        )?;
+    }
+    let status = if viewer.search_editing {
+        format!(" /{}", viewer.search_query)
+    } else if !viewer.status.is_empty() {
+        format!(" {}", viewer.status)
+    } else if sheet.truncated {
+        " Large sheet truncated to safe viewer limits".to_string()
+    } else {
+        format!(
+            " {} rows × {} columns · Enter details · / search · c copy · q close",
+            sheet.dimensions().0,
+            sheet.dimensions().1
+        )
+    };
+    queue!(
+        out,
+        MoveTo(x, top + rows.saturating_sub(1) as u16),
+        SetBackgroundColor(app.theme.status_bar),
+        SetForegroundColor(app.theme.status_text),
+        Print(pad_or_truncate(&status, width))
+    )
+}
+
+fn draw_document_viewer<W: Write>(
+    out: &mut W,
+    app: &App,
+    viewer: &crate::office_viewer::OfficeViewer,
+    view: &crate::office_viewer::DocumentView,
+    area: OfficeViewerArea,
+) -> io::Result<()> {
+    let OfficeViewerArea {
+        top,
+        rows,
+        x,
+        width,
+    } = area;
+    let content_rows = rows.saturating_sub(3);
+    for offset in 0..content_rows {
+        let line_index = view.scroll_line + offset;
+        let y = top + 1 + offset as u16;
+        let line = view.lines.get(line_index).map_or("", String::as_str);
+        let selected = line_index == view.cursor_line;
+        queue!(
+            out,
+            MoveTo(x, y),
+            SetBackgroundColor(if selected {
+                app.theme.current_line
+            } else {
+                app.theme.background
+            }),
+            SetForegroundColor(if selected {
+                app.theme.heading
+            } else {
+                app.theme.foreground
+            }),
+            Print(pad_or_truncate(
+                &format!("{:>5}  {}", line_index + 1, manager_display_line(line)),
+                width
+            ))
+        )?;
+    }
+    let selected = view.lines.get(view.cursor_line).map_or("", String::as_str);
+    queue!(
+        out,
+        MoveTo(x, top + rows.saturating_sub(2) as u16),
+        SetBackgroundColor(app.theme.overlay),
+        SetForegroundColor(app.theme.overlay_text),
+        Print(pad_or_truncate(
+            &format!(
+                " Line {}: {}",
+                view.cursor_line + 1,
+                manager_display_line(selected)
+            ),
+            width
+        ))
+    )?;
+    if view.detail_open && rows >= 8 {
+        draw_viewer_detail(
+            out,
+            app,
+            top + 2,
+            x + 2,
+            width.saturating_sub(4),
+            rows.saturating_sub(6).min(8),
+            selected,
+        )?;
+    }
+    let status = if viewer.search_editing {
+        format!(" /{}", viewer.search_query)
+    } else if !viewer.status.is_empty() {
+        format!(" {}", viewer.status)
+    } else {
+        format!(
+            " {} lines · ↑↓/PgUp/PgDn navigate · / search · c copy · q close",
+            view.lines.len()
+        )
+    };
+    queue!(
+        out,
+        MoveTo(x, top + rows.saturating_sub(1) as u16),
+        SetBackgroundColor(app.theme.status_bar),
+        SetForegroundColor(app.theme.status_text),
+        Print(pad_or_truncate(&status, width))
+    )
+}
+
+fn draw_viewer_detail<W: Write>(
+    out: &mut W,
+    app: &App,
+    top: u16,
+    x: u16,
+    width: usize,
+    rows: usize,
+    text: &str,
+) -> io::Result<()> {
+    if width < 8 || rows == 0 {
+        return Ok(());
+    }
+    let wrapped = text
+        .lines()
+        .flat_map(|line| wrap_display_line(&manager_display_line(line), width.saturating_sub(4)))
+        .take(rows.saturating_sub(2))
+        .collect::<Vec<_>>();
+    for offset in 0..rows {
+        let line = if offset == 0 {
+            " Details · Enter closes ".to_string()
+        } else if offset + 1 == rows {
+            "─".repeat(width)
+        } else {
+            format!("  {}", wrapped.get(offset - 1).map_or("", String::as_str))
+        };
+        queue!(
+            out,
+            MoveTo(x, top + offset as u16),
+            SetBackgroundColor(app.theme.overlay),
+            SetForegroundColor(if offset == 0 {
+                app.theme.heading
+            } else {
+                app.theme.overlay_text
+            }),
+            SetAttribute(if offset == 0 {
+                Attribute::Bold
+            } else {
+                Attribute::Reset
+            }),
+            Print(pad_or_truncate(&line, width)),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
+    Ok(())
+}
+
+fn wrap_display_line(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if current_width + character_width > width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(character);
+        current_width += character_width;
+    }
+    lines.push(current);
+    lines
+}
+
+fn secondary_cursor_cell(line: &str, column: usize, tab_width: usize) -> (usize, char) {
+    let display_column = display_width(&line.chars().take(column).collect::<String>(), tab_width);
+    let glyph = match line.chars().nth(column) {
+        Some('\t') | None => ' ',
+        Some(character) => character,
+    };
+    (display_column, glyph)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2014,6 +2535,22 @@ fn draw_manager_preview_pane<W: Write>(
                 lines.push(("… preview truncated".to_string(), None));
             }
         }
+        Preview::Office {
+            kind,
+            summary,
+            lines: preview_lines,
+            truncated,
+        } => {
+            lines.push(((*kind).to_string(), None));
+            lines.extend(summary.iter().cloned().map(|line| (line, None)));
+            if !preview_lines.is_empty() {
+                lines.push((String::new(), None));
+                lines.extend(preview_lines.iter().cloned().map(|line| (line, None)));
+            }
+            if *truncated {
+                lines.push(("… preview truncated".to_string(), None));
+            }
+        }
         Preview::Binary {
             size,
             header,
@@ -2336,23 +2873,53 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             | Mode::KeymapGallery
             | Mode::ContextMenu
             | Mode::Dashboard
-            | Mode::FileManager => app.theme.command_mode,
+            | Mode::FileManager
+            | Mode::OfficeViewer => app.theme.command_mode,
         }
     };
 
     let language_name = app.language_name();
-    let left = format!(
-        " {}  │  {} keys  │  Tab {}/{}  │  {} lines  │  {} ",
-        app.active_panel_label(),
-        app.keymap_profile().name(),
-        app.editor.active_index() + 1,
-        app.editor.len(),
-        app.editor.line_count(),
-        language_name
-    );
+    let left = if let Some(viewer) = app
+        .office_viewer
+        .as_ref()
+        .filter(|_| app.mode == Mode::OfficeViewer)
+    {
+        format!(
+            " VIEWER  │  {} keys  │  {}  │  {} ",
+            app.keymap_profile().name(),
+            viewer.kind_label(),
+            viewer.title
+        )
+    } else {
+        format!(
+            " {}  │  {} keys  │  Tab {}/{}  │  {} lines  │  {} ",
+            app.active_panel_label(),
+            app.keymap_profile().name(),
+            app.editor.active_index() + 1,
+            app.editor.len(),
+            app.editor.line_count(),
+            language_name
+        )
+    };
     let background = app.background_status();
     let background_label = background.as_ref().map(|(label, _)| label.as_str());
-    let right = if app.explorer_focused {
+    let right = if let Some(viewer) = app
+        .office_viewer
+        .as_ref()
+        .filter(|_| app.mode == Mode::OfficeViewer)
+    {
+        match &viewer.content {
+            OfficeContent::Spreadsheet(view) => format!(
+                " {}!{}{}  ",
+                view.active().map_or("Sheet", |sheet| sheet.name.as_str()),
+                column_label(view.column),
+                view.row + 1
+            ),
+            OfficeContent::Document(view) => {
+                format!(" Line {}/{}  ", view.cursor_line + 1, view.lines.len())
+            }
+        }
+    } else if app.explorer_focused {
         format!(
             " {}{} {}/{} items  ",
             background_label.unwrap_or(""),
@@ -4032,7 +4599,8 @@ fn draw_hotkey_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
             | Mode::KeymapGallery
             | Mode::ContextMenu
             | Mode::Dashboard
-            | Mode::FileManager => app.theme.command_mode,
+            | Mode::FileManager
+            | Mode::OfficeViewer => app.theme.command_mode,
         }
     };
 
@@ -4272,6 +4840,15 @@ fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
             ("D", "Delete"),
             ("/", "Filter"),
             ("Esc", "Close"),
+        ],
+        (Mode::OfficeViewer, _) => &[
+            ("↑↓←→", "Navigate"),
+            ("Tab", "Next sheet"),
+            ("Enter", "Details"),
+            ("/", "Search"),
+            ("N", "Previous"),
+            ("C", "Copy"),
+            ("Q/Esc", "Close"),
         ],
     }
 }
@@ -4547,6 +5124,7 @@ fn place_cursor<W: Write>(
             | Mode::KeymapGallery
             | Mode::ContextMenu
             | Mode::Dashboard
+            | Mode::OfficeViewer
     ) || (app.explorer_focused && !matches!(app.mode, Mode::Command | Mode::Search))
     {
         return queue!(out, Hide);
@@ -4938,5 +5516,13 @@ mod tests {
 
         assert!(theme_gallery_contains(&app, 80, 24, 18, 1));
         assert_eq!(theme_gallery_item_at(&app, 80, 24, 18, 3), Some(3));
+    }
+
+    #[test]
+    fn secondary_cursor_cells_track_tabs_unicode_and_line_endings() {
+        assert_eq!(secondary_cursor_cell("\t界x", 0, 4), (0, ' '));
+        assert_eq!(secondary_cursor_cell("\t界x", 1, 4), (4, '界'));
+        assert_eq!(secondary_cursor_cell("\t界x", 2, 4), (6, 'x'));
+        assert_eq!(secondary_cursor_cell("\t界x", 3, 4), (7, ' '));
     }
 }

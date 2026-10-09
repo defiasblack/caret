@@ -319,6 +319,16 @@ impl App {
                 self.persist_settings();
                 self.message = "Auto-indent disabled".to_string();
             }
+            "multicursor=ctrl" | "multicursormodifier=ctrl" => {
+                self.settings.multi_cursor_ctrl_click = true;
+                self.persist_settings();
+                self.message = "Multi-cursor mouse modifier: Ctrl+Click".to_string();
+            }
+            "multicursor=alt" | "multicursormodifier=alt" => {
+                self.settings.multi_cursor_ctrl_click = false;
+                self.persist_settings();
+                self.message = "Multi-cursor mouse modifier: Alt+Click".to_string();
+            }
             "trimonsave" => {
                 self.settings.trim_trailing_whitespace_on_save = true;
                 self.apply_editor_settings();

@@ -10,6 +10,7 @@ mod file_ops;
 mod fuzzy;
 mod keys;
 mod lsp;
+mod office_viewer;
 mod platform;
 mod plugin;
 mod preview;

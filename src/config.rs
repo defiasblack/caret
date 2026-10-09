@@ -128,6 +128,7 @@ pub struct Settings {
     pub trim_trailing_whitespace_on_save: bool,
     pub final_newline: FinalNewline,
     pub undo_history_limit: usize,
+    pub multi_cursor_ctrl_click: bool,
     /// Custom key bindings: action id → chord, e.g. `find = "ctrl+g"`.
     pub custom_keys: std::collections::BTreeMap<String, String>,
 }
@@ -369,6 +370,18 @@ impl Settings {
                 validation: "managed by :bind, :unbind, and :bindreset",
                 restart_required: false,
             },
+            SettingInfo {
+                name: "multicursormodifier",
+                current: if self.multi_cursor_ctrl_click {
+                    "ctrl".to_string()
+                } else {
+                    "alt".to_string()
+                },
+                default: "alt".to_string(),
+                description: "Modifier used with a mouse click to add or remove a cursor",
+                validation: "set with :set multicursor=alt or :set multicursor=ctrl",
+                restart_required: false,
+            },
         ]
     }
 }
@@ -411,6 +424,7 @@ impl Default for Settings {
             trim_trailing_whitespace_on_save: false,
             final_newline: FinalNewline::Preserve,
             undo_history_limit: 1_000,
+            multi_cursor_ctrl_click: false,
             custom_keys: std::collections::BTreeMap::new(),
         }
     }
@@ -492,7 +506,7 @@ mod tests {
         let settings = Settings::default();
         let rows = settings.setting_infos();
 
-        assert_eq!(rows.len(), 27);
+        assert_eq!(rows.len(), 28);
         assert_eq!(rows[0].name, "theme");
         assert_eq!(rows[0].default, "oxide");
         assert!(rows

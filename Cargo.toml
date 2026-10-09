@@ -17,8 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 arboard = "3.6"
+calamine = "0.36"
 crossterm = "0.29"
 directories = "6.0"
+flate2 = "1.1"
 ignore = "0.4"
 libc = "0.2"
 notify = "8.2"

@@ -314,6 +314,7 @@ path, and stale background results are rejected.
 | `d` | Duplicate with an automatically conflict-free name |
 | `Delete` / `D` | Move to OS trash / explicitly confirm permanent deletion |
 | `t` | Open an integrated terminal at the selected directory |
+| `v` | Open a selected Office document in Caret's native viewer |
 | `Ctrl-C` | Cancel an active multi-item operation safely |
 | `R` | Retry only the failed items from the last operation |
 | Right click | Open the selected item's file-action menu |
@@ -323,6 +324,20 @@ layout. Dirty open buffers block destructive operations. Successful moves and
 renames update open-tab paths, recent files, navigation history, recovery and
 session inputs, Git refresh state, and the active LSP document. Previews have a
 hard 1.5-second UI timeout in addition to byte and line limits.
+
+Office previews are parsed locally. Word documents (`.docx`) open in a
+line-oriented document reader. Workbooks (`.xlsx`, `.xls`, `.xlsm`, `.xlsb`,
+and `.ods`) open as navigable sheets with cell values and formulas. Caret does
+not launch Office, run macros, calculate formulas, or open embedded content.
+
+Press `v`, double-click, or open a supported document with `Enter`, `:e`,
+`:tabnew`, the project tree, the file picker, or Caret's command line. No
+Office, `xleak`, or `doxx` installation is required.
+
+Inside the viewer, use arrows or `h/j/k/l` to navigate, Page Up/Down for larger
+moves, `/` to search, `n`/`N` for the next/previous match, `c` or `Ctrl-C` to
+copy the current cell or line, `Enter` for full details, and `q` or `Esc` to
+close. In workbooks, `Tab` and `Shift-Tab` switch sheets.
 
 ## Coding intelligence
 

@@ -118,6 +118,7 @@ pub struct Editor {
     open_transaction: Option<Transaction>,
     history_limit: usize,
     preferred_column: Option<usize>,
+    syntax_selection_history: Vec<(Cursor, Option<Cursor>)>,
 }
 
 impl Editor {
@@ -154,6 +155,7 @@ impl Editor {
                 open_transaction: None,
                 history_limit: DEFAULT_HISTORY_LIMIT,
                 preferred_column: None,
+                syntax_selection_history: Vec::new(),
             }),
             None => Ok(Self::blank()),
         }
@@ -190,6 +192,7 @@ impl Editor {
             open_transaction: None,
             history_limit: DEFAULT_HISTORY_LIMIT,
             preferred_column: None,
+            syntax_selection_history: Vec::new(),
         }
     }
 
@@ -223,6 +226,7 @@ impl Editor {
             open_transaction: None,
             history_limit: DEFAULT_HISTORY_LIMIT,
             preferred_column: None,
+            syntax_selection_history: Vec::new(),
         })
     }
 
@@ -483,6 +487,7 @@ impl Editor {
     /// Records and applies one buffer mutation inside the open undo group.
     /// Every buffer change must go through here so history can replay it.
     fn edit(&mut self, at: usize, removed_chars: usize, inserted: &str) {
+        self.syntax_selection_history.clear();
         if self.open_transaction.is_none() {
             self.begin_undo_group();
         }
@@ -784,6 +789,7 @@ impl Editor {
     }
 
     pub fn select_word_at_cursor(&mut self) -> bool {
+        self.syntax_selection_history.clear();
         let characters = self.buffer.chars().collect::<Vec<_>>();
         let mut start = self.current_char_index();
         if start >= characters.len() || !is_word_character(characters[start]) {
@@ -806,13 +812,26 @@ impl Editor {
 
     pub fn select_syntax_node(&mut self) -> bool {
         self.finish_undo_group();
+        let previous = (self.cursor, self.selection_anchor);
         let Some((start, end)) = self.syntax.as_ref().and_then(|syntax| {
             syntax.node_range_at(self.current_char_index(), self.selection_range())
         }) else {
             return false;
         };
+        self.syntax_selection_history.push(previous);
         self.selection_anchor = Some(self.cursor_from_char_index(start));
         self.set_cursor_from_char_index(end);
+        self.preferred_column = None;
+        true
+    }
+
+    pub fn shrink_syntax_selection(&mut self) -> bool {
+        let Some((cursor, anchor)) = self.syntax_selection_history.pop() else {
+            return false;
+        };
+        self.cursor = cursor;
+        self.selection_anchor = anchor;
+        self.secondary_cursors.clear();
         self.preferred_column = None;
         true
     }
@@ -820,9 +839,19 @@ impl Editor {
     pub fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.secondary_cursors.clear();
+        self.syntax_selection_history.clear();
     }
 
     pub fn select_next_occurrence(&mut self) -> bool {
+        self.select_occurrence(true)
+    }
+
+    pub fn select_previous_occurrence(&mut self) -> bool {
+        self.select_occurrence(false)
+    }
+
+    fn select_occurrence(&mut self, forward: bool) -> bool {
+        self.syntax_selection_history.clear();
         let query = if let Some(text) = self.selected_text() {
             text
         } else {
@@ -853,19 +882,43 @@ impl Editor {
         let query_len = query.chars().count();
         let text = self.buffer.to_string();
         let occupied = self.selection_ranges();
-        let after = self.selection_range().map(|(_, end)| end).unwrap_or(0);
-        let mut matches = text
+        let boundary = self
+            .selection_range()
+            .map(|(start, end)| if forward { end } else { start })
+            .unwrap_or(0);
+        let matches = text
             .match_indices(&query)
             .map(|(byte, _)| text[..byte].chars().count())
             .collect::<Vec<_>>();
-        matches.sort_by_key(|start| (*start < after, *start));
-
-        let Some(start) = matches.into_iter().find(|start| {
+        let available = |start: &usize| {
             let end = *start + query_len;
             !occupied
                 .iter()
                 .any(|(used_start, used_end)| *start < *used_end && end > *used_start)
-        }) else {
+        };
+        let start = if forward {
+            matches
+                .iter()
+                .copied()
+                .filter(|start| *start >= boundary)
+                .chain(matches.iter().copied().filter(|start| *start < boundary))
+                .find(available)
+        } else {
+            matches
+                .iter()
+                .rev()
+                .copied()
+                .filter(|start| *start < boundary)
+                .chain(
+                    matches
+                        .iter()
+                        .rev()
+                        .copied()
+                        .filter(|start| *start >= boundary),
+                )
+                .find(available)
+        };
+        let Some(start) = start else {
             return false;
         };
 
@@ -1402,39 +1455,88 @@ impl Editor {
     }
 
     pub fn duplicate_line(&mut self) {
+        self.copy_lines(true);
+    }
+
+    pub fn copy_lines(&mut self, down: bool) {
         self.begin_undo_group();
         let mut lines = self.logical_lines();
-        let line = self.cursor.line.min(lines.len().saturating_sub(1));
-        lines.insert(line, lines[line].clone());
+        let (start, end, selected) = self.selected_line_range();
+        let copied = lines[start..=end].to_vec();
+        let insertion = if down { end + 1 } else { start };
+        lines.splice(insertion..insertion, copied.iter().cloned());
         self.replace_logical_lines(&lines, self.has_trailing_newline());
-        self.cursor.line += 1;
-        self.selection_anchor = None;
+        let copied_start = insertion;
+        let copied_end = copied_start + copied.len() - 1;
+        if selected {
+            self.selection_anchor = Some(Cursor {
+                line: copied_start,
+                column: 0,
+            });
+            self.cursor = Cursor {
+                line: copied_end,
+                column: self.line_len_chars(copied_end),
+            };
+        } else {
+            self.cursor.line = copied_start;
+            self.cursor.column = self.cursor.column.min(self.line_len_chars(copied_start));
+            self.selection_anchor = None;
+        }
         self.secondary_cursors.clear();
         self.dirty = true;
         self.preferred_column = None;
     }
 
+    pub fn duplicate_selection(&mut self) {
+        let Some((start, end)) = self.selection_range() else {
+            self.copy_lines(true);
+            return;
+        };
+        let text = self.buffer.slice(start..end).to_string();
+        self.begin_undo_group();
+        self.edit(end, 0, &text);
+        let duplicated_end = end + text.chars().count();
+        self.selection_anchor = Some(self.cursor_from_char_index(end));
+        self.set_cursor_from_char_index(duplicated_end);
+        self.secondary_cursors.clear();
+        self.preferred_column = None;
+    }
+
     pub fn move_line(&mut self, down: bool) -> bool {
         let logical_line_count = self.logical_lines().len();
-        let line = self.cursor.line.min(logical_line_count.saturating_sub(1));
-        let target = if down {
-            line.checked_add(1)
-                .filter(|next| *next < logical_line_count)
-        } else {
-            line.checked_sub(1)
-        };
-        let Some(target) = target else {
+        let (start, end, selected) = self.selected_line_range();
+        if (down && end + 1 >= logical_line_count) || (!down && start == 0) {
             return false;
-        };
+        }
 
         self.begin_undo_group();
 
         let mut lines = self.logical_lines();
-        lines.swap(line, target);
+        let new_start = if down {
+            let next = lines.remove(end + 1);
+            lines.insert(start, next);
+            start + 1
+        } else {
+            let previous = lines.remove(start - 1);
+            lines.insert(end, previous);
+            start - 1
+        };
+        let new_end = new_start + (end - start);
         self.replace_logical_lines(&lines, self.has_trailing_newline());
-        self.cursor.line = target;
-        self.cursor.column = self.cursor.column.min(self.line_len_chars(target));
-        self.selection_anchor = None;
+        if selected {
+            self.selection_anchor = Some(Cursor {
+                line: new_start,
+                column: 0,
+            });
+            self.cursor = Cursor {
+                line: new_end,
+                column: self.line_len_chars(new_end),
+            };
+        } else {
+            self.cursor.line = new_start;
+            self.cursor.column = self.cursor.column.min(self.line_len_chars(new_start));
+            self.selection_anchor = None;
+        }
         self.secondary_cursors.clear();
         self.dirty = true;
         self.preferred_column = None;
@@ -1600,6 +1702,55 @@ impl Editor {
         self.cursor = target;
         self.selection_anchor = None;
         true
+    }
+
+    pub fn toggle_cursor_at(&mut self, target: Cursor) -> usize {
+        let target = Cursor {
+            line: target.line.min(self.line_count().saturating_sub(1)),
+            column: target
+                .column
+                .min(self.line_len_chars(target.line.min(self.line_count().saturating_sub(1)))),
+        };
+        if target == self.cursor {
+            return self.secondary_cursors.len() + 1;
+        }
+        if let Some(index) = self
+            .secondary_cursors
+            .iter()
+            .position(|existing| existing.cursor == target)
+        {
+            self.secondary_cursors.remove(index);
+            return self.secondary_cursors.len() + 1;
+        }
+        self.finish_undo_group();
+        self.secondary_cursors.push(SecondaryCursor {
+            cursor: target,
+            selection_anchor: None,
+        });
+        self.syntax_selection_history.clear();
+        self.secondary_cursors.len() + 1
+    }
+
+    pub fn add_cursors_to_line_ends(&mut self) -> usize {
+        let (start, end, _) = self.selected_line_range();
+        self.finish_undo_group();
+        self.secondary_cursors.clear();
+        for line in start..end {
+            self.secondary_cursors.push(SecondaryCursor {
+                cursor: Cursor {
+                    line,
+                    column: self.line_len_chars(line),
+                },
+                selection_anchor: None,
+            });
+        }
+        self.cursor = Cursor {
+            line: end,
+            column: self.line_len_chars(end),
+        };
+        self.selection_anchor = None;
+        self.syntax_selection_history.clear();
+        self.secondary_cursors.len() + 1
     }
 
     /// Extends `select_next_occurrence` to every remaining match.  Returns
@@ -2460,6 +2611,78 @@ mod tests {
         assert_eq!(editor.buffer.to_string(), "z beta z z");
         editor.insert_char('!');
         assert_eq!(editor.buffer.to_string(), "z! beta z! z!");
+    }
+
+    #[test]
+    fn previous_occurrence_wraps_backward_without_reselecting_ranges() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("one two one three one");
+        editor.set_cursor_from_char_index(editor.len_chars());
+
+        assert!(editor.select_previous_occurrence());
+        assert_eq!(editor.selected_text().as_deref(), Some("one"));
+        assert_eq!(editor.selection_ranges(), vec![(18, 21), (8, 11)]);
+        assert!(editor.select_previous_occurrence());
+        assert_eq!(editor.selection_ranges(), vec![(18, 21), (8, 11), (0, 3)]);
+    }
+
+    #[test]
+    fn line_block_copy_move_and_selection_duplication_preserve_content() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("alpha\nbeta\ngamma");
+        editor.selection_anchor = Some(Cursor { line: 0, column: 0 });
+        editor.cursor = Cursor { line: 1, column: 4 };
+
+        editor.copy_lines(true);
+        assert_eq!(editor.text(), "alpha\nbeta\nalpha\nbeta\ngamma");
+        assert_eq!(editor.selected_text().as_deref(), Some("alpha\nbeta"));
+        assert!(editor.move_line(true));
+        assert_eq!(editor.text(), "alpha\nbeta\ngamma\nalpha\nbeta");
+
+        editor.duplicate_selection();
+        assert_eq!(editor.text(), "alpha\nbeta\ngamma\nalpha\nbetaalpha\nbeta");
+        assert_eq!(editor.selected_text().as_deref(), Some("alpha\nbeta"));
+    }
+
+    #[test]
+    fn line_end_and_modifier_click_cursors_toggle_predictably() {
+        let mut editor = Editor::blank();
+        editor.buffer = Rope::from_str("a\nbeta\nxyz");
+        editor.selection_anchor = Some(Cursor { line: 0, column: 0 });
+        editor.cursor = Cursor { line: 2, column: 3 };
+
+        assert_eq!(editor.add_cursors_to_line_ends(), 3);
+        assert_eq!(editor.cursor, Cursor { line: 2, column: 3 });
+        assert_eq!(editor.secondary_cursors.len(), 2);
+
+        assert_eq!(editor.toggle_cursor_at(Cursor { line: 1, column: 4 }), 2);
+        assert_eq!(editor.toggle_cursor_at(Cursor { line: 1, column: 1 }), 3);
+        assert_eq!(editor.cursor, Cursor { line: 2, column: 3 });
+    }
+
+    #[test]
+    fn syntax_selection_can_expand_then_shrink_to_the_original_cursor() {
+        let path = std::env::temp_dir().join(format!(
+            "caret-expand-selection-{}-{}.rs",
+            std::process::id(),
+            line!()
+        ));
+        fs::write(&path, "fn main() { let value = 1; }\n").unwrap();
+        let mut editor = Editor::from_file(&path).unwrap();
+        editor.set_cursor_from_char_index(16);
+        let original = editor.cursor;
+
+        assert!(editor.select_syntax_node());
+        let inner = editor.selected_text().expect("first syntax selection");
+        assert!(editor.select_syntax_node());
+        assert_ne!(editor.selected_text().as_deref(), Some(inner.as_str()));
+        assert!(editor.shrink_syntax_selection());
+        assert_eq!(editor.selected_text().as_deref(), Some(inner.as_str()));
+        assert!(editor.shrink_syntax_selection());
+        assert_eq!(editor.cursor, original);
+        assert!(editor.selected_text().is_none());
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

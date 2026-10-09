@@ -101,6 +101,9 @@ Automated release-candidate baseline: `0.6.0-rc.2`,
   and final-newline policy.
 - [x] Multi-cursor deletion, cursor-above/below, column selection, next/all
   occurrence selection, and multiple-selection restoration.
+- [x] Shared editor actions for syntax-aware expand/shrink selection, line-block
+  copy/move, selection duplication, directional occurrence selection, line-end
+  cursors, a complete context menu, and configurable modifier-click cursors.
 - [x] Complete file find/replace with case, whole-word, regex, selection scope,
   history, match counts, replace-one, replace-all, keyboard, and mouse flows.
 - [x] Gitignore-aware project search and reviewable project replacement with
@@ -215,6 +218,15 @@ not satisfy the roadmap's safe operation layer.
 - [x] Add directory summaries and readable JSON, TOML, and YAML previews.
 - [x] Add binary metadata plus a bounded hexadecimal header.
 - [x] Add symlink target/status and basic image metadata previews.
+- [x] Add safe local text/cell previews for `.docx` and `.xlsx` Office Open XML
+  documents; never invoke Office, execute macros, or calculate formulas.
+- [x] Route supported Office files from Manager, explorer, picker, commands,
+  and direct file launches into Caret-native interactive viewers without
+  external viewer installation.
+- [x] Add a workbook grid for `.xlsx`, `.xls`, `.xlsm`, `.xlsb`, and `.ods`
+  with sheet switching, cell/formula details, search, navigation, and copy.
+- [x] Add a `.docx` document reader with line navigation, search, details, and
+  copy.
 - [x] Guarantee that previews never execute untrusted files or block editor
   input.
 - [x] Defer terminal images, PDF/archive previews, media metadata, and

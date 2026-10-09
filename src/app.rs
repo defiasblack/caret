@@ -22,6 +22,7 @@ use crate::{
     file_ops::ConflictPolicy,
     keys::{Action as KeyAction, KeyBindings},
     lsp::{self, LspClient},
+    office_viewer::{self, OfficeContent, OfficeViewer, ViewerAction},
     plugin::{PluginContext, PluginRegistry, PluginResponse},
     project::ProjectTree,
     search::{CompiledSearch, SearchOptions},
@@ -57,6 +58,7 @@ pub enum Mode {
     ContextMenu,
     Dashboard,
     FileManager,
+    OfficeViewer,
 }
 
 /// Rows the command palette shows at once.  The drawing code and
@@ -114,6 +116,7 @@ impl Mode {
             Self::ContextMenu => "MENU",
             Self::Dashboard => "WELCOME",
             Self::FileManager => "MANAGER",
+            Self::OfficeViewer => "VIEWER",
         }
     }
 }
@@ -220,6 +223,21 @@ pub enum ContextAction {
     Cut,
     Paste,
     SelectAll,
+    ExpandSelection,
+    ShrinkSelection,
+    CopyLineUp,
+    CopyLineDown,
+    MoveLineUp,
+    MoveLineDown,
+    DuplicateSelection,
+    AddCursorAbove,
+    AddCursorBelow,
+    AddCursorLineEnds,
+    AddNextOccurrence,
+    AddPreviousOccurrence,
+    SelectAllOccurrences,
+    MultiCursorCtrlClick,
+    MultiCursorAltClick,
     ToggleComment,
     Format,
 }
@@ -247,6 +265,21 @@ impl ContextAction {
             Self::Cut => "Cut",
             Self::Paste => "Paste",
             Self::SelectAll => "Select all",
+            Self::ExpandSelection => "Expand selection",
+            Self::ShrinkSelection => "Shrink selection",
+            Self::CopyLineUp => "Copy line up",
+            Self::CopyLineDown => "Copy line down",
+            Self::MoveLineUp => "Move line up",
+            Self::MoveLineDown => "Move line down",
+            Self::DuplicateSelection => "Duplicate selection",
+            Self::AddCursorAbove => "Add cursor above",
+            Self::AddCursorBelow => "Add cursor below",
+            Self::AddCursorLineEnds => "Add cursors to line ends",
+            Self::AddNextOccurrence => "Add next occurrence",
+            Self::AddPreviousOccurrence => "Add previous occurrence",
+            Self::SelectAllOccurrences => "Select all occurrences",
+            Self::MultiCursorCtrlClick => "Switch to Ctrl+Click for multi-cursor",
+            Self::MultiCursorAltClick => "Switch to Alt+Click for multi-cursor",
             Self::ToggleComment => "Toggle comment",
             Self::Format => "Format document",
         }
@@ -268,6 +301,19 @@ impl ContextAction {
             Self::Cut => "Ctrl-X",
             Self::Paste => "Ctrl-V",
             Self::SelectAll => "Ctrl-A",
+            Self::ExpandSelection => "Shift-Alt-Right",
+            Self::ShrinkSelection => "Shift-Alt-Left",
+            Self::CopyLineUp => "Shift-Alt-Up",
+            Self::CopyLineDown => "Shift-Alt-Down",
+            Self::MoveLineUp => "Alt-Up",
+            Self::MoveLineDown => "Alt-Down",
+            Self::DuplicateSelection => "Ctrl-Shift-Alt-D",
+            Self::AddCursorAbove => "Ctrl-Alt-Up",
+            Self::AddCursorBelow => "Ctrl-Alt-Down",
+            Self::AddCursorLineEnds => "Shift-Alt-I",
+            Self::AddNextOccurrence => "Ctrl-D",
+            Self::AddPreviousOccurrence => "Ctrl-Shift-D",
+            Self::SelectAllOccurrences => "Ctrl-Shift-L",
             Self::ToggleComment => "Ctrl-/",
             _ => "",
         }
@@ -354,6 +400,7 @@ pub struct App {
     pub project_search: ProjectSearchState,
     pub file_picker: FilePickerState,
     pub file_manager: FileManager,
+    pub office_viewer: Option<OfficeViewer>,
     manager_return_mode: Mode,
     manager_filter_active: bool,
     pub manager_confirmation: Option<ManagerConfirmation>,
@@ -511,7 +558,7 @@ impl App {
         let plugins = PluginRegistry::load(&config::plugins_dir());
         let current_dir = std::env::current_dir()?;
 
-        let (editor_path, project_root, explorer_focused, sidebar_visible): (
+        let (mut editor_path, project_root, explorer_focused, sidebar_visible): (
             Option<PathBuf>,
             PathBuf,
             bool,
@@ -547,6 +594,13 @@ impl App {
                 }
             },
         };
+        let special_viewer_path = editor_path
+            .as_ref()
+            .filter(|path| office_viewer::supports(path))
+            .cloned();
+        if special_viewer_path.is_some() {
+            editor_path = None;
+        }
 
         let mut editor = match restored_session.as_ref() {
             Some(session) => Tabs::from_session(&session.tabs, session.active_tab)?
@@ -646,6 +700,7 @@ impl App {
             project_search: ProjectSearchState::default(),
             file_picker: FilePickerState::default(),
             file_manager,
+            office_viewer: None,
             manager_return_mode: editor_mode,
             manager_filter_active: false,
             manager_confirmation: None,
@@ -801,6 +856,9 @@ impl App {
                     "Recovery: {summary} — :recover N, :recovercompare N, or :discardrecovery"
                 );
             }
+        }
+        if let Some(path) = special_viewer_path {
+            app.open_office_document(&path);
         }
         if path.is_some() {
             app.remember_current_project();
@@ -1093,6 +1151,11 @@ impl App {
             return;
         }
 
+        if self.mode == Mode::OfficeViewer {
+            self.handle_office_viewer_mouse(mouse, width, height);
+            return;
+        }
+
         if self.mode == Mode::FileManager {
             match mouse.kind {
                 MouseEventKind::ScrollUp => self.file_manager.move_selection(-3),
@@ -1324,7 +1387,7 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                self.handle_left_click(mouse.column, mouse.row, width, height);
+                self.handle_left_click(mouse.column, mouse.row, width, height, mouse.modifiers);
             }
             MouseEventKind::Down(MouseButton::Right) => {
                 self.open_context_menu(mouse.column, mouse.row, width, height)
@@ -1431,6 +1494,24 @@ impl App {
             actions.extend([
                 ContextAction::Paste,
                 ContextAction::SelectAll,
+                ContextAction::ExpandSelection,
+                ContextAction::ShrinkSelection,
+                ContextAction::CopyLineUp,
+                ContextAction::CopyLineDown,
+                ContextAction::MoveLineUp,
+                ContextAction::MoveLineDown,
+                ContextAction::DuplicateSelection,
+                ContextAction::AddCursorAbove,
+                ContextAction::AddCursorBelow,
+                ContextAction::AddCursorLineEnds,
+                ContextAction::AddNextOccurrence,
+                ContextAction::AddPreviousOccurrence,
+                ContextAction::SelectAllOccurrences,
+                if self.settings.multi_cursor_ctrl_click {
+                    ContextAction::MultiCursorAltClick
+                } else {
+                    ContextAction::MultiCursorCtrlClick
+                },
                 ContextAction::ToggleComment,
                 ContextAction::Format,
             ]);
@@ -1512,6 +1593,31 @@ impl App {
                     KeyModifiers::CONTROL,
                 ));
             }
+            ContextAction::ExpandSelection => self.run_action(KeyAction::ExpandSelection),
+            ContextAction::ShrinkSelection => self.run_action(KeyAction::ShrinkSelection),
+            ContextAction::CopyLineUp => self.run_action(KeyAction::CopyLineUp),
+            ContextAction::CopyLineDown => self.run_action(KeyAction::CopyLineDown),
+            ContextAction::MoveLineUp => self.run_action(KeyAction::MoveLineUp),
+            ContextAction::MoveLineDown => self.run_action(KeyAction::MoveLineDown),
+            ContextAction::DuplicateSelection => self.run_action(KeyAction::DuplicateSelection),
+            ContextAction::AddCursorAbove => self.run_action(KeyAction::AddCursorAbove),
+            ContextAction::AddCursorBelow => self.run_action(KeyAction::AddCursorBelow),
+            ContextAction::AddCursorLineEnds => self.run_action(KeyAction::AddCursorLineEnds),
+            ContextAction::AddNextOccurrence => self.run_action(KeyAction::AddNextOccurrence),
+            ContextAction::AddPreviousOccurrence => {
+                self.run_action(KeyAction::AddPreviousOccurrence)
+            }
+            ContextAction::SelectAllOccurrences => self.run_action(KeyAction::SelectOccurrences),
+            ContextAction::MultiCursorCtrlClick => {
+                self.settings.multi_cursor_ctrl_click = true;
+                self.persist_settings();
+                self.message = "Multi-cursor now uses Ctrl+Click".to_string();
+            }
+            ContextAction::MultiCursorAltClick => {
+                self.settings.multi_cursor_ctrl_click = false;
+                self.persist_settings();
+                self.message = "Multi-cursor now uses Alt+Click".to_string();
+            }
             ContextAction::ToggleComment => self.toggle_comments(),
             ContextAction::Format => self.request_formatting(),
         }
@@ -1528,7 +1634,14 @@ impl App {
         self.message = message.to_string();
     }
 
-    fn handle_left_click(&mut self, column: u16, row: u16, width: u16, height: u16) {
+    fn handle_left_click(
+        &mut self,
+        column: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        modifiers: KeyModifiers,
+    ) {
         self.follow_cursor = true;
         let layout = crate::ui::screen_layout(self, width, height);
 
@@ -1690,6 +1803,26 @@ impl App {
         } else {
             self.editor.scroll_column + local_x - layout.gutter_width
         };
+
+        let multi_cursor_modifier = if self.settings.multi_cursor_ctrl_click {
+            KeyModifiers::CONTROL
+        } else {
+            KeyModifiers::ALT
+        };
+        if modifiers.contains(multi_cursor_modifier) {
+            let previous_cursor = self.editor.cursor;
+            let previous_anchor = self.editor.selection_anchor;
+            self.editor
+                .set_cursor_from_display_position(line, display_column);
+            let target = self.editor.cursor;
+            self.editor.cursor = previous_cursor;
+            self.editor.selection_anchor = previous_anchor;
+            self.editor.finish_undo_group();
+            let count = self.editor.toggle_cursor_at(target);
+            self.search_origin = self.editor.cursor;
+            self.message = format!("{count} cursor(s) · modifier-click toggles cursors");
+            return;
+        }
 
         self.editor.clear_selection();
         self.editor.finish_undo_group();
@@ -2155,6 +2288,16 @@ impl App {
             self.handle_lsp_panel_key(key);
             return;
         }
+        if self.mode == Mode::OfficeViewer {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('q' | 'Q'))
+            {
+                self.request_quit(false);
+            } else {
+                self.handle_office_viewer_key(key);
+            }
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('`' | '~'))
         {
@@ -2421,7 +2564,8 @@ impl App {
             | Mode::KeymapGallery
             | Mode::ContextMenu
             | Mode::Dashboard
-            | Mode::FileManager => {}
+            | Mode::FileManager
+            | Mode::OfficeViewer => {}
         }
     }
 
@@ -2624,6 +2768,20 @@ impl App {
                 self.editor.move_file_end();
                 self.message = "Selected all".to_string();
             }
+            KeyAction::ExpandSelection => {
+                self.message = if self.editor.select_syntax_node() {
+                    "Expanded selection".to_string()
+                } else {
+                    "No larger syntax node at the cursor".to_string()
+                };
+            }
+            KeyAction::ShrinkSelection => {
+                self.message = if self.editor.shrink_syntax_selection() {
+                    "Shrank selection".to_string()
+                } else {
+                    "No previous syntax selection".to_string()
+                };
+            }
             KeyAction::Copy => self.copy_selection_to_clipboard(),
             KeyAction::Cut => {
                 if let Some(text) = self.editor.selected_text() {
@@ -2648,6 +2806,37 @@ impl App {
                     self.editor.insert_text(text);
                     self.message = "Pasted".to_string();
                 }
+            }
+            KeyAction::CopyLineUp => {
+                self.editor.checkpoint();
+                self.editor.copy_lines(false);
+                self.message = "Copied line(s) up".to_string();
+            }
+            KeyAction::CopyLineDown => {
+                self.editor.checkpoint();
+                self.editor.copy_lines(true);
+                self.message = "Copied line(s) down".to_string();
+            }
+            KeyAction::MoveLineUp => {
+                self.editor.checkpoint();
+                self.message = if self.editor.move_line(false) {
+                    "Moved line(s) up".to_string()
+                } else {
+                    "Line(s) are already at the top".to_string()
+                };
+            }
+            KeyAction::MoveLineDown => {
+                self.editor.checkpoint();
+                self.message = if self.editor.move_line(true) {
+                    "Moved line(s) down".to_string()
+                } else {
+                    "Line(s) are already at the bottom".to_string()
+                };
+            }
+            KeyAction::DuplicateSelection => {
+                self.editor.checkpoint();
+                self.editor.duplicate_selection();
+                self.message = "Duplicated selection".to_string();
             }
             KeyAction::NextTab => self.next_tab(),
             KeyAction::PrevTab => self.previous_tab(),
@@ -2687,6 +2876,12 @@ impl App {
             KeyAction::ToggleComment => self.toggle_comments(),
             KeyAction::AddCursorAbove => self.add_cursor_line(false),
             KeyAction::AddCursorBelow => self.add_cursor_line(true),
+            KeyAction::AddCursorLineEnds => {
+                let count = self.editor.add_cursors_to_line_ends();
+                self.message = format!("Added {count} line-end cursor(s)");
+            }
+            KeyAction::AddNextOccurrence => self.add_occurrence(true),
+            KeyAction::AddPreviousOccurrence => self.add_occurrence(false),
             KeyAction::SelectOccurrences => {
                 let count = self.editor.select_all_occurrences();
                 self.message = if count > 1 {
@@ -2864,6 +3059,24 @@ impl App {
             "No line below to add a cursor on".to_string()
         } else {
             "No line above to add a cursor on".to_string()
+        };
+    }
+
+    fn add_occurrence(&mut self, forward: bool) {
+        let added = if forward {
+            self.editor.select_next_occurrence()
+        } else {
+            self.editor.select_previous_occurrence()
+        };
+        self.message = if added {
+            format!(
+                "Selected {} occurrences",
+                self.editor.selection_ranges().len()
+            )
+        } else if forward {
+            "No next occurrence".to_string()
+        } else {
+            "No previous occurrence".to_string()
         };
     }
 
@@ -4031,6 +4244,7 @@ impl App {
                     Err(error) => self.message = format!("Could not start terminal: {error}"),
                 }
             }
+            KeyCode::Char('v') => self.open_manager_office_document(),
             KeyCode::Char('s') => {
                 self.file_manager.cycle_sort();
                 self.message = format!("Sorted by {}", self.file_manager.sort.name());
@@ -4102,6 +4316,120 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn open_manager_office_document(&mut self) {
+        let Some(entry) = self.file_manager.selected_entry() else {
+            self.message = "Select a document or spreadsheet first".to_string();
+            return;
+        };
+        if entry.is_dir {
+            self.message = "Select a document or spreadsheet, not a directory".to_string();
+            return;
+        }
+        let path = entry.path.clone();
+        if !self.open_office_document(&path) {
+            self.message = "Use v with a .docx or .xlsx document".to_string();
+        }
+    }
+
+    fn open_office_document(&mut self, path: &Path) -> bool {
+        if !office_viewer::supports(path) {
+            return false;
+        }
+        match OfficeViewer::open(path) {
+            Ok(viewer) => {
+                self.office_viewer = Some(viewer);
+                self.split_views = None;
+                self.explorer_focused = false;
+                self.terminal_focused = false;
+                self.mode = Mode::OfficeViewer;
+                self.message = format!("Opened {} in Caret", path.display());
+            }
+            Err(error) => {
+                self.message = format!("Could not open {}: {error}", path.display());
+            }
+        }
+        true
+    }
+
+    fn handle_office_viewer_key(&mut self, key: KeyEvent) {
+        let Some(viewer) = self.office_viewer.as_mut() else {
+            self.mode = self.preferred_editor_mode();
+            return;
+        };
+        let action = viewer.handle_key(key, self.viewport_rows.saturating_sub(3));
+        let status = viewer.status.clone();
+        match action {
+            ViewerAction::None => {
+                if !status.is_empty() {
+                    self.message = status;
+                }
+            }
+            ViewerAction::Copy(text) => {
+                self.message = if text.is_empty() {
+                    "Nothing to copy".to_string()
+                } else {
+                    copy_message(crate::clipboard::copy(&text), "Copied viewer content")
+                };
+            }
+            ViewerAction::Close => {
+                self.office_viewer = None;
+                self.mode = self.preferred_editor_mode();
+                self.message = "Closed Office viewer".to_string();
+            }
+        }
+    }
+
+    fn handle_office_viewer_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) {
+        let navigation = match mouse.kind {
+            MouseEventKind::ScrollUp => Some(KeyCode::Up),
+            MouseEventKind::ScrollDown => Some(KeyCode::Down),
+            _ => None,
+        };
+        if let Some(code) = navigation {
+            if let Some(viewer) = self.office_viewer.as_mut() {
+                for _ in 0..3 {
+                    viewer.handle_key(
+                        KeyEvent::new(code, KeyModifiers::NONE),
+                        self.viewport_rows.saturating_sub(3),
+                    );
+                }
+            }
+            return;
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let Some(hit) =
+            crate::ui::office_viewer_hit_at(self, width, height, mouse.column, mouse.row)
+        else {
+            return;
+        };
+        let Some(viewer) = self.office_viewer.as_mut() else {
+            return;
+        };
+        match hit {
+            crate::ui::OfficeViewerHit::SpreadsheetCell { row, column } => {
+                if let OfficeContent::Spreadsheet(view) = &mut viewer.content {
+                    view.row = row;
+                    view.column = column;
+                    view.detail_open = false;
+                    viewer.status = format!(
+                        "{}{} selected",
+                        office_viewer::column_label(column),
+                        row + 1
+                    );
+                }
+            }
+            crate::ui::OfficeViewerHit::DocumentLine(line) => {
+                if let OfficeContent::Document(view) = &mut viewer.content {
+                    view.cursor_line = line;
+                    view.detail_open = false;
+                    viewer.status = format!("Line {} selected", line + 1);
+                }
+            }
         }
     }
 
@@ -4316,6 +4644,9 @@ impl App {
     fn activate_manager_entry(&mut self) {
         match self.file_manager.activate() {
             ActivateResult::OpenFile(path) => {
+                if self.open_office_document(&path) {
+                    return;
+                }
                 let before = self.current_location();
                 match self.editor.open_or_switch(&path) {
                     Ok(disposition) => {
@@ -4344,6 +4675,9 @@ impl App {
         };
         if entry.is_dir {
             self.message = "Ctrl-Enter opens files in a vertical split".to_string();
+            return;
+        }
+        if self.open_office_document(&entry.path) {
             return;
         }
         let primary = EditorView {
@@ -4608,6 +4942,9 @@ impl App {
     fn activate_project_entry(&mut self) {
         match self.project.activate_selected() {
             Ok(Some(path)) => {
+                if self.open_office_document(&path) {
+                    return;
+                }
                 let before = self.current_location();
                 match self.editor.open_or_switch(&path) {
                     Ok(disposition) => {
@@ -5525,6 +5862,9 @@ impl App {
             .project
             .root
             .join(&self.file_picker.files[matched.file_index]);
+        if self.open_office_document(&path) {
+            return;
+        }
         let before = self.current_location();
         match self.editor.open_or_switch(&path) {
             Ok(disposition) => {
@@ -6099,6 +6439,41 @@ impl App {
         ("trim", "Trim trailing whitespace", None),
         ("splitline", "Split the line at the cursor", None),
         (
+            "expandselection",
+            "Expand selection to the enclosing syntax node",
+            Some(KeyAction::ExpandSelection),
+        ),
+        (
+            "shrinkselection",
+            "Restore the previous syntax selection",
+            Some(KeyAction::ShrinkSelection),
+        ),
+        (
+            "copylineup",
+            "Copy the selected line or lines upward",
+            Some(KeyAction::CopyLineUp),
+        ),
+        (
+            "copylinedown",
+            "Copy the selected line or lines downward",
+            Some(KeyAction::CopyLineDown),
+        ),
+        (
+            "moveup",
+            "Move the selected line or lines upward",
+            Some(KeyAction::MoveLineUp),
+        ),
+        (
+            "movedown",
+            "Move the selected line or lines downward",
+            Some(KeyAction::MoveLineDown),
+        ),
+        (
+            "duplicateselection",
+            "Duplicate the selection or current line",
+            Some(KeyAction::DuplicateSelection),
+        ),
+        (
             "selectoccurrences",
             "Select every occurrence",
             Some(KeyAction::SelectOccurrences),
@@ -6114,6 +6489,21 @@ impl App {
             "Add a cursor on the line below",
             Some(KeyAction::AddCursorBelow),
         ),
+        (
+            "addcursorlineends",
+            "Add a cursor to every selected line end",
+            Some(KeyAction::AddCursorLineEnds),
+        ),
+        (
+            "addnextoccurrence",
+            "Add the next matching occurrence",
+            Some(KeyAction::AddNextOccurrence),
+        ),
+        (
+            "addpreviousoccurrence",
+            "Add the previous matching occurrence",
+            Some(KeyAction::AddPreviousOccurrence),
+        ),
         ("set formatonsave", "Format every file on save", None),
         ("set noformatonsave", "Stop formatting on save", None),
         ("set hidden", "Show dotfiles in the tree", None),
@@ -6125,6 +6515,16 @@ impl App {
         ("set nodirectoriesfirst", "Sort folders with files", None),
         ("set managerpreview", "Enable safe file previews", None),
         ("set nomanagerpreview", "Disable file previews", None),
+        (
+            "set multicursor=ctrl",
+            "Use Ctrl+Click to toggle additional cursors",
+            None,
+        ),
+        (
+            "set multicursor=alt",
+            "Use Alt+Click to toggle additional cursors",
+            None,
+        ),
         (
             "set managerpanes=23,42",
             "Set wide manager parent/current percentages",
@@ -6312,7 +6712,7 @@ impl App {
                     let path = self.resolve_project_path(&argument);
                     if path.is_dir() {
                         self.change_project_root(path);
-                    } else {
+                    } else if !self.open_office_document(&path) {
                         let before = self.current_location();
                         match self.editor.open_or_switch(&path) {
                             Ok(disposition) => {
@@ -6340,15 +6740,17 @@ impl App {
                     self.new_tab(None);
                 } else {
                     let path = self.resolve_project_path(&argument);
-                    let before = self.current_location();
-                    match self.editor.open_or_switch(&path) {
-                        Ok(_) => {
-                            self.commit_navigation(before);
-                            self.explorer_focused = false;
-                            self.mode = self.preferred_editor_mode();
-                            self.after_tab_switch();
+                    if !self.open_office_document(&path) {
+                        let before = self.current_location();
+                        match self.editor.open_or_switch(&path) {
+                            Ok(_) => {
+                                self.commit_navigation(before);
+                                self.explorer_focused = false;
+                                self.mode = self.preferred_editor_mode();
+                                self.after_tab_switch();
+                            }
+                            Err(error) => self.message = format!("Open failed: {error}"),
                         }
-                        Err(error) => self.message = format!("Open failed: {error}"),
                     }
                 }
             }
@@ -6451,22 +6853,11 @@ impl App {
                 self.editor.duplicate_line();
                 self.message = "Duplicated line".to_string();
             }
-            "moveup" => {
-                self.editor.checkpoint();
-                self.message = if self.editor.move_line(false) {
-                    "Moved line up".to_string()
-                } else {
-                    "Line is already first".to_string()
-                };
-            }
-            "movedown" => {
-                self.editor.checkpoint();
-                self.message = if self.editor.move_line(true) {
-                    "Moved line down".to_string()
-                } else {
-                    "Line is already last".to_string()
-                };
-            }
+            "duplicateselection" => self.run_action(KeyAction::DuplicateSelection),
+            "copylineup" => self.run_action(KeyAction::CopyLineUp),
+            "copylinedown" => self.run_action(KeyAction::CopyLineDown),
+            "moveup" => self.run_action(KeyAction::MoveLineUp),
+            "movedown" => self.run_action(KeyAction::MoveLineDown),
             "join" => {
                 self.editor.checkpoint();
                 self.message = if self.editor.join_line_below() {
@@ -6520,22 +6911,15 @@ impl App {
                 self.message = "Split line at cursor".to_string();
             }
             "selectoccurrences" | "selectallmatches" => {
-                let count = self.editor.select_all_occurrences();
-                self.message = if count > 1 {
-                    format!("Selected {count} occurrences · type to replace them all")
-                } else {
-                    "Select or place the cursor on a word first".to_string()
-                };
+                self.run_action(KeyAction::SelectOccurrences)
             }
-            "selectnode" | "expandselection" => {
-                self.message = if self.editor.select_syntax_node() {
-                    "Selected syntax node · repeat to expand".to_string()
-                } else {
-                    "No larger syntax node at the cursor".to_string()
-                };
-            }
+            "selectnode" | "expandselection" => self.run_action(KeyAction::ExpandSelection),
+            "shrinkselection" => self.run_action(KeyAction::ShrinkSelection),
             "addcursorabove" => self.add_cursor_line(false),
             "addcursorbelow" => self.add_cursor_line(true),
+            "addcursorlineends" => self.run_action(KeyAction::AddCursorLineEnds),
+            "addnextoccurrence" => self.run_action(KeyAction::AddNextOccurrence),
+            "addpreviousoccurrence" => self.run_action(KeyAction::AddPreviousOccurrence),
             "indent" => self.indent_selection(false),
             "outdent" => self.indent_selection(true),
             "comment" | "togglecomment" => self.toggle_comments(),
@@ -8547,6 +8931,72 @@ mod tests {
     }
 
     #[test]
+    fn native_office_documents_are_opened_inside_caret() {
+        assert!(office_viewer::supports(Path::new("report.docx")));
+        assert!(office_viewer::supports(Path::new("data.xlsx")));
+        assert!(!office_viewer::supports(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn office_viewer_mouse_clicks_select_cells_without_closing() {
+        let mut app = App::new(None).expect("create app");
+        app.mode = Mode::OfficeViewer;
+        app.office_viewer = Some(OfficeViewer {
+            path: PathBuf::from("orders.xlsx"),
+            title: "orders.xlsx".to_string(),
+            content: OfficeContent::Spreadsheet(office_viewer::SpreadsheetView {
+                sheets: vec![office_viewer::SheetView {
+                    name: "Sheet1".to_string(),
+                    cells: vec![
+                        vec!["A1".to_string(), "B1".to_string()],
+                        vec!["A2".to_string(), "B2".to_string()],
+                    ],
+                    formulas: Vec::new(),
+                    truncated: false,
+                }],
+                active_sheet: 0,
+                row: 0,
+                column: 0,
+                scroll_row: 0,
+                scroll_column: 0,
+                detail_open: false,
+            }),
+            search_query: String::new(),
+            search_editing: false,
+            status: String::new(),
+        });
+        let layout = crate::ui::screen_layout(&app, 120, 30);
+        app.handle_office_viewer_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: (layout.editor_x + 7 + 24 + 1) as u16,
+                row: layout.content_top + 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            120,
+            30,
+        );
+
+        assert_eq!(app.mode, Mode::OfficeViewer);
+        let OfficeContent::Spreadsheet(view) = &app.office_viewer.as_ref().unwrap().content else {
+            panic!("expected spreadsheet");
+        };
+        assert_eq!((view.row, view.column), (1, 1));
+
+        app.handle_office_viewer_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 20,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            120,
+            30,
+        );
+        assert_eq!(app.mode, Mode::OfficeViewer);
+    }
+
+    #[test]
     fn dirty_tab_close_requires_confirmation_before_discarding() {
         let mut app = App::new(None).expect("create app");
         app.explorer_focused = false;
@@ -9060,7 +9510,7 @@ mod tests {
         assert_eq!(app.mode, Mode::SettingsBrowser);
 
         let all = app.setting_rows();
-        assert_eq!(all.len(), 27);
+        assert_eq!(all.len(), 28);
 
         type_text(&mut app, "undo");
         let filtered = app.setting_rows();

@@ -300,11 +300,13 @@ impl SyntaxDocument {
         cursor_char: usize,
         current_range: Option<(usize, usize)>,
     ) -> Option<(usize, usize)> {
-        let byte = char_index_to_byte(&self.source, cursor_char);
+        let (start_char, end_char) = current_range.unwrap_or((cursor_char, cursor_char));
+        let start_byte = char_index_to_byte(&self.source, start_char);
+        let end_byte = char_index_to_byte(&self.source, end_char.max(start_char.saturating_add(1)));
         let mut node = self
             .tree
             .root_node()
-            .descendant_for_byte_range(byte, byte.saturating_add(1).min(self.source.len()))?;
+            .descendant_for_byte_range(start_byte, end_byte.min(self.source.len()))?;
         loop {
             if node.is_named() && node.start_byte() < node.end_byte() {
                 let range = (
