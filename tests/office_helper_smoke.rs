@@ -14,7 +14,7 @@ fn load(path: &Path, output: &Path) -> Option<Result<serde_json::Value, String>>
         .arg(path)
         .stdin(Stdio::null())
         .stdout(fs::File::create(output).unwrap())
-        .stderr(Stdio::null())
+        .stderr(fs::File::create(output.with_extension("stderr")).unwrap())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(6);
@@ -53,7 +53,16 @@ fn helper_rejects_oversized_malformed_and_sparse_allocation_bombs() {
         &file,
         r#"<row r="1"><c r="A1"><v>1</v></c></row><row r="1048576"><c r="XFD1048576"><v>2</v></c></row>"#,
     );
-    assert!(load(&file, &output).is_none_or(|result| result.is_err()));
+    assert!(
+        load(&file, &output).is_none(),
+        "allocation bomb must terminate inside the isolated helper"
+    );
+    assert!(
+        fs::read_to_string(output.with_extension("stderr"))
+            .unwrap()
+            .contains("memory allocation"),
+        "helper must reject the allocation, rather than an unrelated parse error"
+    );
     test_support::write_workbook(&file, r#"<row r="3"><c r="B3"><v>7</v></c></row>"#);
     let viewer = load(&file, &output).unwrap().unwrap();
     assert_eq!(

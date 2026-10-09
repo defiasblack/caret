@@ -10,13 +10,15 @@ pub fn write_deflated_zip(path: &Path, files: &[(&str, &str)]) {
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(contents).unwrap();
         let compressed = encoder.finish().unwrap();
+        let mut crc = flate2::Crc::new();
+        crc.update(contents);
         bytes.extend_from_slice(b"PK\x03\x04");
         bytes.extend_from_slice(&20u16.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(&8u16.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&crc.sum().to_le_bytes());
         bytes.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&(contents.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -31,7 +33,7 @@ pub fn write_deflated_zip(path: &Path, files: &[(&str, &str)]) {
         central.extend_from_slice(&8u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&crc.sum().to_le_bytes());
         central.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         central.extend_from_slice(&(contents.len() as u32).to_le_bytes());
         central.extend_from_slice(&(name.len() as u16).to_le_bytes());
