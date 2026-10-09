@@ -78,28 +78,20 @@ impl PtyProcess {
     fn wait_for_output(&mut self, needle: &[u8], timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            while let Ok(bytes) = self.output.try_recv() {
-                if bytes.windows(4).any(|window| window == b"\x1b[6n") {
-                    // ConPTY asks the terminal for its cursor position before
-                    // delivering application input.
-                    self.send(b"\x1b[1;1R");
-                }
-                self.parser.process(&bytes);
-                self.captured.extend_from_slice(&bytes);
-                let matched_output = self
-                    .captured
-                    .windows(needle.len())
-                    .any(|window| window == needle);
-                let matched_screen = self
-                    .parser
-                    .screen()
-                    .contents()
-                    .as_bytes()
-                    .windows(needle.len())
-                    .any(|window| window == needle);
-                if matched_output || matched_screen {
-                    return;
-                }
+            self.poll_output();
+            let matched_output = self
+                .captured
+                .windows(needle.len())
+                .any(|window| window == needle);
+            let matched_screen = self
+                .parser
+                .screen()
+                .contents()
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window == needle);
+            if matched_output || matched_screen {
+                return;
             }
             if self.child.try_wait().expect("poll Caret").is_some() {
                 break;
@@ -113,9 +105,27 @@ impl PtyProcess {
         );
     }
 
+    fn poll_output(&mut self) {
+        while let Ok(bytes) = self.output.try_recv() {
+            let tail = self.captured.len().saturating_sub(3);
+            self.captured.extend_from_slice(&bytes);
+            // ConPTY cursor requests can be split across reads and can arrive
+            // while waiting for a filesystem change rather than screen text.
+            let requests = self.captured[tail..]
+                .windows(4)
+                .filter(|window| *window == b"\x1b[6n")
+                .count();
+            for _ in 0..requests {
+                self.send(b"\x1b[1;1R");
+            }
+            self.parser.process(&bytes);
+        }
+    }
+
     fn wait_for_exit(&mut self, timeout: Duration) -> ExitStatus {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
+            self.poll_output();
             if let Some(status) = self.child.try_wait().expect("poll Caret") {
                 return status;
             }
@@ -164,6 +174,7 @@ fn edits_saves_and_exits_cleanly_in_a_real_pty() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && fs::read_to_string(&file).unwrap() != "safe original" {
+        process.poll_output();
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(fs::read_to_string(&file).unwrap(), "safe original");
@@ -260,6 +271,7 @@ fn forced_termination_is_reported_by_the_next_real_pty_session() {
     let save_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < save_deadline && fs::read_to_string(&file).unwrap() != "unsaved original"
     {
+        second.poll_output();
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(fs::read_to_string(&file).unwrap(), "unsaved original");
@@ -302,6 +314,7 @@ fn external_changes_require_confirmation_in_a_real_pty() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && fs::read_to_string(&file).unwrap() != "buffer original" {
+        process.poll_output();
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(fs::read_to_string(&file).unwrap(), "buffer original");
@@ -330,12 +343,15 @@ fn repeated_edits_and_atomic_saves_remain_stable_in_a_real_pty() {
         process.send(&[0x13]); // Ctrl-S
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && fs::read_to_string(&file).unwrap() != expected {
+            process.poll_output();
             thread::sleep(Duration::from_millis(10));
         }
+        process.poll_output();
         assert_eq!(
             fs::read_to_string(&file).unwrap(),
             expected,
-            "save cycle {count} did not produce the complete document"
+            "save cycle {count} did not produce the complete document; screen: {}",
+            process.parser.screen().contents()
         );
     }
 

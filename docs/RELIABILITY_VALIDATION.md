@@ -31,7 +31,9 @@ cargo test --release --locked --bin caret benchmark_ -- --ignored --nocapture --
 
 Local Windows tests use an isolated `TEMP`/`TMP` directory so file-manager tests
 that enumerate the parent of their fixture do not scan unrelated system temp
-files. CI's runner temp directories are already isolated.
+files. CI's runner temp directories are already isolated. The PTY harness
+services ConPTY cursor requests across read boundaries and during file/exit waits;
+five consecutive parallel Windows PTY suites passed after this transport repair.
 
 ## Regression coverage
 
