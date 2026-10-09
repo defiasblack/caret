@@ -24,6 +24,47 @@ pub enum LineEnding {
     Crlf,
 }
 
+pub struct DocumentSnapshot {
+    pub text: String,
+    pub format: FileFormat,
+    pub modified: Option<std::time::SystemTime>,
+    pub len: u64,
+    pub fingerprint: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskState {
+    pub modified: Option<std::time::SystemTime>,
+    pub len: Option<u64>,
+    pub fingerprint: Option<u64>,
+}
+
+pub fn disk_state(path: &Path) -> DiskState {
+    use std::io::Read;
+    let file = fs::File::open(path).ok();
+    let metadata = file.as_ref().and_then(|file| file.metadata().ok());
+    let fingerprint = file.and_then(|mut file| {
+        let mut hasher = DefaultHasher::new();
+        file.metadata().ok()?.len().hash(&mut hasher);
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).ok()?;
+            if count == 0 {
+                break;
+            }
+            hasher.write(&buffer[..count]);
+        }
+        Some(hasher.finish())
+    });
+    DiskState {
+        modified: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok()),
+        len: metadata.map(|metadata| metadata.len()),
+        fingerprint,
+    }
+}
+
 /// What happens to the last line's ending when a document is saved.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -48,7 +89,21 @@ impl FinalNewline {
 }
 
 pub fn read_text(path: &Path) -> io::Result<(String, FileFormat)> {
-    let bytes = fs::read(path)?;
+    let snapshot = read_snapshot(path)?;
+    Ok((snapshot.text, snapshot.format))
+}
+
+pub fn read_snapshot(path: &Path) -> io::Result<DocumentSnapshot> {
+    read_snapshot_with(path, || {})
+}
+
+fn read_snapshot_with(path: &Path, after_read: impl FnOnce()) -> io::Result<DocumentSnapshot> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    after_read();
+    let metadata = file.metadata()?;
     if bytes.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -70,14 +125,17 @@ pub fn read_text(path: &Path) -> io::Result<(String, FileFormat)> {
         LineEnding::Lf
     };
     let final_newline = text.ends_with('\n');
-    Ok((
+    Ok(DocumentSnapshot {
         text,
-        FileFormat {
+        format: FileFormat {
             utf8_bom,
             line_ending,
             final_newline,
         },
-    ))
+        modified: metadata.modified().ok(),
+        len: bytes.len() as u64,
+        fingerprint: fingerprint_bytes(&bytes),
+    })
 }
 
 /// Writes a fully synchronized replacement beside `path` and only then swaps it
@@ -197,9 +255,13 @@ pub fn recovery_dir() -> PathBuf {
 /// metadata alone is not sufficient for conflict detection.
 pub fn fingerprint(path: &Path) -> io::Result<u64> {
     let bytes = fs::read(path)?;
+    Ok(fingerprint_bytes(&bytes))
+}
+
+pub fn fingerprint_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
-    Ok(hasher.finish())
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -410,5 +472,29 @@ mod tests {
         drop(lock);
         assert_eq!(fs::read(&path).unwrap(), b"important original");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshot_fingerprint_and_decoding_share_the_read_bytes() {
+        let path = temp("snapshot-race");
+        let old = b"\xEF\xBB\xBFold\r\n";
+        fs::write(&path, old).unwrap();
+        let snapshot = read_snapshot_with(&path, || fs::write(&path, b"new\r\n").unwrap()).unwrap();
+        assert_eq!(snapshot.text, "old\r\n");
+        assert!(snapshot.format.utf8_bom);
+        assert_eq!(snapshot.fingerprint, fingerprint_bytes(old));
+        assert_ne!(snapshot.fingerprint, fingerprint(&path).unwrap());
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn streaming_disk_fingerprint_matches_save_fingerprint() {
+        let path = temp("streaming-hash");
+        let bytes = vec![b'x'; 128 * 1024 + 7];
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            disk_state(&path).fingerprint,
+            Some(fingerprint_bytes(&bytes))
+        );
+        fs::remove_file(path).unwrap();
     }
 }

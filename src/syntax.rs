@@ -132,6 +132,7 @@ pub struct SyntaxDocument {
     highlight_query: Option<Query>,
     indent_query: Option<Query>,
     source: String,
+    line_starts: Vec<usize>,
 }
 
 impl SyntaxDocument {
@@ -151,6 +152,7 @@ impl SyntaxDocument {
             highlight_query,
             indent_query,
             source: source.to_string(),
+            line_starts: line_start_offsets(source),
         })
     }
 
@@ -173,6 +175,24 @@ impl SyntaxDocument {
             old_end_position,
             new_end_position,
         });
+        let first = self
+            .line_starts
+            .partition_point(|offset| *offset <= start_byte);
+        let last = self
+            .line_starts
+            .partition_point(|offset| *offset <= old_end_byte);
+        let delta = inserted.len() as isize - (old_end_byte - start_byte) as isize;
+        for offset in &mut self.line_starts[last..] {
+            *offset = offset.saturating_add_signed(delta);
+        }
+        self.line_starts.splice(
+            first..last,
+            inserted
+                .bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .map(|(index, _)| start_byte + index + 1),
+        );
         self.source
             .replace_range(start_byte..old_end_byte, inserted);
         if let Some(tree) = self.parser.parse(&self.source, Some(&self.tree)) {
@@ -182,7 +202,11 @@ impl SyntaxDocument {
 
     pub fn highlight_line(&self, line_index: usize, line: &str, theme: &Theme) -> Vec<Color> {
         let mut colors = highlight_line_base(line, self.language, theme);
-        let line_start = line_start_byte(&self.source, line_index).unwrap_or(self.source.len());
+        let line_start = self
+            .line_starts
+            .get(line_index)
+            .copied()
+            .unwrap_or(self.source.len());
         if let Some(query) = &self.highlight_query {
             apply_query_highlights(
                 query,
@@ -745,20 +769,16 @@ fn point_after_text(start: Point, text: &str) -> Point {
     }
 }
 
-fn line_start_byte(source: &str, line_index: usize) -> Option<usize> {
-    if line_index == 0 {
-        return Some(0);
-    }
-    let mut remaining = line_index;
-    for (byte, character) in source.char_indices() {
-        if character == '\n' {
-            remaining -= 1;
-            if remaining == 0 {
-                return Some(byte + 1);
-            }
-        }
-    }
-    None
+fn line_start_offsets(source: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(
+            source
+                .bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .map(|(index, _)| index + 1),
+        )
+        .collect()
 }
 
 fn apply_query_highlights(
@@ -1423,5 +1443,53 @@ mod tests {
                 .map(|symbol| symbol.name.as_str()),
             Some("Run")
         );
+    }
+
+    #[test]
+    fn line_offsets_remain_exact_across_unicode_and_newline_edits() {
+        let mut doc =
+            SyntaxDocument::new(Some(Path::new("main.rs")), "// é\r\nfn a() {}\n").unwrap();
+        for (at, removed, inserted) in [
+            (0, 0, "\n"),
+            (1, 6, "// 日\n\n"),
+            (3, 2, "\r\n"),
+            (0, 1, ""),
+            (2, 0, "α"),
+        ] {
+            doc.apply_edit(at, removed, inserted);
+            assert_eq!(
+                doc.line_starts,
+                line_start_offsets(&doc.source),
+                "{}",
+                doc.source
+            );
+        }
+        let theme = Theme::for_kind(crate::theme::ThemeKind::Oxide);
+        for (index, line) in doc.source.lines().enumerate() {
+            assert_eq!(
+                doc.highlight_line(index, line, &theme).len(),
+                line.chars().count()
+            );
+        }
+    }
+    #[test]
+    #[ignore = "manual release performance benchmark"]
+    fn benchmark_highlight_viewports() {
+        let source = "fn item() { let answer = 42; }\n".repeat(20_000);
+        let syntax = SyntaxDocument::new(Some(Path::new("perf.rs")), &source).unwrap();
+        let theme = Theme::for_kind(crate::theme::ThemeKind::Oxide);
+        for start in [0, 19_970] {
+            let at = std::time::Instant::now();
+            for _ in 0..100 {
+                for index in start..start + 30 {
+                    std::hint::black_box(syntax.highlight_line(
+                        index,
+                        "fn item() { let answer = 42; }",
+                        &theme,
+                    ));
+                }
+            }
+            eprintln!("100 draws of 30 lines near {start}: {:?}", at.elapsed());
+        }
     }
 }

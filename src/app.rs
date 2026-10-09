@@ -401,6 +401,9 @@ pub struct App {
     pub file_picker: FilePickerState,
     pub file_manager: FileManager,
     pub office_viewer: Option<OfficeViewer>,
+    pub office_loading: Option<PathBuf>,
+    office_loader: crate::office_loader::OfficeLoader,
+    disk_monitor: crate::disk_monitor::DiskMonitor,
     manager_return_mode: Mode,
     manager_filter_active: bool,
     pub manager_confirmation: Option<ManagerConfirmation>,
@@ -701,6 +704,9 @@ impl App {
             file_picker: FilePickerState::default(),
             file_manager,
             office_viewer: None,
+            office_loading: None,
+            office_loader: crate::office_loader::OfficeLoader::default(),
+            disk_monitor: crate::disk_monitor::DiskMonitor::new(),
             manager_return_mode: editor_mode,
             manager_filter_active: false,
             manager_confirmation: None,
@@ -822,11 +828,9 @@ impl App {
                     scroll_line: state.scroll_line,
                     scroll_column: state.scroll_column,
                 };
-                (split.primary.tab_index < app.editor.len()
-                    && split.secondary.tab_index < app.editor.len())
-                .then(|| SplitViews {
-                    primary: view(split.primary),
-                    secondary: view(split.secondary),
+                Some(SplitViews {
+                    primary: view(app.editor.restored_view(split.primary, &session.tabs)?),
+                    secondary: view(app.editor.restored_view(split.secondary, &session.tabs)?),
                     secondary_active: split.secondary_active,
                     vertical: split.vertical,
                 })
@@ -896,27 +900,38 @@ impl App {
     }
 
     fn current_session_state(&self) -> crate::session::SessionState {
+        let exported = self.editor.export_session();
         crate::session::SessionState {
             project_root: self.project.root.clone(),
-            tabs: self.editor.session_tabs(),
-            active_tab: self.editor.active_index(),
+            tabs: exported.tabs,
+            active_tab: exported.active,
             sidebar_visible: self.project.visible,
             sidebar_outline: self.sidebar_view == SidebarView::Outline,
-            split: self.split_views.map(|split| crate::session::SplitState {
-                primary: crate::session::ViewState {
-                    tab_index: split.primary.tab_index,
-                    cursor: split.primary.cursor.into(),
-                    scroll_line: split.primary.scroll_line,
-                    scroll_column: split.primary.scroll_column,
-                },
-                secondary: crate::session::ViewState {
-                    tab_index: split.secondary.tab_index,
-                    cursor: split.secondary.cursor.into(),
-                    scroll_line: split.secondary.scroll_line,
-                    scroll_column: split.secondary.scroll_column,
-                },
-                secondary_active: split.secondary_active,
-                vertical: split.vertical,
+            split: self.split_views.and_then(|split| {
+                Some(crate::session::SplitState {
+                    primary: crate::session::ViewState {
+                        tab_index: exported
+                            .index_map
+                            .get(split.primary.tab_index)
+                            .copied()
+                            .flatten()?,
+                        cursor: split.primary.cursor.into(),
+                        scroll_line: split.primary.scroll_line,
+                        scroll_column: split.primary.scroll_column,
+                    },
+                    secondary: crate::session::ViewState {
+                        tab_index: exported
+                            .index_map
+                            .get(split.secondary.tab_index)
+                            .copied()
+                            .flatten()?,
+                        cursor: split.secondary.cursor.into(),
+                        scroll_line: split.secondary.scroll_line,
+                        scroll_column: split.secondary.scroll_column,
+                    },
+                    secondary_active: split.secondary_active,
+                    vertical: split.vertical,
+                })
             }),
             file_manager: Some(
                 self.file_manager
@@ -1088,6 +1103,22 @@ impl App {
     pub fn poll_background(&mut self) -> bool {
         let message = self.message.clone();
         let mut changed = self.file_manager.poll();
+        if let Some(result) = self.office_loader.poll() {
+            self.office_loading = None;
+            match result {
+                Ok(viewer) => {
+                    self.message = format!("Opened {} in Caret", viewer.path.display());
+                    self.office_viewer = Some(viewer);
+                }
+                Err(error) => {
+                    self.message = format!("Could not load Office document: {error}");
+                    if self.mode == Mode::OfficeViewer {
+                        self.mode = self.preferred_editor_mode();
+                    }
+                }
+            }
+            changed = true;
+        }
         if let Some(summary) = self.file_manager.last_operation.clone() {
             if summary.id != self.handled_manager_operation {
                 self.handled_manager_operation = summary.id;
@@ -1100,11 +1131,15 @@ impl App {
         }
         self.poll_lsp();
         self.checkpoint_persistence();
-        if self.mode != Mode::ReloadConfirm && self.editor.changed_on_disk() {
+        if let Some(observed) = self
+            .disk_monitor
+            .poll(&self.editor)
+            .filter(|_| self.mode != Mode::ReloadConfirm)
+        {
             // Record the conflict immediately. Choosing "Later" must not
             // acknowledge the new disk version and silently allow a later
             // save to overwrite it.
-            self.editor.keep_disk_change();
+            self.editor.keep_disk_state(observed);
             self.mode = Mode::ReloadConfirm;
             self.message =
                 "File changed on disk — [R] Reload   [K] Keep buffer   [C] Compare   [Esc] Later"
@@ -4338,16 +4373,21 @@ impl App {
         if !office_viewer::supports(path) {
             return false;
         }
-        match OfficeViewer::open(path) {
-            Ok(viewer) => {
-                self.office_viewer = Some(viewer);
+        match self.office_loader.start(path) {
+            Ok(()) => {
+                self.office_viewer = None;
+                self.office_loading = Some(path.to_path_buf());
                 self.split_views = None;
                 self.explorer_focused = false;
                 self.terminal_focused = false;
                 self.mode = Mode::OfficeViewer;
-                self.message = format!("Opened {} in Caret", path.display());
+                self.message = format!("Loading {} · Esc cancels", path.display());
             }
             Err(error) => {
+                self.office_loading = None;
+                if self.mode == Mode::OfficeViewer && self.office_viewer.is_none() {
+                    self.mode = self.preferred_editor_mode();
+                }
                 self.message = format!("Could not open {}: {error}", path.display());
             }
         }
@@ -4355,11 +4395,32 @@ impl App {
     }
 
     fn handle_office_viewer_key(&mut self, key: KeyEvent) {
+        if self.office_loading.is_some() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.office_loader.cancel();
+                self.office_loading = None;
+                self.mode = self.preferred_editor_mode();
+                self.message = "Office loading cancelled".into();
+            }
+            return;
+        }
         let Some(viewer) = self.office_viewer.as_mut() else {
             self.mode = self.preferred_editor_mode();
             return;
         };
-        let action = viewer.handle_key(key, self.viewport_rows.saturating_sub(3));
+        let page_rows = match &viewer.content {
+            OfficeContent::Spreadsheet(_) => {
+                office_viewer::ViewerViewport::spreadsheet(
+                    self.viewport_rows,
+                    self.viewport_columns,
+                )
+                .rows
+            }
+            OfficeContent::Document(_) => {
+                office_viewer::ViewerViewport::document(self.viewport_rows).rows
+            }
+        };
+        let action = viewer.handle_key(key, page_rows);
         let status = viewer.status.clone();
         match action {
             ViewerAction::None => {
@@ -7635,10 +7696,10 @@ impl App {
                     .ok_or_else(|| format!("Invalid text edits for {}", path.display()))?;
                 editor.replace_text(&text);
             } else {
-                let expected_fingerprint = crate::document::fingerprint(&path)
+                let snapshot = crate::document::read_snapshot(&path)
                     .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
-                let (text, format) = crate::document::read_text(&path)
-                    .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+                let expected_fingerprint = snapshot.fingerprint;
+                let (text, format) = (snapshot.text, snapshot.format);
                 let text = apply_lsp_text_edits(&text, &edits)
                     .ok_or_else(|| format!("Invalid text edits for {}", path.display()))?;
                 let mut bytes = Vec::with_capacity(text.len() + 3);
@@ -8945,15 +9006,13 @@ mod tests {
             path: PathBuf::from("orders.xlsx"),
             title: "orders.xlsx".to_string(),
             content: OfficeContent::Spreadsheet(office_viewer::SpreadsheetView {
-                sheets: vec![office_viewer::SheetView {
-                    name: "Sheet1".to_string(),
-                    cells: vec![
+                sheets: vec![office_viewer::SheetView::from_rows(
+                    "Sheet1",
+                    vec![
                         vec!["A1".to_string(), "B1".to_string()],
                         vec!["A2".to_string(), "B2".to_string()],
                     ],
-                    formulas: Vec::new(),
-                    truncated: false,
-                }],
+                )],
                 active_sheet: 0,
                 row: 0,
                 column: 0,
@@ -8982,6 +9041,37 @@ mod tests {
             panic!("expected spreadsheet");
         };
         assert_eq!((view.row, view.column), (1, 1));
+        app.project.visible = false;
+        if let OfficeContent::Spreadsheet(view) = &mut app.office_viewer.as_mut().unwrap().content {
+            view.sheets[0] =
+                office_viewer::SheetView::from_rows("big", vec![vec!["x".into(); 10]; 100]);
+        }
+        for (width, height) in [(30, 12), (55, 15), (80, 30), (120, 40)] {
+            let layout = crate::ui::screen_layout(&app, width, height);
+            let viewport = office_viewer::ViewerViewport::spreadsheet(
+                layout.content_height,
+                layout.editor_width,
+            );
+            let partial_column = layout.editor_x + 7 + viewport.columns * 24;
+            if partial_column < layout.editor_x + layout.editor_width {
+                assert!(crate::ui::office_viewer_hit_at(
+                    &app,
+                    width,
+                    height,
+                    partial_column as u16,
+                    layout.content_top + 3
+                )
+                .is_none());
+            }
+            assert!(crate::ui::office_viewer_hit_at(
+                &app,
+                width,
+                height,
+                (layout.editor_x + 8) as u16,
+                layout.content_top + layout.content_height as u16 - 2
+            )
+            .is_none());
+        }
 
         app.handle_office_viewer_mouse(
             MouseEvent {
@@ -9032,7 +9122,11 @@ mod tests {
         let mut app = App::new(Some(&path)).expect("create app");
         std::fs::write(&path, "external").unwrap();
 
-        app.poll_background();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.mode != Mode::ReloadConfirm && Instant::now() < deadline {
+            app.poll_background();
+            std::thread::yield_now();
+        }
         assert_eq!(app.mode, Mode::ReloadConfirm);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.editor.has_pending_external_change());
@@ -10125,5 +10219,42 @@ mod tests {
         assert_eq!(lsp_workspace_root(&source), Some(project));
 
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn session_export_remaps_both_named_panes_and_discards_untitled_splits() {
+        let root = std::env::temp_dir().join(format!("caret-app-split-map-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let mut app = App::new(Some(&root)).unwrap();
+        app.editor.insert_char('u');
+        app.editor.open_or_switch(&a).unwrap();
+        app.editor.new_buffer();
+        app.editor.open_or_switch(&b).unwrap();
+        let view = EditorView {
+            tab_index: 1,
+            cursor: crate::editor::Cursor::default(),
+            scroll_line: 0,
+            scroll_column: 0,
+        };
+        app.split_views = Some(SplitViews {
+            primary: view,
+            secondary: EditorView {
+                tab_index: 3,
+                ..view
+            },
+            secondary_active: true,
+            vertical: true,
+        });
+        let state = app.current_session_state();
+        assert_eq!(state.active_tab, 1);
+        let split = state.split.unwrap();
+        assert_eq!(split.primary.tab_index, 0);
+        assert_eq!(split.secondary.tab_index, 1);
+        app.split_views.as_mut().unwrap().secondary.tab_index = 2;
+        assert!(app.current_session_state().split.is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

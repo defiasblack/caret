@@ -69,6 +69,34 @@ It was reconciled against the repository on 2026-07-25.
 - [x] Windows, macOS, and Linux CI build/test/diagnostic matrix plus Ubuntu
   locked-install and PTY startup smoke coverage, with warnings denied.
 
+### Repository reliability and performance repairs
+
+- [x] Track current and saved document revisions through undo/redo, saves,
+  history branching, and eviction; failed saves leave unsaved work dirty.
+- [x] Decode text and establish disk fingerprints from the same document
+  snapshot; retain the fingerprint and length of bytes actually saved.
+- [x] Exclusively reserve copy staging, install through no-replace boundaries,
+  clean up only owned output, and retain completed cross-device copies when
+  source removal partially fails.
+- [x] Preserve independent absolute value/formula ranges in sparse workbook
+  maps with cached dimensions; share viewport geometry across drawing,
+  navigation, paging, resizing, and mouse selection.
+- [x] Drain both plugin output pipes concurrently with stdin and enforce the
+  deadline through input, execution, output collection, termination, and reap.
+- [x] Map named session tabs and split panes across untitled/missing tabs while
+  preserving the session JSON format and clamping restored views.
+- [x] Coalesce active-file fingerprint checks on one bounded background worker
+  every two seconds, reject obsolete paths/save generations, and poll background
+  services during input as well as idle periods.
+- [x] Cache syntax line-start byte offsets and update them after edits so
+  highlighting does not scan preceding document text.
+- [x] Supervise cancellable Office helper loads, reject obsolete results, and
+  enforce input, allocation, deadline, cell-count, and response budgets; document
+  the defaults and retain supported formats and display limits.
+- [x] Record Windows/Linux/macOS formatting, warnings-denied Clippy, full tests,
+  release builds, PTY smoke tests, and release performance measurements for these
+  repairs in `docs/RELIABILITY_VALIDATION.md`.
+
 ### Remaining release work
 
 Automated release-candidate baseline: `0.6.0-rc.2`,
