@@ -23,12 +23,22 @@ impl BudgetAllocator {
     }
 
     fn reserve(&self, bytes: usize) -> bool {
-        self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(bytes)
-                    .filter(|next| *next <= self.limit.load(Ordering::Relaxed))
-            })
-            .is_ok()
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = used
+                .checked_add(bytes)
+                .filter(|next| *next <= self.limit.load(Ordering::Relaxed))
+            else {
+                return false;
+            };
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(current) => used = current,
+            }
+        }
     }
 }
 
@@ -53,17 +63,20 @@ unsafe impl GlobalAlloc for BudgetAllocator {
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        let growth = size.saturating_sub(layout.size());
-        if !self.reserve(growth) {
+        // A system realloc may allocate the new block before freeing the old
+        // one. Reserve that peak before calling it, even if it can grow in place.
+        if !self.reserve(size) {
             return std::ptr::null_mut();
         }
         let result = unsafe { System.realloc(pointer, layout, size) };
-        if result.is_null() {
-            self.used.fetch_sub(growth, Ordering::Relaxed);
-        } else {
-            self.used
-                .fetch_sub(layout.size().saturating_sub(size), Ordering::Relaxed);
-        }
+        self.used.fetch_sub(
+            if result.is_null() {
+                size
+            } else {
+                layout.size()
+            },
+            Ordering::Relaxed,
+        );
         result
     }
 }
@@ -80,5 +93,21 @@ mod tests {
         assert!(!allocator.reserve(usize::MAX));
         allocator.used.fetch_sub(8, Ordering::Relaxed);
         assert!(allocator.reserve(8));
+    }
+    #[test]
+    fn realloc_reserves_the_peak_and_preserves_the_old_block_on_failure() {
+        let allocator = BudgetAllocator::new();
+        allocator.set_limit(16);
+        let layout = Layout::from_size_align(8, 8).unwrap();
+        // SAFETY: all operations use the same allocator and original layout;
+        // the failed realloc leaves the original allocation owned by this test.
+        unsafe {
+            let pointer = allocator.alloc(layout);
+            assert!(!pointer.is_null());
+            assert!(allocator.realloc(pointer, layout, 12).is_null());
+            assert_eq!(allocator.used.load(Ordering::Relaxed), 8);
+            allocator.dealloc(pointer, layout);
+        }
+        assert_eq!(allocator.used.load(Ordering::Relaxed), 0);
     }
 }
