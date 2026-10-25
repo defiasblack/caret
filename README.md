@@ -416,7 +416,11 @@ packages cover Windows, Linux (glibc), and macOS on x64 and arm64.
 Each rasterization runs in a disposable helper, with a 32 MiB input limit,
 five-second deadline, 512 MiB allocation/native-memory budget, and 64 MiB
 response limit. Windows enforces native allocations with a Job Object;
-Unix sets `RLIMIT_AS` before loading the renderer. Image decoding also caps
+Linux sets a 512 MiB `RLIMIT_AS` before loading the renderer. On macOS, the
+shared runtime already occupies a larger address space: Caret disables the
+Nano allocator and limits additional address-space growth to 512 MiB above
+startup mappings, with an independent 512 MiB live Rust allocation cap. These
+address-space budgets are not total resident-memory guarantees. Image decoding also caps
 dimensions at 32,768 pixels and total pixels at 32×1024×1024, with a 256 MiB
 decoder allocation limit. Zoom renders only the visible area. Esc, replacement
 loads, and viewer closure terminate and reap the helper; obsolete page, zoom,

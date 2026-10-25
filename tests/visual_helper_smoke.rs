@@ -9,7 +9,12 @@ use std::{
 };
 
 fn render(path: &Path, request: &Value, output: &Path) -> Result<Value, String> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_caret"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_caret"));
+    #[cfg(target_os = "macos")]
+    command
+        .env("MallocNanoZone", "0")
+        .env("MallocSpaceEfficient", "1");
+    let mut child = command
         .args(["--visual-worker"])
         .arg(path)
         .arg(request.to_string())

@@ -30,6 +30,12 @@ The CI matrix installs the same verified PDFium runtime and runs checks on
 Windows, Linux, and macOS. Source users without PDFium can run ordinary tests;
 native PDF assertions report an explicit skip locally and fail if missing in CI.
 
+Darwin startup mappings already exceed 512 MiB. Its helper disables the Nano
+allocator and establishes `RLIMIT_AS` at startup virtual size plus 512 MiB
+before parsing, alongside the same independent 512 MiB Rust allocation cap.
+Windows uses a native commit limit; Linux uses a total address-space limit.
+These platform limits should not be described as identical resident-memory caps.
+
 Manual visual sign-off remains useful for terminal fonts/DPI, graphics
 passthrough through multiplexers, and physical display appearance. The installed
 computer-use skill forbids automating terminal apps, so no live-window visual

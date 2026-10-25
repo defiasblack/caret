@@ -115,9 +115,10 @@ impl PtyProcess {
             thread::sleep(Duration::from_millis(20));
         }
         panic!(
-            "Caret did not render expected text {:?}; output was {:?}",
+            "Caret did not render {:?}; screen: {:?}; last output: {:?}",
             String::from_utf8_lossy(needle),
-            String::from_utf8_lossy(&self.captured)
+            self.parser.screen().contents(),
+            String::from_utf8_lossy(&self.captured[self.captured.len().saturating_sub(2048)..])
         );
     }
 

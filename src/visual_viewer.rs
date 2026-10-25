@@ -448,6 +448,10 @@ impl VisualLoader {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
+        #[cfg(target_os = "macos")]
+        command
+            .env("MallocNanoZone", "0")
+            .env("MallocSpaceEfficient", "1");
         let mut child = command.spawn()?;
         let output = child.stdout.take().expect("piped stdout");
         let (sender, result) = mpsc::sync_channel(1);
@@ -559,14 +563,49 @@ fn limit_native_memory() -> io::Result<std::os::windows::io::OwnedHandle> {
 }
 #[cfg(unix)]
 fn limit_native_memory() -> io::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    let budget = MEMORY_BYTES as libc::rlim_t;
+    #[cfg(target_os = "macos")]
+    let budget = startup_virtual_bytes()?
+        .checked_add(MEMORY_BYTES as u64)
+        .ok_or_else(|| io::Error::other("Visual memory limit overflow"))?
+        as libc::rlim_t;
     let limits = libc::rlimit {
-        rlim_cur: MEMORY_BYTES as libc::rlim_t,
-        rlim_max: MEMORY_BYTES as libc::rlim_t,
+        rlim_cur: budget,
+        rlim_max: budget,
     };
     if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limits) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::other(format!(
+            "Cannot establish the visual renderer memory budget: {}",
+            io::Error::last_os_error()
+        )));
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn startup_virtual_bytes() -> io::Result<u64> {
+    // Darwin includes the dyld shared cache and other startup mappings in the
+    // address-space total, already exceeding 512 MiB before opening a file.
+    // Bound additional mappings before loading PDFium, rather than rejecting
+    // every input. Rust allocations still have an independent 512 MiB cap.
+    let mut task = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let size = std::mem::size_of_val(&task) as i32;
+    let count = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            task.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if count != size {
+        return Err(io::Error::other(
+            "Cannot inspect the visual helper's startup memory",
+        ));
+    }
+    Ok(unsafe { task.assume_init() }.pti_virtual_size)
 }
 
 pub fn render_file(path: &Path, request: RenderRequest) -> io::Result<Frame> {

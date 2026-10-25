@@ -33,7 +33,10 @@ impl Library {
             unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) }
         };
         if handle.is_null() {
-            Err(io::Error::other(format!("Cannot load PDFium at {}. Run scripts/setup_pdfium.py, or set CARET_PDFIUM_LIBRARY to the full library path", path.display())))
+            Err(io::Error::other(format!(
+                "Cannot load PDFium. Run python scripts/setup_pdfium.py (see README). Library: {}",
+                path.display()
+            )))
         } else {
             Ok(Self(handle))
         }
