@@ -14,6 +14,7 @@ mod lsp;
 mod memory_budget;
 mod office_loader;
 mod office_viewer;
+mod pdf;
 mod persistence_worker;
 mod platform;
 mod plugin;
@@ -30,6 +31,7 @@ mod terminal;
 mod test_support;
 mod theme;
 mod ui;
+mod visual_viewer;
 mod worker;
 
 use std::{
@@ -162,6 +164,12 @@ fn run<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
 fn main() {
     if env::args_os()
         .nth(1)
+        .is_some_and(|arg| arg == visual_viewer::WORKER_ARGUMENT)
+    {
+        std::process::exit(visual_viewer::worker());
+    }
+    if env::args_os()
+        .nth(1)
         .is_some_and(|argument| argument == office_loader::WORKER_ARGUMENT)
     {
         let Some(path) = env::args_os().nth(2).map(PathBuf::from) else {
@@ -200,6 +208,14 @@ fn main() {
 
     let mut out = stdout();
     let result = run(&mut out, &mut app);
+
+    if app.visual_painted {
+        let _ = execute!(
+            out,
+            crossterm::style::Print(visual_viewer::KITTY_DELETE),
+            Clear(ClearType::All)
+        );
+    }
 
     drop(guard);
 

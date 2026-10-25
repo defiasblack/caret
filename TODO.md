@@ -289,7 +289,15 @@ not satisfy the roadmap's safe operation layer.
   copy.
 - [x] Guarantee that previews never execute untrusted files or block editor
   input.
-- [x] Defer terminal images, PDF/archive previews, media metadata, and
+- [x] Add full-page PDF and raster-image viewers with terminal graphics,
+  fit/zoom/pan/page controls, cancellable supervised rendering, bounded input,
+  native memory, decode pixels, response and time budgets, and stale-result
+  rejection. Preserve dirty buffers and clear graphics on close/resize/error.
+- [x] Provide pinned PDFium setup/packaging with verified archive checksums and
+  third-party licenses; retain an image-only path when PDFium is unavailable.
+- [x] Validate visual PDF/image opening, navigation, and cleanup in PTYs and
+  the complete test suite; retain Windows/Linux/macOS CI coverage.
+- [x] Defer archive previews, media metadata, and
   extension-provided previewers until the initial provider API is stable.
 
 ### UI, settings, and test completion

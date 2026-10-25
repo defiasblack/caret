@@ -24,6 +24,15 @@ struct PtyProcess {
 
 impl PtyProcess {
     fn start(file: &Path, data_dir: &Path, config_dir: &Path) -> Self {
+        Self::start_with_graphics(file, data_dir, config_dir, None)
+    }
+
+    fn start_with_graphics(
+        file: &Path,
+        data_dir: &Path,
+        config_dir: &Path,
+        graphics: Option<&str>,
+    ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 30,
@@ -41,6 +50,10 @@ impl PtyProcess {
         // Launchers and CI commonly set this. The TUI must retain its chosen
         // theme, including visible selection backgrounds, in that environment.
         command.env("NO_COLOR", "1");
+        if let Some(graphics) = graphics {
+            command.env("CARET_GRAPHICS", graphics);
+            command.env("CARET_CELL_PIXELS", "8x16");
+        }
 
         let child = pair
             .slave
@@ -141,6 +154,98 @@ impl PtyProcess {
         self.child.kill().expect("terminate Caret");
         self.wait_for_exit(Duration::from_secs(10))
     }
+}
+
+#[test]
+fn visual_pdf_pages_zoom_and_cleanup_work_in_a_real_pty() {
+    let library = if cfg!(windows) {
+        "bin/pdfium.dll"
+    } else if cfg!(target_os = "macos") {
+        "lib/libpdfium.dylib"
+    } else {
+        "lib/libpdfium.so"
+    };
+    if std::env::var_os("CARET_PDFIUM_LIBRARY").is_none()
+        && !Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("runtime/pdfium")
+            .join(library)
+            .is_file()
+    {
+        assert!(std::env::var_os("CI").is_none(), "CI must install PDFium");
+        eprintln!("PDF PTY assertions skipped: run python scripts/setup_pdfium.py");
+        return;
+    }
+    let root = temp_root();
+    fs::create_dir_all(&root).unwrap();
+    let file = root.join("visual.pdf");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/visual-two-pages.pdf"),
+        &file,
+    )
+    .unwrap();
+    // The Windows test harness uses the OS's inbox ConPTY, which can predate
+    // Sixel support even when Windows Terminal bundles a current OpenConsole.
+    // Native Sixel bytes are asserted separately in the helper/encoder tests.
+    let graphics = if cfg!(windows) { "blocks" } else { "sixel" };
+    let rendered_marker: &[u8] = if cfg!(windows) {
+        b"\x1b[38;2;"
+    } else {
+        b"\x1bP0;1;0q"
+    };
+    let mut process = PtyProcess::start_with_graphics(
+        &file,
+        &root.join("data"),
+        &root.join("config"),
+        Some(graphics),
+    );
+    process.wait_for_output(b"PDF", Duration::from_secs(10));
+    process.wait_for_output(rendered_marker, Duration::from_secs(10));
+    process.captured.clear();
+    process.send(b"+");
+    process.wait_for_output(b"125%", Duration::from_secs(10));
+    process.wait_for_output(rendered_marker, Duration::from_secs(10));
+    process.captured.clear();
+    process.send(b"n");
+    process.wait_for_output(b"Page 2/2", Duration::from_secs(10));
+    process.wait_for_output(rendered_marker, Duration::from_secs(10));
+    process.send(b"f\x1b");
+    process.wait_for_output(b"Closed visual viewer", Duration::from_secs(10));
+    assert!(
+        cfg!(windows)
+            || process
+                .captured
+                .windows(b"\x1b[2J".len())
+                .any(|window| window == b"\x1b[2J")
+    );
+    process.send(&[0x11]);
+    assert!(process.wait_for_exit(Duration::from_secs(10)).success());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn image_viewer_renders_color_and_recovers_from_decode_errors_in_a_real_pty() {
+    let root = temp_root();
+    fs::create_dir_all(&root).unwrap();
+    let file = root.join("image.png");
+    image::RgbImage::from_pixel(12, 8, image::Rgb([10, 120, 240]))
+        .save(&file)
+        .unwrap();
+    let mut process = PtyProcess::start_with_graphics(
+        &file,
+        &root.join("data"),
+        &root.join("config"),
+        Some("blocks"),
+    );
+    process.wait_for_output(b"IMAGE", Duration::from_secs(10));
+    process.wait_for_output(b"\x1b[38;2;10;120;240m", Duration::from_secs(10));
+    fs::write(&file, b"malformed image").unwrap();
+    process.send(b"r");
+    process.wait_for_output(b"format", Duration::from_secs(10));
+    process.send(b"\x1b");
+    process.wait_for_output(b"Closed visual viewer", Duration::from_secs(10));
+    process.send(&[0x11]);
+    assert!(process.wait_for_exit(Duration::from_secs(10)).success());
+    fs::remove_dir_all(root).unwrap();
 }
 
 impl Drop for PtyProcess {

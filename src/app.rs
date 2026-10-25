@@ -432,6 +432,9 @@ pub struct App {
     pub file_manager: FileManager,
     pub office_viewer: Option<OfficeViewer>,
     pub office_loading: Option<PathBuf>,
+    pub visual_viewer: Option<crate::visual_viewer::VisualViewer>,
+    pub visual_painted: bool,
+    visual_loader: crate::visual_viewer::VisualLoader,
     office_loader: crate::office_loader::OfficeLoader,
     disk_monitor: crate::disk_monitor::DiskMonitor,
     manager_return_mode: Mode,
@@ -631,7 +634,7 @@ impl App {
         };
         let special_viewer_path = editor_path
             .as_ref()
-            .filter(|path| office_viewer::supports(path))
+            .filter(|path| office_viewer::supports(path) || crate::visual_viewer::supports(path))
             .cloned();
         if special_viewer_path.is_some() {
             editor_path = None;
@@ -742,6 +745,9 @@ impl App {
             file_manager,
             office_viewer: None,
             office_loading: None,
+            visual_viewer: None,
+            visual_painted: false,
+            visual_loader: crate::visual_viewer::VisualLoader::default(),
             office_loader: crate::office_loader::OfficeLoader::default(),
             disk_monitor: crate::disk_monitor::DiskMonitor::new(),
             manager_return_mode: editor_mode,
@@ -1158,6 +1164,18 @@ impl App {
                 self.project_search.results.len()
             );
             changed = true;
+        }
+        if let Some((request, result)) = self.visual_loader.poll() {
+            if let Some(viewer) = self.visual_viewer.as_mut() {
+                if viewer.accept(request, result) {
+                    self.message = if viewer.error.is_some() {
+                        "Could not render this file; see the viewer error above".into()
+                    } else {
+                        viewer.label()
+                    };
+                    changed = true;
+                }
+            }
         }
         if let Some(result) = self.office_loader.poll() {
             self.office_loading = None;
@@ -4474,14 +4492,29 @@ impl App {
         }
         let path = entry.path.clone();
         if !self.open_office_document(&path) {
-            self.message = "Use v with a .docx or .xlsx document".to_string();
+            self.message = "Use v with a PDF, image, document, or spreadsheet".to_string();
         }
     }
 
     fn open_office_document(&mut self, path: &Path) -> bool {
+        if crate::visual_viewer::supports(path) {
+            self.office_loader.cancel();
+            self.visual_loader.cancel();
+            self.office_viewer = None;
+            self.office_loading = None;
+            self.visual_viewer = Some(crate::visual_viewer::VisualViewer::new(path));
+            self.split_views = None;
+            self.explorer_focused = false;
+            self.terminal_focused = false;
+            self.mode = Mode::OfficeViewer;
+            self.message = "Opening visual viewer · Esc closes".into();
+            return true;
+        }
         if !office_viewer::supports(path) {
             return false;
         }
+        self.visual_loader.cancel();
+        self.visual_viewer = None;
         match self.office_loader.start(path) {
             Ok(()) => {
                 self.office_viewer = None;
@@ -4504,6 +4537,15 @@ impl App {
     }
 
     fn handle_office_viewer_key(&mut self, key: KeyEvent) {
+        if let Some(viewer) = self.visual_viewer.as_mut() {
+            if viewer.handle_key(key) {
+                self.visual_loader.cancel();
+                self.visual_viewer = None;
+                self.mode = self.preferred_editor_mode();
+                self.message = "Closed visual viewer".into();
+            }
+            return;
+        }
         if self.office_loading.is_some() {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 self.office_loader.cancel();
@@ -4553,6 +4595,33 @@ impl App {
     }
 
     fn handle_office_viewer_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) {
+        let layout = crate::ui::screen_layout(self, width, height);
+        if let Some(viewer) = self.visual_viewer.as_mut() {
+            if mouse.column < layout.editor_x as u16
+                || mouse.row <= layout.content_top
+                || usize::from(mouse.row)
+                    >= usize::from(layout.content_top) + layout.content_height.saturating_sub(1)
+            {
+                return;
+            }
+            let code = match mouse.kind {
+                MouseEventKind::ScrollUp if mouse.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(KeyCode::Char('+'))
+                }
+                MouseEventKind::ScrollDown if mouse.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(KeyCode::Char('-'))
+                }
+                MouseEventKind::ScrollUp => Some(KeyCode::Up),
+                MouseEventKind::ScrollDown => Some(KeyCode::Down),
+                MouseEventKind::ScrollLeft => Some(KeyCode::Left),
+                MouseEventKind::ScrollRight => Some(KeyCode::Right),
+                _ => None,
+            };
+            if let Some(code) = code {
+                viewer.handle_key(KeyEvent::from(code));
+            }
+            return;
+        }
         let navigation = match mouse.kind {
             MouseEventKind::ScrollUp => Some(KeyCode::Up),
             MouseEventKind::ScrollDown => Some(KeyCode::Down),
@@ -4600,6 +4669,17 @@ impl App {
                     viewer.status = format!("Line {} selected", line + 1);
                 }
             }
+        }
+    }
+
+    pub fn prepare_visual_viewer(&mut self, columns: usize, rows: usize) {
+        if let Some(viewer) = self.visual_viewer.as_mut() {
+            viewer.prepare(
+                columns,
+                rows,
+                crate::visual_viewer::cell_size(),
+                &mut self.visual_loader,
+            );
         }
     }
 
@@ -9118,6 +9198,23 @@ mod tests {
         assert!(office_viewer::supports(Path::new("report.docx")));
         assert!(office_viewer::supports(Path::new("data.xlsx")));
         assert!(!office_viewer::supports(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn visual_viewer_preserves_dirty_editor_and_closes_during_loading() {
+        let mut app = App::new(None).unwrap();
+        app.editor.insert_text("unsaved source");
+        let original = app.editor.text();
+        assert!(app.open_office_document(Path::new("pending.pdf")));
+        assert_eq!(app.mode, Mode::OfficeViewer);
+        assert!(app.visual_viewer.is_some());
+        app.handle_office_viewer_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.visual_viewer.is_none());
+        assert_eq!(app.editor.text(), original);
+        assert!(app.editor.dirty);
+        assert!(app.open_office_document(Path::new("picture.PNG")));
+        assert!(app.visual_viewer.is_some());
+        assert!(!app.open_office_document(Path::new("source.rs")));
     }
 
     #[test]

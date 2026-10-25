@@ -9,7 +9,7 @@ use crossterm::{
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
     },
-    terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate},
+    terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -257,6 +257,17 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         SetForegroundColor(app.theme.foreground)
     )?;
 
+    if app.visual_painted {
+        // Text overpainting does not erase persistent terminal graphics. Clear
+        // the previous image even when closing, resizing, or showing an error.
+        queue!(
+            out,
+            Print(crate::visual_viewer::KITTY_DELETE),
+            Clear(ClearType::All)
+        )?;
+        app.visual_painted = false;
+    }
+
     if width < 44 || height < 8 {
         queue!(
             out,
@@ -279,6 +290,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     let editor_x = layout.editor_x;
     let editor_width = layout.editor_width;
     let gutter_width = layout.gutter_width;
+    if app.mode == Mode::OfficeViewer && app.visual_viewer.is_some() {
+        app.prepare_visual_viewer(editor_width, content_height.saturating_sub(2));
+    }
 
     let panes = editor_panes(app, width, height);
     let active_pane = panes
@@ -310,64 +324,66 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         draw_vertical_separator(out, app, sidebar_width as u16, content_top, content_height)?;
     }
 
-    if let Some(views) = app.split_views {
-        let focused = (
-            app.editor.active_index(),
-            app.editor.cursor,
-            app.editor.scroll_line,
-            app.editor.scroll_column,
-        );
-        for pane in &panes {
-            let view = if pane.secondary {
-                views.secondary
+    if app.mode != Mode::OfficeViewer {
+        if let Some(views) = app.split_views {
+            let focused = (
+                app.editor.active_index(),
+                app.editor.cursor,
+                app.editor.scroll_line,
+                app.editor.scroll_column,
+            );
+            for pane in &panes {
+                let view = if pane.secondary {
+                    views.secondary
+                } else {
+                    views.primary
+                };
+                app.editor.select(view.tab_index);
+                app.editor.cursor = view.cursor;
+                app.editor.scroll_line = view.scroll_line;
+                app.editor.scroll_column = view.scroll_column;
+                draw_editor(
+                    out,
+                    app,
+                    pane.top,
+                    pane.rows,
+                    pane.x as u16,
+                    pane.width as u16,
+                    pane.gutter,
+                )?;
+            }
+            if views.vertical {
+                draw_vertical_separator(
+                    out,
+                    app,
+                    (panes[0].x + panes[0].width) as u16,
+                    content_top,
+                    content_height,
+                )?;
             } else {
-                views.primary
-            };
-            app.editor.select(view.tab_index);
-            app.editor.cursor = view.cursor;
-            app.editor.scroll_line = view.scroll_line;
-            app.editor.scroll_column = view.scroll_column;
+                queue!(
+                    out,
+                    MoveTo(editor_x as u16, panes[0].top + panes[0].rows as u16),
+                    SetBackgroundColor(app.theme.background),
+                    SetForegroundColor(app.theme.border),
+                    Print("─".repeat(editor_width))
+                )?;
+            }
+            app.editor.select(focused.0);
+            app.editor.cursor = focused.1;
+            app.editor.scroll_line = focused.2;
+            app.editor.scroll_column = focused.3;
+        } else {
             draw_editor(
                 out,
                 app,
-                pane.top,
-                pane.rows,
-                pane.x as u16,
-                pane.width as u16,
-                pane.gutter,
-            )?;
-        }
-        if views.vertical {
-            draw_vertical_separator(
-                out,
-                app,
-                (panes[0].x + panes[0].width) as u16,
                 content_top,
                 content_height,
-            )?;
-        } else {
-            queue!(
-                out,
-                MoveTo(editor_x as u16, panes[0].top + panes[0].rows as u16),
-                SetBackgroundColor(app.theme.background),
-                SetForegroundColor(app.theme.border),
-                Print("─".repeat(editor_width))
+                editor_x as u16,
+                editor_width as u16,
+                gutter_width,
             )?;
         }
-        app.editor.select(focused.0);
-        app.editor.cursor = focused.1;
-        app.editor.scroll_line = focused.2;
-        app.editor.scroll_column = focused.3;
-    } else {
-        draw_editor(
-            out,
-            app,
-            content_top,
-            content_height,
-            editor_x as u16,
-            editor_width as u16,
-            gutter_width,
-        )?;
     }
     if app.mode == Mode::OfficeViewer {
         draw_office_viewer(
@@ -378,6 +394,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
             editor_x as u16,
             editor_width as u16,
         )?;
+        app.visual_painted = app.visual_viewer.as_ref().is_some_and(|viewer| {
+            viewer.frame.is_some() && viewer.protocol != crate::visual_viewer::Protocol::Blocks
+        });
     }
     if layout.terminal_height > 0 {
         draw_terminal(out, app, layout.terminal_top, layout.terminal_height, width)?;
@@ -1514,6 +1533,19 @@ fn draw_office_viewer<W: Write>(
     x: u16,
     width: u16,
 ) -> io::Result<()> {
+    if let Some(viewer) = app.visual_viewer.as_ref() {
+        return draw_visual_viewer(
+            out,
+            app,
+            viewer,
+            OfficeViewerArea {
+                top,
+                rows,
+                x,
+                width: width as usize,
+            },
+        );
+    }
     let Some(viewer) = app.office_viewer.as_ref() else {
         for offset in 0..rows {
             queue!(
@@ -1579,6 +1611,88 @@ fn draw_office_viewer<W: Write>(
         OfficeContent::Document(view) => {
             draw_document_viewer(out, app, viewer, view, area)?;
         }
+    }
+    Ok(())
+}
+
+fn draw_visual_viewer<W: Write>(
+    out: &mut W,
+    app: &App,
+    viewer: &crate::visual_viewer::VisualViewer,
+    area: OfficeViewerArea,
+) -> io::Result<()> {
+    let OfficeViewerArea {
+        top,
+        rows,
+        x,
+        width,
+    } = area;
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    for row in 0..rows {
+        queue!(
+            out,
+            MoveTo(x, top + row as u16),
+            SetBackgroundColor(app.theme.background),
+            SetForegroundColor(app.theme.foreground),
+            Print(" ".repeat(width))
+        )?;
+    }
+    let name = viewer
+        .path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    queue!(
+        out,
+        MoveTo(x, top),
+        SetBackgroundColor(app.theme.top_bar),
+        SetForegroundColor(app.theme.heading),
+        Print(pad_or_truncate(
+            &format!(" {} · {}", manager_display_line(&name), viewer.label()),
+            width
+        ))
+    )?;
+    if rows > 2 {
+        if let Some(frame) = &viewer.frame {
+            // Keep terminal cursor changes made by graphics inside this pane.
+            queue!(out, Print("\x1b7"))?;
+            for (row, line) in frame.lines.iter().take(rows - 2).enumerate() {
+                queue!(out, MoveTo(x, top + 1 + row as u16), Print(line))?;
+            }
+            queue!(out, Print("\x1b8"))?;
+        } else {
+            let status = viewer.error.as_deref().unwrap_or(if viewer.loading {
+                "Rendering · Esc cancels"
+            } else {
+                "Preparing visual viewer"
+            });
+            // Filesystem errors can include control characters from filenames.
+            queue!(
+                out,
+                MoveTo(x, top + 1),
+                SetBackgroundColor(app.theme.background),
+                SetForegroundColor(if viewer.error.is_some() {
+                    app.theme.error
+                } else {
+                    app.theme.foreground
+                }),
+                Print(pad_or_truncate(&manager_display_line(status), width))
+            )?;
+        }
+    }
+    if rows > 1 {
+        queue!(
+            out,
+            MoveTo(x, top + rows as u16 - 1),
+            SetBackgroundColor(app.theme.prompt_bar),
+            SetForegroundColor(app.theme.muted),
+            Print(pad_or_truncate(
+                " +/- Zoom · F Fit · W Width · Arrows Pan · PgUp/PgDn Pages · R Reload · Esc Close",
+                width
+            ))
+        )?;
     }
     Ok(())
 }
@@ -2925,6 +3039,12 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
 
     let language_name = app.language_name();
     let left = if let Some(viewer) = app
+        .visual_viewer
+        .as_ref()
+        .filter(|_| app.mode == Mode::OfficeViewer)
+    {
+        format!(" VIEWER  │  {} ", viewer.label())
+    } else if let Some(viewer) = app
         .office_viewer
         .as_ref()
         .filter(|_| app.mode == Mode::OfficeViewer)
@@ -2949,6 +3069,21 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
     let background = app.background_status();
     let background_label = background.as_ref().map(|(label, _)| label.as_str());
     let right = if let Some(viewer) = app
+        .visual_viewer
+        .as_ref()
+        .filter(|_| app.mode == Mode::OfficeViewer)
+    {
+        viewer
+            .frame
+            .as_ref()
+            .map(|frame| {
+                format!(
+                    " {} × {}  ",
+                    frame.transform.source_width, frame.transform.source_height
+                )
+            })
+            .unwrap_or_default()
+    } else if let Some(viewer) = app
         .office_viewer
         .as_ref()
         .filter(|_| app.mode == Mode::OfficeViewer)
@@ -4733,6 +4868,16 @@ pub fn hotkey_action_at(app: &App, width: u16, column: u16) -> Option<&'static s
 }
 
 fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
+    if app.mode == Mode::OfficeViewer && app.visual_viewer.is_some() {
+        return &[
+            ("+/-", "Zoom"),
+            ("F", "Fit page"),
+            ("W", "Fit width"),
+            ("↑↓←→", "Pan"),
+            ("PgUp/Dn", "Page"),
+            ("Esc", "Close"),
+        ];
+    }
     if app.lsp_panel.is_some() {
         return &[("↑↓", "Select"), ("Enter", "Open/Apply"), ("Esc", "Close")];
     }
@@ -5569,5 +5714,44 @@ mod tests {
         assert_eq!(secondary_cursor_cell("\t界x", 1, 4), (4, '界'));
         assert_eq!(secondary_cursor_cell("\t界x", 2, 4), (6, 'x'));
         assert_eq!(secondary_cursor_cell("\t界x", 3, 4), (7, ' '));
+    }
+
+    #[test]
+    fn visual_output_keeps_graphics_but_sanitizes_filenames_and_errors() {
+        let app = App::new(None).unwrap();
+        let mut viewer = crate::visual_viewer::VisualViewer::new(Path::new("hostile\x1b[2J.png"));
+        viewer.error = Some("bad\x1b]52;c;payload\x07image".into());
+        let area = OfficeViewerArea {
+            top: 2,
+            rows: 10,
+            x: 0,
+            width: 100,
+        };
+        let mut output = Vec::new();
+        draw_visual_viewer(&mut output, &app, &viewer, area).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("\x1b[2J"));
+        assert!(!output.contains("\x1b]52;"));
+        viewer.error = None;
+        viewer.frame = Some(crate::visual_viewer::Frame {
+            page: 0,
+            pages: 1,
+            transform: crate::visual_viewer::Transform {
+                width: 8,
+                height: 6,
+                left: 0,
+                top: 0,
+                pan_x: 0,
+                pan_y: 0,
+                source_width: 8,
+                source_height: 6,
+            },
+            lines: vec!["\x1bP0;1;0q\"1;1;8;6#0!8~\x1b\\".into()],
+        });
+        let mut output = Vec::new();
+        draw_visual_viewer(&mut output, &app, &viewer, area).unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains(&viewer.frame.as_ref().unwrap().lines[0]));
     }
 }

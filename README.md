@@ -326,7 +326,7 @@ path, and stale background results are rejected.
 | `d` | Duplicate with an automatically conflict-free name |
 | `Delete` / `D` | Move to OS trash / explicitly confirm permanent deletion |
 | `t` | Open an integrated terminal at the selected directory |
-| `v` | Open a selected Office document in Caret's native viewer |
+| `v` | Open a selected PDF, image, or Office document in Caret's viewer |
 | `Ctrl-C` | Cancel an active multi-item operation safely |
 | `R` | Retry only the failed items from the last operation |
 | Right click | Open the selected item's file-action menu |
@@ -364,6 +364,68 @@ Inside the viewer, use arrows or `h/j/k/l` to navigate, Page Up/Down for larger
 moves, `/` to search, `n`/`N` for the next/previous match, `c` or `Ctrl-C` to
 copy the current cell or line, `Enter` for full details, and `q` or `Esc` to
 close. In workbooks, `Tab` and `Shift-Tab` switch sheets.
+
+## Visual PDF and image viewer
+
+Open a PDF or image from the command line, Manager (`Enter` or `v`), the
+project tree, file picker, or `:e`. The read-only visual viewer preserves PDF
+page layout, fonts, illustrations, and photographs. Images support PNG,
+JPEG, BMP, ICO, TIFF, PNM/PPM/PGM/PBM, and TGA. Multi-frame image files display
+their first image; animation, annotations, forms, and PDF editing are not
+implemented. Password-protected PDFs show a clear error.
+
+| Key | Action |
+|---|---|
+| `+` / `-` | Zoom in / out (25–800% of the fitted size) |
+| `f` / `0` | Fit the whole page or image |
+| `w` | Fit width |
+| Arrows / `h/j/k/l`, mouse wheel | Pan the enlarged page/image |
+| `Ctrl` + mouse wheel | Zoom |
+| `PageDown` / `n` / Space | Next PDF page |
+| `PageUp` / `p` | Previous PDF page |
+| Home / End | First / last PDF page |
+| `r` | Reload the file |
+| `q` / Esc | Close or cancel loading; return to the editor |
+
+Windows Terminal 1.22+ and other Sixel terminals display actual graphics.
+Kitty and Ghostty use the Kitty graphics protocol. Other terminals receive a
+lower-resolution, true-color half-block rendition of the same page/image.
+`CARET_GRAPHICS=sixel`, `kitty`, or `blocks` overrides automatic selection;
+Sixel terminals that are not recognized automatically should select `sixel`.
+Terminal multiplexers must pass the selected graphics protocol through.
+When terminal pixel dimensions are unavailable (including the Windows console
+API), Caret assumes 8×16 pixels per character cell. Set, for example,
+`CARET_CELL_PIXELS=10x20` to match a different font/DPI. Resize the window to
+refit content. The raster viewport is capped at 2048×1536 pixels.
+
+Images are built in. PDF rendering uses the non-JavaScript, non-XFA PDFium
+runtime. For source builds, use Python 3.12+ to install the pinned,
+checksum-verified runtime once:
+
+```sh
+python scripts/setup_pdfium.py
+```
+
+No downloads occur while opening documents. To package/install Caret elsewhere,
+run `python scripts/setup_pdfium.py --install-dir PATH_TO_CARET_DIRECTORY` to
+place PDFium and its third-party licenses beside the executable. Alternatively,
+set `CARET_PDFIUM_LIBRARY` to an absolute library path. A missing runtime is
+reported in the viewer; image viewing remains available. Supported runtime
+packages cover Windows, Linux (glibc), and macOS on x64 and arm64.
+
+Each rasterization runs in a disposable helper, with a 32 MiB input limit,
+five-second deadline, 512 MiB allocation/native-memory budget, and 64 MiB
+response limit. Windows enforces native allocations with a Job Object;
+Unix sets `RLIMIT_AS` before loading the renderer. Image decoding also caps
+dimensions at 32,768 pixels and total pixels at 32×1024×1024, with a 256 MiB
+decoder allocation limit. Zoom renders only the visible area. Esc, replacement
+loads, and viewer closure terminate and reap the helper; obsolete page, zoom,
+resize, and reload results are discarded. Unsaved editor buffers are retained.
+
+The PDFium bindings follow its [public C API](https://pdfium.googlesource.com/pdfium/+/refs/heads/main/public/fpdfview.h);
+the runtime comes from [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries).
+See Microsoft's [Sixel support announcement](https://devblogs.microsoft.com/commandline/windows-terminal-preview-1-22-release/)
+for Windows Terminal requirements.
 
 ## Coding intelligence
 
