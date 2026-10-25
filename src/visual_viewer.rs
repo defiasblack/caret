@@ -501,7 +501,10 @@ fn read_response(output: impl Read) -> io::Result<Frame> {
 pub fn worker() -> i32 {
     crate::ALLOCATOR.set_limit(MEMORY_BYTES);
     let response = (|| -> io::Result<Frame> {
+        #[cfg(windows)]
         let _memory = limit_native_memory()?;
+        #[cfg(unix)]
+        limit_native_memory()?;
         let path = std::env::args_os()
             .nth(2)
             .map(PathBuf::from)
@@ -587,7 +590,7 @@ pub fn render_file(path: &Path, request: RenderRequest) -> io::Result<Frame> {
     let (pixels, pages, transform) = if is_pdf(path) {
         crate::pdf::render(&bytes, &request)?
     } else {
-        render_image(bytes, &request)?
+        render_image(bytes, &request, image::ImageFormat::from_path(path).ok())?
     };
     let lines = match request.protocol {
         Protocol::Sixel => vec![sixel(&pixels)],
@@ -605,8 +608,15 @@ pub fn render_file(path: &Path, request: RenderRequest) -> io::Result<Frame> {
 fn render_image(
     bytes: Vec<u8>,
     request: &RenderRequest,
+    hint: Option<image::ImageFormat>,
 ) -> io::Result<(image::RgbImage, usize, Transform)> {
-    let mut reader = image::ImageReader::new(io::Cursor::new(bytes)).with_guessed_format()?;
+    let mut reader = image::ImageReader::new(io::Cursor::new(bytes));
+    // TGA has no signature to sniff; retain the extension as a fallback while
+    // allowing recognizable byte signatures to take precedence.
+    if let Some(format) = hint {
+        reader.set_format(format);
+    }
+    let mut reader = reader.with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(32768);
     limits.max_image_height = Some(32768);
@@ -838,12 +848,12 @@ mod tests {
         source
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
-        let (image, pages, transform) = render_image(bytes.into_inner(), &request()).unwrap();
+        let (image, pages, transform) = render_image(bytes.into_inner(), &request(), None).unwrap();
         assert_eq!(pages, 1);
         assert_eq!((transform.width, transform.height), (80, 80));
         assert_eq!(image.get_pixel(10, 0).0, [224, 224, 224]);
         assert_eq!(image.get_pixel(0, 0).0, [30, 30, 30]);
-        assert!(render_image(b"broken".to_vec(), &request()).is_err());
+        assert!(render_image(b"broken".to_vec(), &request(), None).is_err());
     }
     #[test]
     fn navigation_restores_fit_and_rejects_stale_work_on_close() {

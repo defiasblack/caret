@@ -212,7 +212,7 @@ pub fn render(
         );
         drop(bitmap);
         let mut rgb = image::RgbImage::new(request.width, request.height);
-        for (source, target) in pixels.chunks_exact(4).zip(rgb.pixels_mut()) {
+        for (source, target) in pixels.as_chunks::<4>().0.iter().zip(rgb.pixels_mut()) {
             *target = image::Rgb([source[2], source[1], source[0]]);
         }
         Ok((rgb, count, transform))

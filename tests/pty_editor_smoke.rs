@@ -240,7 +240,7 @@ fn image_viewer_renders_color_and_recovers_from_decode_errors_in_a_real_pty() {
     process.wait_for_output(b"\x1b[38;2;10;120;240m", Duration::from_secs(10));
     fs::write(&file, b"malformed image").unwrap();
     process.send(b"r");
-    process.wait_for_output(b"format", Duration::from_secs(10));
+    process.wait_for_output(b"Could not render this file", Duration::from_secs(10));
     process.send(b"\x1b");
     process.wait_for_output(b"Closed visual viewer", Duration::from_secs(10));
     process.send(&[0x11]);

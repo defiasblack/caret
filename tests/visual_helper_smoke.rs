@@ -81,6 +81,20 @@ fn pdf_pages_render_with_layout_and_image_budgets_are_enforced() {
         .unwrap();
     let rendered = render(&image, &request(), &output).unwrap();
     assert_eq!(rendered["transform"]["source_width"], 4);
+    for extension in ["jpg", "bmp", "ico", "tif", "ppm", "tga"] {
+        let path = root.join(format!("picture.{extension}"));
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            2,
+            image::Rgba([20, 100, 200, 255]),
+        ))
+        .save(&path)
+        .unwrap();
+        let rendered = render(&path, &request(), &output)
+            .unwrap_or_else(|error| panic!("{extension}: {error}"));
+        assert_eq!(rendered["transform"]["source_width"], 4);
+        assert_eq!(rendered["transform"]["source_height"], 2);
+    }
     let mut zoom = request();
     zoom["zoom"] = json!(800);
     zoom["pan_x"] = json!(32768);
