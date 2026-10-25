@@ -2,6 +2,7 @@ mod app;
 mod clipboard;
 mod config;
 mod diagnostics;
+mod disk_monitor;
 mod document;
 mod editor;
 mod explorer;
@@ -10,7 +11,11 @@ mod file_ops;
 mod fuzzy;
 mod keys;
 mod lsp;
+mod memory_budget;
+mod office_loader;
 mod office_viewer;
+mod pdf;
+mod persistence_worker;
 mod platform;
 mod plugin;
 mod preview;
@@ -22,8 +27,12 @@ mod session;
 mod syntax;
 mod tabs;
 mod terminal;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod ui;
+mod visual_viewer;
+mod worker;
 
 use std::{
     env,
@@ -44,11 +53,17 @@ use crossterm::{
 };
 use explorer::ExplorerService;
 
+#[global_allocator]
+static ALLOCATOR: memory_budget::BudgetAllocator = memory_budget::BudgetAllocator::new();
+
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
+        // The interactive theme also paints selection backgrounds. Inherited
+        // NO_COLOR must not erase them; the mono theme provides grayscale UI.
+        crossterm::style::force_color_output(true);
         execute!(
             stdout(),
             EnterAlternateScreen,
@@ -133,8 +148,9 @@ fn run<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         let mut changed = if event::poll(Duration::from_millis(50))? {
             app.handle_event(event::read()?)
         } else {
-            app.poll_background()
+            false
         };
+        changed |= app.poll_background();
         changed |= explorer.poll(&mut app.project);
 
         if changed && !app.should_quit {
@@ -146,6 +162,21 @@ fn run<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
 }
 
 fn main() {
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == visual_viewer::WORKER_ARGUMENT)
+    {
+        std::process::exit(visual_viewer::worker());
+    }
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == office_loader::WORKER_ARGUMENT)
+    {
+        let Some(path) = env::args_os().nth(2).map(PathBuf::from) else {
+            std::process::exit(2);
+        };
+        std::process::exit(office_loader::worker(&path));
+    }
     std::panic::set_hook(Box::new(|info| {
         let location = info
             .location()
@@ -177,6 +208,14 @@ fn main() {
 
     let mut out = stdout();
     let result = run(&mut out, &mut app);
+
+    if app.visual_painted {
+        let _ = execute!(
+            out,
+            crossterm::style::Print(visual_viewer::KITTY_DELETE),
+            Clear(ClearType::All)
+        );
+    }
 
     drop(guard);
 

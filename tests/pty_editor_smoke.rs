@@ -24,6 +24,15 @@ struct PtyProcess {
 
 impl PtyProcess {
     fn start(file: &Path, data_dir: &Path, config_dir: &Path) -> Self {
+        Self::start_with_graphics(file, data_dir, config_dir, None)
+    }
+
+    fn start_with_graphics(
+        file: &Path,
+        data_dir: &Path,
+        config_dir: &Path,
+        graphics: Option<&str>,
+    ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 30,
@@ -38,6 +47,13 @@ impl PtyProcess {
         command.env("CARET_DATA_DIR", data_dir);
         command.env("CARET_CONFIG_DIR", config_dir);
         command.env("TERM", "xterm-256color");
+        // Launchers and CI commonly set this. The TUI must retain its chosen
+        // theme, including visible selection backgrounds, in that environment.
+        command.env("NO_COLOR", "1");
+        if let Some(graphics) = graphics {
+            command.env("CARET_GRAPHICS", graphics);
+            command.env("CARET_CELL_PIXELS", "8x16");
+        }
 
         let child = pair
             .slave
@@ -78,28 +94,20 @@ impl PtyProcess {
     fn wait_for_output(&mut self, needle: &[u8], timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            while let Ok(bytes) = self.output.try_recv() {
-                if bytes.windows(4).any(|window| window == b"\x1b[6n") {
-                    // ConPTY asks the terminal for its cursor position before
-                    // delivering application input.
-                    self.send(b"\x1b[1;1R");
-                }
-                self.parser.process(&bytes);
-                self.captured.extend_from_slice(&bytes);
-                let matched_output = self
-                    .captured
-                    .windows(needle.len())
-                    .any(|window| window == needle);
-                let matched_screen = self
-                    .parser
-                    .screen()
-                    .contents()
-                    .as_bytes()
-                    .windows(needle.len())
-                    .any(|window| window == needle);
-                if matched_output || matched_screen {
-                    return;
-                }
+            self.poll_output();
+            let matched_output = self
+                .captured
+                .windows(needle.len())
+                .any(|window| window == needle);
+            let matched_screen = self
+                .parser
+                .screen()
+                .contents()
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window == needle);
+            if matched_output || matched_screen {
+                return;
             }
             if self.child.try_wait().expect("poll Caret").is_some() {
                 break;
@@ -107,15 +115,34 @@ impl PtyProcess {
             thread::sleep(Duration::from_millis(20));
         }
         panic!(
-            "Caret did not render expected text {:?}; output was {:?}",
+            "Caret did not render {:?}; screen: {:?}; last output: {:?}",
             String::from_utf8_lossy(needle),
-            String::from_utf8_lossy(&self.captured)
+            self.parser.screen().contents(),
+            String::from_utf8_lossy(&self.captured[self.captured.len().saturating_sub(2048)..])
         );
+    }
+
+    fn poll_output(&mut self) {
+        while let Ok(bytes) = self.output.try_recv() {
+            let tail = self.captured.len().saturating_sub(3);
+            self.captured.extend_from_slice(&bytes);
+            // ConPTY cursor requests can be split across reads and can arrive
+            // while waiting for a filesystem change rather than screen text.
+            let requests = self.captured[tail..]
+                .windows(4)
+                .filter(|window| *window == b"\x1b[6n")
+                .count();
+            for _ in 0..requests {
+                self.send(b"\x1b[1;1R");
+            }
+            self.parser.process(&bytes);
+        }
     }
 
     fn wait_for_exit(&mut self, timeout: Duration) -> ExitStatus {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
+            self.poll_output();
             if let Some(status) = self.child.try_wait().expect("poll Caret") {
                 return status;
             }
@@ -128,6 +155,98 @@ impl PtyProcess {
         self.child.kill().expect("terminate Caret");
         self.wait_for_exit(Duration::from_secs(10))
     }
+}
+
+#[test]
+fn visual_pdf_pages_zoom_and_cleanup_work_in_a_real_pty() {
+    let library = if cfg!(windows) {
+        "bin/pdfium.dll"
+    } else if cfg!(target_os = "macos") {
+        "lib/libpdfium.dylib"
+    } else {
+        "lib/libpdfium.so"
+    };
+    if std::env::var_os("CARET_PDFIUM_LIBRARY").is_none()
+        && !Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("runtime/pdfium")
+            .join(library)
+            .is_file()
+    {
+        assert!(std::env::var_os("CI").is_none(), "CI must install PDFium");
+        eprintln!("PDF PTY assertions skipped: run python scripts/setup_pdfium.py");
+        return;
+    }
+    let root = temp_root();
+    fs::create_dir_all(&root).unwrap();
+    let file = root.join("visual.pdf");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/visual-two-pages.pdf"),
+        &file,
+    )
+    .unwrap();
+    // The Windows test harness uses the OS's inbox ConPTY, which can predate
+    // Sixel support even when Windows Terminal bundles a current OpenConsole.
+    // Native Sixel bytes are asserted separately in the helper/encoder tests.
+    let graphics = if cfg!(windows) { "blocks" } else { "sixel" };
+    let rendered_marker: &[u8] = if cfg!(windows) {
+        b"\x1b[38;2;"
+    } else {
+        b"\x1bP0;1;0q"
+    };
+    let mut process = PtyProcess::start_with_graphics(
+        &file,
+        &root.join("data"),
+        &root.join("config"),
+        Some(graphics),
+    );
+    process.wait_for_output(b"PDF", Duration::from_secs(10));
+    process.wait_for_output(rendered_marker, Duration::from_secs(10));
+    process.captured.clear();
+    process.send(b"+");
+    process.wait_for_output(b"125%", Duration::from_secs(10));
+    process.wait_for_output(rendered_marker, Duration::from_secs(10));
+    process.captured.clear();
+    process.send(b"n");
+    process.wait_for_output(b"Page 2/2", Duration::from_secs(10));
+    process.wait_for_output(rendered_marker, Duration::from_secs(10));
+    process.send(b"f\x1b");
+    process.wait_for_output(b"Closed visual viewer", Duration::from_secs(10));
+    assert!(
+        cfg!(windows)
+            || process
+                .captured
+                .windows(b"\x1b[2J".len())
+                .any(|window| window == b"\x1b[2J")
+    );
+    process.send(&[0x11]);
+    assert!(process.wait_for_exit(Duration::from_secs(10)).success());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn image_viewer_renders_color_and_recovers_from_decode_errors_in_a_real_pty() {
+    let root = temp_root();
+    fs::create_dir_all(&root).unwrap();
+    let file = root.join("image.png");
+    image::RgbImage::from_pixel(12, 8, image::Rgb([10, 120, 240]))
+        .save(&file)
+        .unwrap();
+    let mut process = PtyProcess::start_with_graphics(
+        &file,
+        &root.join("data"),
+        &root.join("config"),
+        Some("blocks"),
+    );
+    process.wait_for_output(b"IMAGE", Duration::from_secs(10));
+    process.wait_for_output(b"\x1b[38;2;10;120;240m", Duration::from_secs(10));
+    fs::write(&file, b"malformed image").unwrap();
+    process.send(b"r");
+    process.wait_for_output(b"Could not render this file", Duration::from_secs(10));
+    process.send(b"\x1b");
+    process.wait_for_output(b"Closed visual viewer", Duration::from_secs(10));
+    process.send(&[0x11]);
+    assert!(process.wait_for_exit(Duration::from_secs(10)).success());
+    fs::remove_dir_all(root).unwrap();
 }
 
 impl Drop for PtyProcess {
@@ -149,6 +268,105 @@ fn temp_root() -> PathBuf {
 }
 
 #[test]
+fn syntax_colors_and_mouse_keyboard_selection_work_in_a_real_pty() {
+    let root = temp_root();
+    let file = root.join("highlight.rs");
+    fs::create_dir_all(&root).expect("create smoke directory");
+    fs::write(&file, "fn main() { let message = \"hello\"; }\n").expect("create Rust file");
+    fs::create_dir_all(root.join("config")).expect("create config directory");
+    fs::write(root.join("config/config.toml"), "theme = 'oxide'\n")
+        .expect("select color theme explicitly");
+    let mut process = PtyProcess::start(&file, &root.join("data"), &root.join("config"));
+    process.wait_for_output(b"-- INSERT --", Duration::from_secs(10));
+    process.wait_for_output(b"hello", Duration::from_secs(10));
+
+    let screen = process.parser.screen();
+    let (rows, columns) = screen.size();
+    let (row, column) = (0..rows)
+        .flat_map(|row| (0..columns.saturating_sub(9)).map(move |column| (row, column)))
+        .find(|&(row, column)| {
+            "fn main()".chars().enumerate().all(|(offset, character)| {
+                screen.cell(row, column + offset as u16).unwrap().contents()
+                    == character.to_string()
+            })
+        })
+        .expect("Rust source visible");
+    let column = column as usize;
+    let cell = |offset| {
+        process
+            .parser
+            .screen()
+            .cell(row, (column + offset) as u16)
+            .unwrap()
+    };
+    assert_ne!(
+        cell(0).fgcolor(),
+        cell(3).fgcolor(),
+        "keyword uses syntax color"
+    );
+    assert_ne!(
+        cell(26).fgcolor(),
+        cell(3).fgcolor(),
+        "string uses syntax color"
+    );
+
+    // SGR coordinates are one-based. Drag across the first two characters.
+    process.send(
+        format!(
+            "\x1b[<0;{};{}M\x1b[<32;{};{}M\x1b[<0;{};{}m",
+            column + 1,
+            row + 1,
+            column + 3,
+            row + 1,
+            column + 3,
+            row + 1
+        )
+        .as_bytes(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        process.poll_output();
+        let screen = process.parser.screen();
+        if screen.cell(row, column as u16).unwrap().bgcolor()
+            != screen.cell(row, (column + 2) as u16).unwrap().bgcolor()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mouse selection was not highlighted"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    process.send(b"pub fn");
+    process.send(&[0x13]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fs::read_to_string(&file).unwrap() != "pub fn main() { let message = \"hello\"; }\n" {
+        process.poll_output();
+        assert!(
+            Instant::now() < deadline,
+            "typing did not replace mouse selection"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Home clears the old selection; Shift-End selects the complete line.
+    process.send(b"\x1b[H\x1b[1;2Ffn replacement() {}\x13");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fs::read_to_string(&file).unwrap() != "fn replacement() {}\n" {
+        process.poll_output();
+        assert!(
+            Instant::now() < deadline,
+            "Shift-End did not select the line"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    process.send(&[0x11]);
+    assert!(process.wait_for_exit(Duration::from_secs(10)).success());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn edits_saves_and_exits_cleanly_in_a_real_pty() {
     let root = temp_root();
     let file = root.join("important.txt");
@@ -164,6 +382,7 @@ fn edits_saves_and_exits_cleanly_in_a_real_pty() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && fs::read_to_string(&file).unwrap() != "safe original" {
+        process.poll_output();
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(fs::read_to_string(&file).unwrap(), "safe original");
@@ -260,6 +479,7 @@ fn forced_termination_is_reported_by_the_next_real_pty_session() {
     let save_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < save_deadline && fs::read_to_string(&file).unwrap() != "unsaved original"
     {
+        second.poll_output();
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(fs::read_to_string(&file).unwrap(), "unsaved original");
@@ -302,6 +522,7 @@ fn external_changes_require_confirmation_in_a_real_pty() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && fs::read_to_string(&file).unwrap() != "buffer original" {
+        process.poll_output();
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(fs::read_to_string(&file).unwrap(), "buffer original");
@@ -330,16 +551,61 @@ fn repeated_edits_and_atomic_saves_remain_stable_in_a_real_pty() {
         process.send(&[0x13]); // Ctrl-S
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && fs::read_to_string(&file).unwrap() != expected {
+            process.poll_output();
             thread::sleep(Duration::from_millis(10));
         }
+        process.poll_output();
         assert_eq!(
             fs::read_to_string(&file).unwrap(),
             expected,
-            "save cycle {count} did not produce the complete document"
+            "save cycle {count} did not produce the complete document; screen: {}",
+            process.parser.screen().contents()
         );
     }
 
     process.send(&[0x11]); // Ctrl-Q
     assert!(process.wait_for_exit(Duration::from_secs(10)).success());
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn office_helper_loads_and_closes_in_a_real_pty() {
+    let root = temp_root();
+    fs::create_dir_all(&root).unwrap();
+    let file = root.join("sheet.xlsx");
+    test_support::write_workbook(&file, r#"<row r="3"><c r="B3"><v>7</v></c></row>"#);
+    let mut process = PtyProcess::start(&file, &root.join("data"), &root.join("config"));
+    process.wait_for_output(b"SPREADSHEET", Duration::from_secs(10));
+    process.send(&[0x1b]);
+    process.wait_for_output(b"Closed Office viewer", Duration::from_secs(5));
+    process.send(&[0x11]);
+    assert!(process.wait_for_exit(Duration::from_secs(10)).success());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+
+#[test]
+fn split_views_follow_edits_beyond_the_initial_viewport_in_a_real_pty() {
+    let root = temp_root();
+    fs::create_dir_all(root.join("config")).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        "keymap = 'vim'\ntheme = 'oxide'\n",
+    )
+    .unwrap();
+    let file = root.join("split.txt");
+    let source: String = (0..100).map(|line| format!("line{line}\n")).collect();
+    fs::write(&file, source).unwrap();
+    let mut process = PtyProcess::start(&file, &root.join("data"), &root.join("config"));
+    process.wait_for_output(b"Vim keys", Duration::from_secs(10));
+    process.send(b":vsplit\r:100\riVISIBLE_TAIL");
+    process.wait_for_output(b"VISIBLE_TAILline99", Duration::from_secs(10));
+    process.send(&[0x13, 0x11]);
+    assert!(process.wait_for_exit(Duration::from_secs(10)).success());
+    assert!(fs::read_to_string(file)
+        .unwrap()
+        .contains("VISIBLE_TAILline99"));
+    fs::remove_dir_all(root).unwrap();
 }

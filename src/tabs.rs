@@ -17,10 +17,18 @@ pub struct BufferTab {
     untitled_id: usize,
 }
 
+pub type DocumentState = ((u64, u64), Option<PathBuf>);
+
 pub struct Tabs {
     tabs: Vec<BufferTab>,
     active: usize,
     next_untitled_id: usize,
+}
+
+pub struct SessionExport {
+    pub tabs: Vec<crate::session::TabState>,
+    pub active: usize,
+    pub index_map: Vec<Option<usize>>,
 }
 
 impl Tabs {
@@ -87,21 +95,58 @@ impl Tabs {
         }))
     }
 
-    pub fn session_tabs(&self) -> Vec<crate::session::TabState> {
-        self.tabs
-            .iter()
-            .filter_map(|tab| {
-                tab.editor
-                    .path
-                    .as_ref()
-                    .map(|path| crate::session::TabState {
-                        path: path.clone(),
-                        cursor: tab.editor.cursor.into(),
-                        scroll_line: tab.editor.scroll_line,
-                        scroll_column: tab.editor.scroll_column,
-                    })
+    pub fn export_session(&self) -> SessionExport {
+        let mut tabs = Vec::new();
+        let mut index_map = Vec::with_capacity(self.tabs.len());
+        for tab in &self.tabs {
+            if let Some(path) = &tab.editor.path {
+                index_map.push(Some(tabs.len()));
+                tabs.push(crate::session::TabState {
+                    path: path.clone(),
+                    cursor: tab.editor.cursor.into(),
+                    scroll_line: tab.editor.scroll_line,
+                    scroll_column: tab.editor.scroll_column,
+                });
+            } else {
+                index_map.push(None);
+            }
+        }
+        let active = index_map[self.active]
+            .or_else(|| {
+                index_map[..self.active]
+                    .iter()
+                    .rev()
+                    .find_map(|index| *index)
             })
-            .collect()
+            .or_else(|| index_map[self.active..].iter().find_map(|index| *index))
+            .unwrap_or(0);
+        SessionExport {
+            tabs,
+            active,
+            index_map,
+        }
+    }
+
+    pub fn restored_view(
+        &self,
+        state: crate::session::ViewState,
+        saved: &[crate::session::TabState],
+    ) -> Option<crate::session::ViewState> {
+        let path = normalized_path(&saved.get(state.tab_index)?.path);
+        let index = self.tabs.iter().position(|tab| {
+            tab.editor.path.as_deref().map(normalized_path) == Some(path.clone())
+        })?;
+        let editor = &self.tabs[index].editor;
+        let line = state.cursor.line.min(editor.line_count().saturating_sub(1));
+        Some(crate::session::ViewState {
+            tab_index: index,
+            cursor: crate::session::CursorState {
+                line,
+                column: state.cursor.column.min(editor.line_len_chars(line)),
+            },
+            scroll_line: state.scroll_line.min(editor.line_count().saturating_sub(1)),
+            scroll_column: state.scroll_column,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -110,6 +155,29 @@ impl Tabs {
 
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
+    }
+
+    pub fn document_states(&self) -> Vec<DocumentState> {
+        self.tabs
+            .iter()
+            .map(|tab| (tab.editor.stamp(), tab.editor.path.clone()))
+            .collect()
+    }
+    pub fn matches_document_states(&self, states: &[DocumentState]) -> bool {
+        self.tabs.len() == states.len()
+            && self.tabs.iter().zip(states).all(|(tab, (stamp, path))| {
+                tab.editor.stamp() == *stamp && tab.editor.path == *path
+            })
+    }
+
+    pub fn index_for_document(&self, document: u64) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.editor.stamp().0 == document)
+    }
+
+    pub fn editor_at(&self, index: usize) -> Option<&Editor> {
+        self.tabs.get(index).map(|tab| &tab.editor)
     }
 
     pub fn active_index(&self) -> usize {
@@ -171,14 +239,7 @@ impl Tabs {
     /// moved directory. Buffer contents and dirty state are preserved.
     pub fn remap_paths(&mut self, source: &Path, destination: &Path) {
         for tab in &mut self.tabs {
-            let Some(path) = tab.editor.path.as_mut() else {
-                continue;
-            };
-            if path == source {
-                *path = destination.to_path_buf();
-            } else if let Ok(relative) = path.strip_prefix(source) {
-                *path = destination.join(relative);
-            }
+            tab.editor.remap_path(source, destination);
         }
     }
 
@@ -353,20 +414,17 @@ impl Tabs {
         (saved, errors)
     }
 
-    pub fn dirty_recovery_entries(&self) -> Vec<crate::recovery::RecoveryEntry> {
+    pub fn recovery_snapshots(&self) -> Vec<crate::recovery::Snapshot> {
         self.tabs
             .iter()
             .filter(|tab| tab.editor.dirty)
-            .map(|tab| {
-                crate::recovery::entry(
-                    tab.editor.path.clone(),
-                    tab.editor.text(),
-                    tab.editor.cursor,
-                )
+            .map(|tab| crate::recovery::Snapshot {
+                path: tab.editor.path.clone(),
+                text: tab.editor.snapshot_buffer(),
+                cursor: tab.editor.cursor,
             })
             .collect()
     }
-
     fn active_options(&self) -> crate::editor::EditorOptions {
         self.tabs
             .get(self.active)
@@ -559,5 +617,61 @@ mod tests {
         assert_eq!(tabs.cursor.column, "short".len());
         assert_eq!(tabs.scroll_line, 0);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exporting_interleaved_untitled_tabs_remaps_active_and_split_views() {
+        let root = temp_dir("export-indices");
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let mut tabs = Tabs::new(None).unwrap();
+        tabs.insert_char('u'); // Retain the initial untitled tab.
+        tabs.open_or_switch(&a).unwrap();
+        tabs.new_buffer();
+        tabs.open_or_switch(&b).unwrap();
+        tabs.new_buffer();
+        let exported = tabs.export_session();
+        assert_eq!(exported.index_map, [None, Some(0), None, Some(1), None]);
+        assert_eq!(exported.active, 1);
+        tabs.select(2);
+        assert_eq!(tabs.export_session().active, 0);
+        tabs.select(0);
+        assert_eq!(tabs.export_session().active, 0);
+        tabs.select(3);
+        assert_eq!(tabs.export_session().active, 1);
+        let mut saved = exported.tabs;
+        saved.insert(
+            0,
+            crate::session::TabState {
+                path: root.join("missing"),
+                ..saved[0].clone()
+            },
+        );
+        let restored = Tabs::from_session(&saved, 2).unwrap().unwrap();
+        let view = crate::session::ViewState {
+            tab_index: 2,
+            cursor: crate::session::CursorState {
+                line: 99,
+                column: 99,
+            },
+            scroll_line: 99,
+            scroll_column: 0,
+        };
+        let view = restored.restored_view(view, &saved).unwrap();
+        assert_eq!(view.tab_index, 1);
+        assert_eq!(view.cursor.line, 0);
+        assert_eq!(view.cursor.column, 1);
+        assert!(restored
+            .restored_view(
+                crate::session::ViewState {
+                    tab_index: 0,
+                    ..view
+                },
+                &saved
+            )
+            .is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use crossterm::style::Color;
 use tree_sitter::{
@@ -132,6 +133,9 @@ pub struct SyntaxDocument {
     highlight_query: Option<Query>,
     indent_query: Option<Query>,
     source: String,
+    line_starts: Vec<usize>,
+    folds: OnceLock<Arc<[(usize, usize)]>>,
+    symbols_cache: OnceLock<Arc<[Symbol]>>,
 }
 
 impl SyntaxDocument {
@@ -151,6 +155,9 @@ impl SyntaxDocument {
             highlight_query,
             indent_query,
             source: source.to_string(),
+            line_starts: line_start_offsets(source),
+            folds: OnceLock::new(),
+            symbols_cache: OnceLock::new(),
         })
     }
 
@@ -158,11 +165,18 @@ impl SyntaxDocument {
         self.language
     }
 
+    #[cfg(test)]
     pub fn apply_edit(&mut self, at: usize, removed_chars: usize, inserted: &str) {
-        let start_byte = char_index_to_byte(&self.source, at);
-        let old_end_byte = char_index_to_byte(&self.source, at.saturating_add(removed_chars));
-        let start_position = point_at_byte(&self.source, start_byte);
-        let old_end_position = point_at_byte(&self.source, old_end_byte);
+        let start = char_index_to_byte(&self.source, at);
+        let end = char_index_to_byte(&self.source, at.saturating_add(removed_chars));
+        self.apply_byte_edit(start, end, inserted);
+    }
+
+    pub fn apply_byte_edit(&mut self, start_byte: usize, old_end_byte: usize, inserted: &str) {
+        self.folds.take();
+        self.symbols_cache.take();
+        let start_position = self.point_for_byte(start_byte);
+        let old_end_position = self.point_for_byte(old_end_byte);
         let new_end_position = point_after_text(start_position, inserted);
         let new_end_byte = start_byte + inserted.len();
         self.tree.edit(&InputEdit {
@@ -173,6 +187,24 @@ impl SyntaxDocument {
             old_end_position,
             new_end_position,
         });
+        let first = self
+            .line_starts
+            .partition_point(|offset| *offset <= start_byte);
+        let last = self
+            .line_starts
+            .partition_point(|offset| *offset <= old_end_byte);
+        let delta = inserted.len() as isize - (old_end_byte - start_byte) as isize;
+        for offset in &mut self.line_starts[last..] {
+            *offset = offset.saturating_add_signed(delta);
+        }
+        self.line_starts.splice(
+            first..last,
+            inserted
+                .bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .map(|(index, _)| start_byte + index + 1),
+        );
         self.source
             .replace_range(start_byte..old_end_byte, inserted);
         if let Some(tree) = self.parser.parse(&self.source, Some(&self.tree)) {
@@ -180,9 +212,21 @@ impl SyntaxDocument {
         }
     }
 
+    fn point_for_byte(&self, byte: usize) -> Point {
+        let row = self
+            .line_starts
+            .partition_point(|offset| *offset <= byte)
+            .saturating_sub(1);
+        Point::new(row, byte - self.line_starts[row])
+    }
+
     pub fn highlight_line(&self, line_index: usize, line: &str, theme: &Theme) -> Vec<Color> {
         let mut colors = highlight_line_base(line, self.language, theme);
-        let line_start = line_start_byte(&self.source, line_index).unwrap_or(self.source.len());
+        let line_start = self
+            .line_starts
+            .get(line_index)
+            .copied()
+            .unwrap_or(self.source.len());
         if let Some(query) = &self.highlight_query {
             apply_query_highlights(
                 query,
@@ -206,19 +250,23 @@ impl SyntaxDocument {
         colors
     }
 
-    pub fn fold_ranges(&self) -> Vec<(usize, usize)> {
-        let root = self.tree.root_node();
-        let mut ranges = Vec::new();
-        collect_fold_ranges(root, root.id(), &mut ranges);
-        ranges.sort_unstable();
-        ranges.dedup();
-        ranges
+    pub fn fold_ranges(&self) -> Arc<[(usize, usize)]> {
+        Arc::clone(self.folds.get_or_init(|| {
+            let root = self.tree.root_node();
+            let mut ranges = Vec::new();
+            collect_fold_ranges(root, root.id(), &mut ranges);
+            ranges.sort_unstable();
+            ranges.dedup();
+            ranges.into()
+        }))
     }
 
-    pub fn symbols(&self) -> Vec<Symbol> {
-        let mut output = Vec::new();
-        collect_symbols(self.tree.root_node(), &self.source, 0, &mut output);
-        output
+    pub fn symbols(&self) -> Arc<[Symbol]> {
+        Arc::clone(self.symbols_cache.get_or_init(|| {
+            let mut output = Vec::new();
+            collect_symbols(self.tree.root_node(), &self.source, 0, &mut output);
+            output.into()
+        }))
     }
 
     pub fn matching_bracket(&self, cursor_char: usize) -> Option<usize> {
@@ -672,6 +720,7 @@ fn symbol_kind(kind: &str) -> Option<&'static str> {
         | "enum_declaration"
         | "record_declaration" => Some("type"),
         "function_declaration"
+        | "function_item"
         | "function_definition"
         | "method_declaration"
         | "constructor_declaration" => Some("function"),
@@ -723,16 +772,6 @@ fn char_index_to_byte(text: &str, index: usize) -> usize {
         .map_or(text.len(), |(byte, _)| byte)
 }
 
-fn point_at_byte(text: &str, byte: usize) -> Point {
-    let byte = byte.min(text.len());
-    let prefix = &text[..byte];
-    let row = prefix.bytes().filter(|byte| *byte == b'\n').count();
-    let column = prefix
-        .rfind('\n')
-        .map_or(prefix.len(), |newline| prefix.len() - newline - 1);
-    Point::new(row, column)
-}
-
 fn point_after_text(start: Point, text: &str) -> Point {
     let newline_count = text.bytes().filter(|byte| *byte == b'\n').count();
     if newline_count == 0 {
@@ -745,20 +784,16 @@ fn point_after_text(start: Point, text: &str) -> Point {
     }
 }
 
-fn line_start_byte(source: &str, line_index: usize) -> Option<usize> {
-    if line_index == 0 {
-        return Some(0);
-    }
-    let mut remaining = line_index;
-    for (byte, character) in source.char_indices() {
-        if character == '\n' {
-            remaining -= 1;
-            if remaining == 0 {
-                return Some(byte + 1);
-            }
-        }
-    }
-    None
+fn line_start_offsets(source: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(
+            source
+                .bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .map(|(index, _)| index + 1),
+        )
+        .collect()
 }
 
 fn apply_query_highlights(
@@ -1423,5 +1458,99 @@ mod tests {
                 .map(|symbol| symbol.name.as_str()),
             Some("Run")
         );
+    }
+
+    #[test]
+    fn line_offsets_remain_exact_across_unicode_and_newline_edits() {
+        let mut doc =
+            SyntaxDocument::new(Some(Path::new("main.rs")), "// é\r\nfn a() {}\n").unwrap();
+        for (at, removed, inserted) in [
+            (0, 0, "\n"),
+            (1, 6, "// 日\n\n"),
+            (3, 2, "\r\n"),
+            (0, 1, ""),
+            (2, 0, "α"),
+        ] {
+            doc.apply_edit(at, removed, inserted);
+            assert_eq!(
+                doc.line_starts,
+                line_start_offsets(&doc.source),
+                "{}",
+                doc.source
+            );
+        }
+        let theme = Theme::for_kind(crate::theme::ThemeKind::Oxide);
+        for (index, line) in doc.source.lines().enumerate() {
+            assert_eq!(
+                doc.highlight_line(index, line, &theme).len(),
+                line.chars().count()
+            );
+        }
+    }
+    #[test]
+    #[ignore = "manual release performance benchmark"]
+    fn benchmark_highlight_viewports() {
+        let source = "fn item() { let answer = 42; }\n".repeat(20_000);
+        let syntax = SyntaxDocument::new(Some(Path::new("perf.rs")), &source).unwrap();
+        let theme = Theme::for_kind(crate::theme::ThemeKind::Oxide);
+        for start in [0, 19_970] {
+            let at = std::time::Instant::now();
+            for _ in 0..100 {
+                for index in start..start + 30 {
+                    std::hint::black_box(syntax.highlight_line(
+                        index,
+                        "fn item() { let answer = 42; }",
+                        &theme,
+                    ));
+                }
+            }
+            eprintln!("100 draws of 30 lines near {start}: {:?}", at.elapsed());
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_regressions {
+    use super::*;
+    #[test]
+    fn metadata_is_shared_until_a_byte_edit_invalidates_it() {
+        let mut syntax =
+            SyntaxDocument::new(Some(Path::new("test.rs")), "fn old() {\n}\n").unwrap();
+        let folds = syntax.fold_ranges();
+        let symbols = syntax.symbols();
+        assert!(Arc::ptr_eq(&folds, &syntax.fold_ranges()));
+        assert!(Arc::ptr_eq(&symbols, &syntax.symbols()));
+        syntax.apply_byte_edit(0, 0, "fn added() {}\n");
+        assert!(!Arc::ptr_eq(&folds, &syntax.fold_ranges()));
+        assert!(!Arc::ptr_eq(&symbols, &syntax.symbols()));
+        assert!(syntax.symbols().iter().any(|symbol| symbol.name == "added"));
+    }
+    #[test]
+    #[ignore = "manual release performance benchmark"]
+    fn benchmark_cached_metadata_and_byte_edits() {
+        use std::{hint::black_box, time::Instant};
+        for lines in [1_000, 20_000] {
+            let source = "fn f() { let value = 1; }\n".repeat(lines);
+            let mut syntax = SyntaxDocument::new(Some(Path::new("bench.rs")), &source).unwrap();
+            black_box(syntax.fold_ranges());
+            black_box(syntax.symbols());
+            let start = Instant::now();
+            for _ in 0..50 {
+                black_box(syntax.fold_ranges());
+                black_box(syntax.symbols());
+            }
+            let metadata = start.elapsed();
+            let start = Instant::now();
+            for _ in 0..10_000 {
+                black_box(syntax.point_for_byte(black_box(source.len() - 1)));
+            }
+            let positions = start.elapsed();
+            eprintln!("{lines} lines, 10,000 cached EOF position lookups: {positions:?}");
+            let start = Instant::now();
+            for _ in 0..50 {
+                syntax.apply_byte_edit(source.len() - 1, source.len() - 1, " ");
+            }
+            eprintln!("{lines} lines, 50 warm fold+symbol lookups: {metadata:?}; 50 byte edits near EOF: {:?}", start.elapsed());
+        }
     }
 }

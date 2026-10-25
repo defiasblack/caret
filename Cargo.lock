@@ -138,6 +138,7 @@ dependencies = [
  "directories",
  "flate2",
  "ignore",
+ "image",
  "libc",
  "notify",
  "portable-pty",
@@ -520,6 +521,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

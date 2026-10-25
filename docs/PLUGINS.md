@@ -60,7 +60,7 @@ The command must write either no output or one JSON response to standard
 output. Supported response properties are:
 
 - `message`: show a status message.
-- `replace_document`: replace the active buffer.
+- `replace_document`: replace the originating buffer.
 - `replace_selection`: replace the selection.
 - `insert_text`: replace the selection, if any, or insert at the cursor.
 - `open`: open a project-relative or absolute file path.
@@ -75,6 +75,17 @@ Run commands with `:plugin name [arguments]`. Loaded plugin commands also
 appear in the filtered command palette. `:plugins` lists loaded plugins and
 commands.
 
+Commands execute outside the input thread. One plugin command or save-hook
+sequence runs at a time; additional requests report that a plugin is busy.
+Changing the originating text, closing/reloading the tab, or changing its path
+discards the pending result. Selection and insertion responses also require the
+original cursor and selection. Switching tabs alone does not redirect a result.
+
+The existing `timeout_ms` setting defaults to 15,000 ms and covers process
+execution and all three pipes. Stdout is limited to 64 MiB and stderr to 4 MiB.
+Exceeding either limit reports an error and terminates the command. Supervision
+uses a Windows Job Object or a Unix process group to clean up child processes.
+
 ## Languages
 
 A language entry supplies a display name and line-comment prefix for matching
@@ -88,6 +99,9 @@ supported. Apply it with `:theme name`; Caret remembers it across launches.
 
 ## Save hooks
 
-Put command names in `hooks.on_save`. Caret runs them after saving the active
-file, applies their response, and saves any resulting buffer edits once more.
-The event passed to the plugin is `on_save`.
+Put command names in `hooks.on_save`. Caret runs them in order after the initial
+save. Each hook sees the previous hook's edits to the originating document;
+Caret saves the final output once the complete sequence succeeds. The event
+passed to the plugin is `on_save`. A failure leaves earlier hook edits unsaved
+and keeps the editor open. Normal quit waits for the sequence; forced quit
+cancels it. Esc cancels a pending normal quit while hooks continue. Continued typing rejects stale hook output and preserves newer edits.

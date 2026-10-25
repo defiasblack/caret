@@ -552,12 +552,12 @@ Initial previews:
 - Markdown as source with optional styled preview later
 - Binary files with type, size, timestamps, and a short hexadecimal header
 - Symlink destination and status
-- Basic image metadata before inline image rendering is attempted
+- Image metadata and a full visual image viewer with fit, zoom, and panning
+- Full-page PDF viewer with page navigation and bounded helper rendering
+- Sixel and Kitty graphics with a portable color-cell fallback
 
 Later previews may include:
 
-- Terminal image protocols
-- PDF previews
 - Archives
 - Audio and video metadata
 - Extension-provided previewers

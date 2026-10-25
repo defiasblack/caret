@@ -24,6 +24,48 @@ pub enum LineEnding {
     Crlf,
 }
 
+pub struct DocumentSnapshot {
+    pub resolved_path: PathBuf,
+    pub text: String,
+    pub format: FileFormat,
+    pub modified: Option<std::time::SystemTime>,
+    pub len: u64,
+    pub fingerprint: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskState {
+    pub modified: Option<std::time::SystemTime>,
+    pub len: Option<u64>,
+    pub fingerprint: Option<u64>,
+}
+
+pub fn disk_state(path: &Path) -> DiskState {
+    use std::io::Read;
+    let file = fs::File::open(path).ok();
+    let metadata = file.as_ref().and_then(|file| file.metadata().ok());
+    let fingerprint = file.and_then(|mut file| {
+        let mut hasher = DefaultHasher::new();
+        file.metadata().ok()?.len().hash(&mut hasher);
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).ok()?;
+            if count == 0 {
+                break;
+            }
+            hasher.write(&buffer[..count]);
+        }
+        Some(hasher.finish())
+    });
+    DiskState {
+        modified: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok()),
+        len: metadata.map(|metadata| metadata.len()),
+        fingerprint,
+    }
+}
+
 /// What happens to the last line's ending when a document is saved.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -48,7 +90,22 @@ impl FinalNewline {
 }
 
 pub fn read_text(path: &Path) -> io::Result<(String, FileFormat)> {
-    let bytes = fs::read(path)?;
+    let snapshot = read_snapshot(path)?;
+    Ok((snapshot.text, snapshot.format))
+}
+
+pub fn read_snapshot(path: &Path) -> io::Result<DocumentSnapshot> {
+    read_snapshot_with(path, || {})
+}
+
+fn read_snapshot_with(path: &Path, after_read: impl FnOnce()) -> io::Result<DocumentSnapshot> {
+    use std::io::Read;
+    let resolved_path = fs::canonicalize(path)?;
+    let mut file = fs::File::open(&resolved_path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    after_read();
+    let metadata = file.metadata()?;
     if bytes.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -70,14 +127,18 @@ pub fn read_text(path: &Path) -> io::Result<(String, FileFormat)> {
         LineEnding::Lf
     };
     let final_newline = text.ends_with('\n');
-    Ok((
+    Ok(DocumentSnapshot {
+        resolved_path,
         text,
-        FileFormat {
+        format: FileFormat {
             utf8_bom,
             line_ending,
             final_newline,
         },
-    ))
+        modified: metadata.modified().ok(),
+        len: bytes.len() as u64,
+        fingerprint: fingerprint_bytes(&bytes),
+    })
 }
 
 /// Writes a fully synchronized replacement beside `path` and only then swaps it
@@ -90,6 +151,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// the caller observed. `None` means the caller expects the destination not to
 /// exist. The comparison happens after the complete temporary file is durable
 /// and immediately before replacement.
+#[cfg(test)]
 pub fn atomic_write_if_unchanged(
     path: &Path,
     expected_fingerprint: Option<u64>,
@@ -108,9 +170,72 @@ pub fn atomic_write_if_unchanged(
     })
 }
 
+/// Resolve existing aliases without ever replacing a symlink itself.
+pub fn resolve_write_target(path: &Path) -> io::Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::canonicalize(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot resolve save target (dangling link?): {error}"),
+            )
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            Ok(fs::canonicalize(parent)?.join(
+                path.file_name()
+                    .ok_or_else(|| io::Error::other("save path has no filename"))?,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn atomic_write_resolved(
+    alias: &Path,
+    target: &Path,
+    expected: Option<Option<u64>>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    atomic_write_resolved_with(alias, target, expected, bytes, || {})
+}
+
+fn atomic_write_resolved_with(
+    alias: &Path,
+    target: &Path,
+    expected: Option<Option<u64>>,
+    bytes: &[u8],
+    before_validate: impl FnOnce(),
+) -> io::Result<()> {
+    let mut before_validate = Some(before_validate);
+    atomic_write_impl(target, bytes, |_| {
+        if let Some(hook) = before_validate.take() {
+            hook();
+        }
+        if resolve_write_target(alias)? != target {
+            return Err(io::Error::other(
+                "save target changed; reload before saving",
+            ));
+        }
+        if let Some(expected) = expected {
+            let actual = match fingerprint(target) {
+                Ok(value) => Some(value),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            if actual != expected {
+                return Err(io::Error::other("file changed on disk before replacement"));
+            }
+        }
+        Ok(())
+    })
+}
+
 fn atomic_write_impl<F>(path: &Path, bytes: &[u8], before_replace: F) -> io::Result<()>
 where
-    F: FnOnce(&Path) -> io::Result<()>,
+    F: FnMut(&Path) -> io::Result<()>,
 {
     atomic_write_impl_with_writer(path, bytes, before_replace, |file, bytes| {
         use std::io::Write;
@@ -125,7 +250,7 @@ fn atomic_write_impl_with_writer<F, W>(
     write: W,
 ) -> io::Result<()>
 where
-    F: FnOnce(&Path) -> io::Result<()>,
+    F: FnMut(&Path) -> io::Result<()>,
     W: FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
 {
     let parent = path
@@ -149,16 +274,48 @@ where
             file.sync_all()?;
         }
         drop(file);
-        before_replace(&temp)?;
-        // The platform boundary handles replacement semantics. A failure
-        // deliberately leaves the original intact.
-        crate::platform::replace_file(&temp, path)?;
+        install_replacement(
+            &temp,
+            path,
+            before_replace,
+            crate::platform::replace_file,
+            std::thread::sleep,
+            cfg!(windows),
+        )?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Windows scanners can briefly deny rename/delete sharing. Every retry must
+/// validate again: sleeping after a single fingerprint check would lose edits.
+fn install_replacement(
+    temporary: &Path,
+    destination: &Path,
+    mut validate: impl FnMut(&Path) -> io::Result<()>,
+    mut replace: impl FnMut(&Path, &Path) -> io::Result<()>,
+    mut pause: impl FnMut(std::time::Duration),
+    windows_sharing: bool,
+) -> io::Result<()> {
+    let delays = [5, 10, 20, 40, 80, 160, 320];
+    for attempt in 0..=delays.len() {
+        validate(temporary)?;
+        match replace(temporary, destination) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if windows_sharing
+                    && matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    && attempt < delays.len() =>
+            {
+                pause(std::time::Duration::from_millis(delays[attempt]));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 fn create_temporary_file(parent: &Path, name: &str) -> io::Result<(PathBuf, fs::File)> {
@@ -197,9 +354,13 @@ pub fn recovery_dir() -> PathBuf {
 /// metadata alone is not sufficient for conflict detection.
 pub fn fingerprint(path: &Path) -> io::Result<u64> {
     let bytes = fs::read(path)?;
+    Ok(fingerprint_bytes(&bytes))
+}
+
+pub fn fingerprint_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
-    Ok(hasher.finish())
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -410,5 +571,192 @@ mod tests {
         drop(lock);
         assert_eq!(fs::read(&path).unwrap(), b"important original");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshot_fingerprint_and_decoding_share_the_read_bytes() {
+        let path = temp("snapshot-race");
+        let old = b"\xEF\xBB\xBFold\r\n";
+        fs::write(&path, old).unwrap();
+        let snapshot = read_snapshot_with(&path, || fs::write(&path, b"new\r\n").unwrap()).unwrap();
+        assert_eq!(snapshot.text, "old\r\n");
+        assert!(snapshot.format.utf8_bom);
+        assert_eq!(snapshot.fingerprint, fingerprint_bytes(old));
+        assert_ne!(snapshot.fingerprint, fingerprint(&path).unwrap());
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn streaming_disk_fingerprint_matches_save_fingerprint() {
+        let path = temp("streaming-hash");
+        let bytes = vec![b'x'; 128 * 1024 + 7];
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            disk_state(&path).fingerprint,
+            Some(fingerprint_bytes(&bytes))
+        );
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod resolved_save_races {
+    use super::*;
+    #[test]
+    fn write_after_staging_is_detected_before_installing_the_replacement() {
+        let root =
+            std::env::temp_dir().join(format!("caret-resolved-save-race-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("text");
+        fs::write(&path, "original").unwrap();
+        let target = resolve_write_target(&path).unwrap();
+        let expected = fingerprint(&path).unwrap();
+        let result = atomic_write_resolved_with(
+            &path,
+            &target,
+            Some(Some(expected)),
+            b"replacement",
+            || fs::write(&path, "external edit").unwrap(),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external edit");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn alias_retarget_after_staging_preserves_both_targets_and_the_alias() {
+        let root = std::env::temp_dir().join(format!("caret-alias-race-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        let alias = root.join("link");
+        fs::write(&a, "original").unwrap();
+        fs::write(&b, "other").unwrap();
+        let link = |target: &Path| {
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_file(target, &alias)
+            }
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(target, &alias)
+            }
+        };
+        if let Err(error) = link(&a) {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            return;
+        }
+        let target = resolve_write_target(&alias).unwrap();
+        let expected = fingerprint(&alias).unwrap();
+        let result = atomic_write_resolved_with(
+            &alias,
+            &target,
+            Some(Some(expected)),
+            b"replacement",
+            || {
+                fs::remove_file(&alias).unwrap();
+                link(&b).unwrap();
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(a).unwrap(), "original");
+        assert_eq!(fs::read_to_string(b).unwrap(), "other");
+        assert!(fs::symlink_metadata(alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod replacement_retry_regressions {
+    use super::*;
+    use std::cell::Cell;
+    #[test]
+    fn transient_sharing_failures_revalidate_before_retrying() {
+        let validations = Cell::new(0);
+        let attempts = Cell::new(0);
+        let waits = Cell::new(0);
+        install_replacement(
+            Path::new("temp"),
+            Path::new("destination"),
+            |_| {
+                validations.set(validations.get() + 1);
+                Ok(())
+            },
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| waits.set(waits.get() + 1),
+            true,
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(validations.get(), 3);
+        assert_eq!(waits.get(), 2);
+    }
+    #[test]
+    fn an_external_change_during_retry_prevents_replacement() {
+        let changed = Cell::new(false);
+        let attempts = Cell::new(0);
+        let error = install_replacement(
+            Path::new("temp"),
+            Path::new("destination"),
+            |_| {
+                if changed.get() {
+                    Err(io::Error::other("external edit"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from_raw_os_error(5))
+            },
+            |_| changed.set(true),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("external edit"));
+        assert_eq!(attempts.get(), 1);
+    }
+    #[test]
+    fn retries_are_bounded_and_other_failures_are_not_retried() {
+        let attempts = Cell::new(0);
+        let waited = Cell::new(std::time::Duration::ZERO);
+        assert!(install_replacement(
+            Path::new("temp"),
+            Path::new("destination"),
+            |_| Ok(()),
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from_raw_os_error(33))
+            },
+            |delay| waited.set(waited.get() + delay),
+            true
+        )
+        .is_err());
+        assert_eq!(attempts.get(), 8);
+        assert_eq!(waited.get(), std::time::Duration::from_millis(635));
+        attempts.set(0);
+        assert!(install_replacement(
+            Path::new("temp"),
+            Path::new("destination"),
+            |_| Ok(()),
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from_raw_os_error(112))
+            },
+            |_| panic!("non-sharing failure was retried"),
+            true
+        )
+        .is_err());
+        assert_eq!(attempts.get(), 1);
     }
 }

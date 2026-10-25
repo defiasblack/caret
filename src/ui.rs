@@ -9,7 +9,7 @@ use crossterm::{
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
     },
-    terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate},
+    terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -42,6 +42,62 @@ pub struct ScreenLayout {
     pub hotkey_row: u16,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EditorPane {
+    pub x: usize,
+    pub top: u16,
+    pub width: usize,
+    pub rows: usize,
+    pub gutter: usize,
+    pub secondary: bool,
+}
+impl EditorPane {
+    pub fn contains(self, column: u16, row: u16) -> bool {
+        (column as usize) >= self.x
+            && (column as usize) < self.x + self.width
+            && row >= self.top
+            && (row as usize) < self.top as usize + self.rows
+    }
+}
+pub fn editor_panes(app: &App, width: u16, height: u16) -> Vec<EditorPane> {
+    let layout = screen_layout(app, width, height);
+    let mut panes = vec![EditorPane {
+        x: layout.editor_x,
+        top: layout.content_top,
+        width: layout.editor_width,
+        rows: layout.content_height,
+        gutter: layout.gutter_width,
+        secondary: false,
+    }];
+    if let Some(views) = app.split_views {
+        let mut second = panes[0];
+        second.secondary = true;
+        if views.vertical {
+            panes[0].width = layout.editor_width.saturating_sub(1) / 2;
+            second.x += panes[0].width + 1;
+            second.width = layout.editor_width.saturating_sub(panes[0].width + 1);
+        } else {
+            panes[0].rows = layout.content_height.saturating_sub(1) / 2;
+            second.top += panes[0].rows as u16 + 1;
+            second.rows = layout.content_height.saturating_sub(panes[0].rows + 1);
+        }
+        panes.push(second);
+        for pane in &mut panes {
+            let index = if pane.secondary {
+                views.secondary.tab_index
+            } else {
+                views.primary.tab_index
+            };
+            pane.gutter = app
+                .editor
+                .editor_at(index)
+                .map_or(0, |editor| editor.line_number_width())
+                .min(pane.width.saturating_sub(1));
+        }
+    }
+    panes
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileManagerLayout {
     parent_x: usize,
@@ -60,8 +116,8 @@ struct ManagerPanel {
     width: usize,
 }
 
-const OFFICE_ROW_HEADER_WIDTH: usize = 7;
-const OFFICE_CELL_WIDTH: usize = 24;
+const OFFICE_ROW_HEADER_WIDTH: usize = crate::office_viewer::ROW_HEADER_WIDTH;
+const OFFICE_CELL_WIDTH: usize = crate::office_viewer::CELL_WIDTH;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OfficeViewerHit {
@@ -157,8 +213,19 @@ pub fn office_viewer_hit_at(
     match &viewer.content {
         OfficeContent::Spreadsheet(view) => {
             if local_row < 3
-                || local_row >= layout.content_height.saturating_sub(2)
+                || local_row - 3
+                    >= crate::office_viewer::ViewerViewport::spreadsheet(
+                        layout.content_height,
+                        layout.editor_width,
+                    )
+                    .rows
                 || local_column < OFFICE_ROW_HEADER_WIDTH
+                || (local_column - OFFICE_ROW_HEADER_WIDTH) / OFFICE_CELL_WIDTH
+                    >= crate::office_viewer::ViewerViewport::spreadsheet(
+                        layout.content_height,
+                        layout.editor_width,
+                    )
+                    .columns
             {
                 return None;
             }
@@ -190,12 +257,24 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         SetForegroundColor(app.theme.foreground)
     )?;
 
+    if app.visual_painted {
+        // Text overpainting does not erase persistent terminal graphics. Clear
+        // the previous image even when closing, resizing, or showing an error.
+        queue!(
+            out,
+            Print(crate::visual_viewer::KITTY_DELETE),
+            Clear(ClearType::All)
+        )?;
+        app.visual_painted = false;
+    }
+
     if width < 44 || height < 8 {
         queue!(
             out,
             MoveTo(0, 0),
             SetForegroundColor(app.theme.error),
-            Print("Terminal is too small for Caret.")
+            Print("Terminal is too small for Caret."),
+            EndSynchronizedUpdate
         )?;
         out.flush()?;
         return Ok(());
@@ -211,16 +290,24 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     let editor_x = layout.editor_x;
     let editor_width = layout.editor_width;
     let gutter_width = layout.gutter_width;
-    let content_width = editor_width.saturating_sub(gutter_width);
+    if app.mode == Mode::OfficeViewer && app.visual_viewer.is_some() {
+        app.prepare_visual_viewer(editor_width, content_height.saturating_sub(2));
+    }
 
-    app.viewport_rows = content_height.max(1);
-    app.viewport_columns = content_width.max(1);
+    let panes = editor_panes(app, width, height);
+    let active_pane = panes
+        .iter()
+        .find(|pane| pane.secondary == app.split_views.is_some_and(|views| views.secondary_active))
+        .unwrap();
+    app.viewport_rows = active_pane.rows.max(1);
+    app.viewport_columns = active_pane.width.saturating_sub(active_pane.gutter).max(1);
     if let Some(viewer) = app.office_viewer.as_mut() {
         viewer.ensure_visible(content_height, editor_width);
     }
     if app.follow_cursor {
         app.editor
             .ensure_cursor_visible(app.viewport_rows, app.viewport_columns);
+        app.sync_focused_view();
     }
     app.project
         .ensure_selected_visible(content_height.saturating_sub(1));
@@ -237,98 +324,66 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         draw_vertical_separator(out, app, sidebar_width as u16, content_top, content_height)?;
     }
 
-    if let Some(views) = app.split_views {
-        let focused = (
-            app.editor.active_index(),
-            app.editor.cursor,
-            app.editor.scroll_line,
-            app.editor.scroll_column,
-        );
-        if views.vertical {
-            let pane_width = editor_width.saturating_sub(1) / 2;
-            let pane_gutter = app
-                .editor
-                .line_number_width()
-                .min(pane_width.saturating_sub(1));
-            app.editor.select(views.primary.tab_index);
-            app.editor.cursor = views.primary.cursor;
-            app.editor.scroll_line = views.primary.scroll_line;
-            app.editor.scroll_column = views.primary.scroll_column;
-            draw_editor(
-                out,
-                app,
-                content_top,
-                content_height,
-                editor_x as u16,
-                pane_width as u16,
-                pane_gutter,
-            )?;
-            let divider = editor_x + pane_width;
-            draw_vertical_separator(out, app, divider as u16, content_top, content_height)?;
-            app.editor.select(views.secondary.tab_index);
-            app.editor.cursor = views.secondary.cursor;
-            app.editor.scroll_line = views.secondary.scroll_line;
-            app.editor.scroll_column = views.secondary.scroll_column;
-            draw_editor(
-                out,
-                app,
-                content_top,
-                content_height,
-                (divider + 1) as u16,
-                pane_width as u16,
-                pane_gutter,
-            )?;
+    if app.mode != Mode::OfficeViewer {
+        if let Some(views) = app.split_views {
+            let focused = (
+                app.editor.active_index(),
+                app.editor.cursor,
+                app.editor.scroll_line,
+                app.editor.scroll_column,
+            );
+            for pane in &panes {
+                let view = if pane.secondary {
+                    views.secondary
+                } else {
+                    views.primary
+                };
+                app.editor.select(view.tab_index);
+                app.editor.cursor = view.cursor;
+                app.editor.scroll_line = view.scroll_line;
+                app.editor.scroll_column = view.scroll_column;
+                draw_editor(
+                    out,
+                    app,
+                    pane.top,
+                    pane.rows,
+                    pane.x as u16,
+                    pane.width as u16,
+                    pane.gutter,
+                )?;
+            }
+            if views.vertical {
+                draw_vertical_separator(
+                    out,
+                    app,
+                    (panes[0].x + panes[0].width) as u16,
+                    content_top,
+                    content_height,
+                )?;
+            } else {
+                queue!(
+                    out,
+                    MoveTo(editor_x as u16, panes[0].top + panes[0].rows as u16),
+                    SetBackgroundColor(app.theme.background),
+                    SetForegroundColor(app.theme.border),
+                    Print("─".repeat(editor_width))
+                )?;
+            }
+            app.editor.select(focused.0);
+            app.editor.cursor = focused.1;
+            app.editor.scroll_line = focused.2;
+            app.editor.scroll_column = focused.3;
         } else {
-            let pane_rows = content_height.saturating_sub(1) / 2;
-            app.editor.select(views.primary.tab_index);
-            app.editor.cursor = views.primary.cursor;
-            app.editor.scroll_line = views.primary.scroll_line;
-            app.editor.scroll_column = views.primary.scroll_column;
             draw_editor(
                 out,
                 app,
                 content_top,
-                pane_rows,
-                editor_x as u16,
-                editor_width as u16,
-                gutter_width,
-            )?;
-            let divider = content_top + pane_rows as u16;
-            queue!(
-                out,
-                MoveTo(editor_x as u16, divider),
-                SetBackgroundColor(app.theme.background),
-                SetForegroundColor(app.theme.border),
-                Print("─".repeat(editor_width))
-            )?;
-            app.editor.select(views.secondary.tab_index);
-            app.editor.cursor = views.secondary.cursor;
-            app.editor.scroll_line = views.secondary.scroll_line;
-            app.editor.scroll_column = views.secondary.scroll_column;
-            draw_editor(
-                out,
-                app,
-                divider + 1,
-                pane_rows,
+                content_height,
                 editor_x as u16,
                 editor_width as u16,
                 gutter_width,
             )?;
         }
-        app.editor.select(focused.0);
-        app.editor.cursor = focused.1;
-        app.editor.scroll_line = focused.2;
-        app.editor.scroll_column = focused.3;
-    } else {
-        draw_editor(
-            out,
-            app,
-            content_top,
-            content_height,
-            editor_x as u16,
-            editor_width as u16,
-            gutter_width,
-        )?;
     }
     if app.mode == Mode::OfficeViewer {
         draw_office_viewer(
@@ -339,6 +394,9 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
             editor_x as u16,
             editor_width as u16,
         )?;
+        app.visual_painted = app.visual_viewer.as_ref().is_some_and(|viewer| {
+            viewer.frame.is_some() && viewer.protocol != crate::visual_viewer::Protocol::Blocks
+        });
     }
     if layout.terminal_height > 0 {
         draw_terminal(out, app, layout.terminal_top, layout.terminal_height, width)?;
@@ -401,34 +459,11 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         draw_lsp_panel(out, app, width, height)?;
     }
 
-    let (cursor_editor_x, cursor_editor_width, cursor_gutter_width) =
-        if let Some(views) = app.split_views {
-            let pane_width = editor_width.saturating_sub(1) / 2;
-            let pane_gutter = app
-                .editor
-                .line_number_width()
-                .min(pane_width.saturating_sub(1));
-            let x = if views.vertical && views.secondary_active {
-                editor_x + pane_width + 1
-            } else {
-                editor_x
-            };
-            (x, pane_width, pane_gutter)
-        } else {
-            (editor_x, editor_width, gutter_width)
-        };
-    let (cursor_content_top, cursor_content_height) = if let Some(views) = app.split_views {
-        if !views.vertical && views.secondary_active {
-            let pane_rows = content_height.saturating_sub(1) / 2;
-            (content_top + pane_rows as u16 + 1, pane_rows)
-        } else if !views.vertical {
-            (content_top, content_height.saturating_sub(1) / 2)
-        } else {
-            (content_top, content_height)
-        }
-    } else {
-        (content_top, content_height)
-    };
+    let cursor_editor_x = active_pane.x;
+    let cursor_editor_width = active_pane.width;
+    let cursor_gutter_width = active_pane.gutter;
+    let cursor_content_top = active_pane.top;
+    let cursor_content_height = active_pane.rows;
     if app.lsp_panel.is_some() || app.mode == Mode::FileManager {
         queue!(out, Hide)?;
     } else if app.terminal_focused && layout.terminal_height > 0 {
@@ -1498,7 +1533,41 @@ fn draw_office_viewer<W: Write>(
     x: u16,
     width: u16,
 ) -> io::Result<()> {
+    if let Some(viewer) = app.visual_viewer.as_ref() {
+        return draw_visual_viewer(
+            out,
+            app,
+            viewer,
+            OfficeViewerArea {
+                top,
+                rows,
+                x,
+                width: width as usize,
+            },
+        );
+    }
     let Some(viewer) = app.office_viewer.as_ref() else {
+        for offset in 0..rows {
+            queue!(
+                out,
+                MoveTo(x, top + offset as u16),
+                SetBackgroundColor(app.theme.background),
+                SetForegroundColor(app.theme.foreground),
+                Print(" ".repeat(width as usize))
+            )?;
+        }
+        let label = app
+            .office_loading
+            .as_ref()
+            .map(|path| format!(" Loading {} · Esc cancels", path.display()))
+            .unwrap_or_default();
+        if rows > 0 {
+            queue!(
+                out,
+                MoveTo(x, top),
+                Print(pad_or_truncate(&label, width as usize))
+            )?;
+        }
         return Ok(());
     };
     let width = width as usize;
@@ -1546,6 +1615,88 @@ fn draw_office_viewer<W: Write>(
     Ok(())
 }
 
+fn draw_visual_viewer<W: Write>(
+    out: &mut W,
+    app: &App,
+    viewer: &crate::visual_viewer::VisualViewer,
+    area: OfficeViewerArea,
+) -> io::Result<()> {
+    let OfficeViewerArea {
+        top,
+        rows,
+        x,
+        width,
+    } = area;
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    for row in 0..rows {
+        queue!(
+            out,
+            MoveTo(x, top + row as u16),
+            SetBackgroundColor(app.theme.background),
+            SetForegroundColor(app.theme.foreground),
+            Print(" ".repeat(width))
+        )?;
+    }
+    let name = viewer
+        .path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    queue!(
+        out,
+        MoveTo(x, top),
+        SetBackgroundColor(app.theme.top_bar),
+        SetForegroundColor(app.theme.heading),
+        Print(pad_or_truncate(
+            &format!(" {} · {}", manager_display_line(&name), viewer.label()),
+            width
+        ))
+    )?;
+    if rows > 2 {
+        if let Some(frame) = &viewer.frame {
+            // Keep terminal cursor changes made by graphics inside this pane.
+            queue!(out, Print("\x1b7"))?;
+            for (row, line) in frame.lines.iter().take(rows - 2).enumerate() {
+                queue!(out, MoveTo(x, top + 1 + row as u16), Print(line))?;
+            }
+            queue!(out, Print("\x1b8"))?;
+        } else {
+            let status = viewer.error.as_deref().unwrap_or(if viewer.loading {
+                "Rendering · Esc cancels"
+            } else {
+                "Preparing visual viewer"
+            });
+            // Filesystem errors can include control characters from filenames.
+            queue!(
+                out,
+                MoveTo(x, top + 1),
+                SetBackgroundColor(app.theme.background),
+                SetForegroundColor(if viewer.error.is_some() {
+                    app.theme.error
+                } else {
+                    app.theme.foreground
+                }),
+                Print(pad_or_truncate(&manager_display_line(status), width))
+            )?;
+        }
+    }
+    if rows > 1 {
+        queue!(
+            out,
+            MoveTo(x, top + rows as u16 - 1),
+            SetBackgroundColor(app.theme.prompt_bar),
+            SetForegroundColor(app.theme.muted),
+            Print(pad_or_truncate(
+                " +/- Zoom · F Fit · W Width · Arrows Pan · PgUp/PgDn Pages · R Reload · Esc Close",
+                width
+            ))
+        )?;
+    }
+    Ok(())
+}
+
 fn draw_spreadsheet_viewer<W: Write>(
     out: &mut W,
     app: &App,
@@ -1559,6 +1710,13 @@ fn draw_spreadsheet_viewer<W: Write>(
         x,
         width,
     } = area;
+    if rows < 5 || width < OFFICE_ROW_HEADER_WIDTH + OFFICE_CELL_WIDTH {
+        return queue!(
+            out,
+            MoveTo(x, top),
+            Print(pad_or_truncate(" Enlarge terminal to view cells", width))
+        );
+    }
     let Some(sheet) = view.active() else {
         return Ok(());
     };
@@ -1586,8 +1744,9 @@ fn draw_spreadsheet_viewer<W: Write>(
         ))
     )?;
 
-    let visible_columns = width.saturating_sub(OFFICE_ROW_HEADER_WIDTH) / OFFICE_CELL_WIDTH;
-    let data_rows = rows.saturating_sub(5);
+    let viewport = crate::office_viewer::ViewerViewport::spreadsheet(rows, width);
+    let visible_columns = viewport.columns;
+    let data_rows = viewport.rows;
     queue!(
         out,
         MoveTo(x, top + 2),
@@ -1702,7 +1861,7 @@ fn draw_spreadsheet_viewer<W: Write>(
         MoveTo(x, footer_y),
         SetBackgroundColor(app.theme.overlay),
         SetForegroundColor(app.theme.overlay_text),
-        Print(pad_or_truncate(&detail, width))
+        Print(pad_or_truncate(&manager_display_line(&detail), width))
     )?;
     if view.detail_open && rows >= 8 {
         draw_viewer_detail(
@@ -1753,7 +1912,7 @@ fn draw_document_viewer<W: Write>(
         x,
         width,
     } = area;
-    let content_rows = rows.saturating_sub(3);
+    let content_rows = crate::office_viewer::ViewerViewport::document(rows).rows;
     for offset in 0..content_rows {
         let line_index = view.scroll_line + offset;
         let y = top + 1 + offset as u16;
@@ -2880,6 +3039,12 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
 
     let language_name = app.language_name();
     let left = if let Some(viewer) = app
+        .visual_viewer
+        .as_ref()
+        .filter(|_| app.mode == Mode::OfficeViewer)
+    {
+        format!(" VIEWER  │  {} ", viewer.label())
+    } else if let Some(viewer) = app
         .office_viewer
         .as_ref()
         .filter(|_| app.mode == Mode::OfficeViewer)
@@ -2904,6 +3069,21 @@ fn draw_status_bar<W: Write>(out: &mut W, app: &App, row: u16, width: u16) -> io
     let background = app.background_status();
     let background_label = background.as_ref().map(|(label, _)| label.as_str());
     let right = if let Some(viewer) = app
+        .visual_viewer
+        .as_ref()
+        .filter(|_| app.mode == Mode::OfficeViewer)
+    {
+        viewer
+            .frame
+            .as_ref()
+            .map(|frame| {
+                format!(
+                    " {} × {}  ",
+                    frame.transform.source_width, frame.transform.source_height
+                )
+            })
+            .unwrap_or_default()
+    } else if let Some(viewer) = app
         .office_viewer
         .as_ref()
         .filter(|_| app.mode == Mode::OfficeViewer)
@@ -4688,6 +4868,16 @@ pub fn hotkey_action_at(app: &App, width: u16, column: u16) -> Option<&'static s
 }
 
 fn hotkeys_for_app(app: &App) -> &'static [(&'static str, &'static str)] {
+    if app.mode == Mode::OfficeViewer && app.visual_viewer.is_some() {
+        return &[
+            ("+/-", "Zoom"),
+            ("F", "Fit page"),
+            ("W", "Fit width"),
+            ("↑↓←→", "Pan"),
+            ("PgUp/Dn", "Page"),
+            ("Esc", "Close"),
+        ];
+    }
     if app.lsp_panel.is_some() {
         return &[("↑↓", "Select"), ("Enter", "Open/Apply"), ("Esc", "Close")];
     }
@@ -5524,5 +5714,44 @@ mod tests {
         assert_eq!(secondary_cursor_cell("\t界x", 1, 4), (4, '界'));
         assert_eq!(secondary_cursor_cell("\t界x", 2, 4), (6, 'x'));
         assert_eq!(secondary_cursor_cell("\t界x", 3, 4), (7, ' '));
+    }
+
+    #[test]
+    fn visual_output_keeps_graphics_but_sanitizes_filenames_and_errors() {
+        let app = App::new(None).unwrap();
+        let mut viewer = crate::visual_viewer::VisualViewer::new(Path::new("hostile\x1b[2J.png"));
+        viewer.error = Some("bad\x1b]52;c;payload\x07image".into());
+        let area = OfficeViewerArea {
+            top: 2,
+            rows: 10,
+            x: 0,
+            width: 100,
+        };
+        let mut output = Vec::new();
+        draw_visual_viewer(&mut output, &app, &viewer, area).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("\x1b[2J"));
+        assert!(!output.contains("\x1b]52;"));
+        viewer.error = None;
+        viewer.frame = Some(crate::visual_viewer::Frame {
+            page: 0,
+            pages: 1,
+            transform: crate::visual_viewer::Transform {
+                width: 8,
+                height: 6,
+                left: 0,
+                top: 0,
+                pan_x: 0,
+                pan_y: 0,
+                source_width: 8,
+                source_height: 6,
+            },
+            lines: vec!["\x1bP0;1;0q\"1;1;8;6#0!8~\x1b\\".into()],
+        });
+        let mut output = Vec::new();
+        draw_visual_viewer(&mut output, &app, &viewer, area).unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains(&viewer.frame.as_ref().unwrap().lines[0]));
     }
 }

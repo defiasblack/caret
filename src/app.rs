@@ -34,6 +34,8 @@ use crate::{
 
 #[path = "app/persistence.rs"]
 mod persistence;
+#[path = "app/plugin_actions.rs"]
+mod plugin_actions;
 #[path = "app/settings.rs"]
 mod settings;
 
@@ -369,7 +371,33 @@ pub struct ProjectSearchState {
     pub confirm_replace: bool,
 }
 
+#[derive(Clone)]
+struct LspEditContext {
+    path: PathBuf,
+    stamp: (u64, u64),
+    cursor: Cursor,
+    anchor: Option<Cursor>,
+    documents: std::sync::Arc<[crate::tabs::DocumentState]>,
+}
+
+struct PluginTask {
+    document: u64,
+    path: Option<PathBuf>,
+    stamp: (u64, u64),
+    cursor: Cursor,
+    anchor: Option<Cursor>,
+    remaining: std::collections::VecDeque<String>,
+    arguments: Vec<String>,
+    event: String,
+    save: bool,
+    registry: PluginRegistry,
+}
+
 pub struct App {
+    persistence_worker: crate::persistence_worker::PersistenceWorker,
+    plugin_worker: crate::plugin::PluginWorker,
+    plugin_task: Option<PluginTask>,
+    plugin_quit_pending: bool,
     pub editor: Tabs,
     pub project: ProjectTree,
     pub explorer_focused: bool,
@@ -397,10 +425,18 @@ pub struct App {
     active_search: Option<CompiledSearch>,
     search_history: Vec<String>,
     search_history_index: Option<usize>,
+    search_root: Option<PathBuf>,
+    project_search_worker: crate::project_search::SearchWorker,
     pub project_search: ProjectSearchState,
     pub file_picker: FilePickerState,
     pub file_manager: FileManager,
     pub office_viewer: Option<OfficeViewer>,
+    pub office_loading: Option<PathBuf>,
+    pub visual_viewer: Option<crate::visual_viewer::VisualViewer>,
+    pub visual_painted: bool,
+    visual_loader: crate::visual_viewer::VisualLoader,
+    office_loader: crate::office_loader::OfficeLoader,
+    disk_monitor: crate::disk_monitor::DiskMonitor,
     manager_return_mode: Mode,
     manager_filter_active: bool,
     pub manager_confirmation: Option<ManagerConfirmation>,
@@ -453,6 +489,8 @@ pub struct App {
     lsp_restart_count: u8,
     lsp_version: i64,
     lsp_requests: HashMap<u64, String>,
+    lsp_edit_contexts: HashMap<u64, LspEditContext>,
+    lsp_panel_origin: Option<LspEditContext>,
     lsp_format_requests: HashMap<u64, (PathBuf, String)>,
     lsp_initialized: bool,
     lsp_workspace_ready: bool,
@@ -596,7 +634,7 @@ impl App {
         };
         let special_viewer_path = editor_path
             .as_ref()
-            .filter(|path| office_viewer::supports(path))
+            .filter(|path| office_viewer::supports(path) || crate::visual_viewer::supports(path))
             .cloned();
         if special_viewer_path.is_some() {
             editor_path = None;
@@ -651,25 +689,28 @@ impl App {
         } else {
             editor_mode
         };
-        let initial_theme = if std::env::var_os("NO_COLOR").is_some() {
-            ThemeKind::Mono
-        } else {
-            settings.theme
-        };
-        let custom_theme = if std::env::var_os("NO_COLOR").is_none() {
-            settings
-                .custom_theme
-                .as_ref()
-                .and_then(|name| plugins.theme(name).map(|theme| (name.clone(), theme)))
-        } else {
-            None
-        };
+        // A saved theme is an explicit user preference and takes precedence
+        // over a launcher's environment. Keep NO_COLOR for unconfigured starts.
+        let initial_theme =
+            if std::env::var_os("NO_COLOR").is_some() && !config::config_path().is_file() {
+                ThemeKind::Mono
+            } else {
+                settings.theme
+            };
+        let custom_theme = settings
+            .custom_theme
+            .as_ref()
+            .and_then(|name| plugins.theme(name).map(|theme| (name.clone(), theme)));
         let initial_rendered_theme = custom_theme
             .as_ref()
             .map_or_else(|| Theme::for_kind(initial_theme), |(_, theme)| *theme);
         let initial_custom_name = custom_theme.as_ref().map(|(name, _)| name.clone());
 
         let mut app = Self {
+            persistence_worker: crate::persistence_worker::PersistenceWorker::new(),
+            plugin_worker: crate::plugin::worker(),
+            plugin_task: None,
+            plugin_quit_pending: false,
             editor,
             project,
             explorer_focused,
@@ -697,10 +738,18 @@ impl App {
             active_search: None,
             search_history: Vec::new(),
             search_history_index: None,
+            search_root: None,
+            project_search_worker: crate::project_search::search_worker(),
             project_search: ProjectSearchState::default(),
             file_picker: FilePickerState::default(),
             file_manager,
             office_viewer: None,
+            office_loading: None,
+            visual_viewer: None,
+            visual_painted: false,
+            visual_loader: crate::visual_viewer::VisualLoader::default(),
+            office_loader: crate::office_loader::OfficeLoader::default(),
+            disk_monitor: crate::disk_monitor::DiskMonitor::new(),
             manager_return_mode: editor_mode,
             manager_filter_active: false,
             manager_confirmation: None,
@@ -763,6 +812,8 @@ impl App {
             lsp_restart_count: 0,
             lsp_version: 1,
             lsp_requests: HashMap::new(),
+            lsp_edit_contexts: HashMap::new(),
+            lsp_panel_origin: None,
             lsp_format_requests: HashMap::new(),
             lsp_initialized: false,
             lsp_workspace_ready: false,
@@ -822,11 +873,9 @@ impl App {
                     scroll_line: state.scroll_line,
                     scroll_column: state.scroll_column,
                 };
-                (split.primary.tab_index < app.editor.len()
-                    && split.secondary.tab_index < app.editor.len())
-                .then(|| SplitViews {
-                    primary: view(split.primary),
-                    secondary: view(split.secondary),
+                Some(SplitViews {
+                    primary: view(app.editor.restored_view(split.primary, &session.tabs)?),
+                    secondary: view(app.editor.restored_view(split.secondary, &session.tabs)?),
                     secondary_active: split.secondary_active,
                     vertical: split.vertical,
                 })
@@ -882,12 +931,8 @@ impl App {
 
     fn checkpoint_persistence(&mut self) {
         if self.last_recovery_checkpoint.elapsed() >= Duration::from_secs(2) {
-            let entries = self.editor.dirty_recovery_entries();
-            if entries.is_empty() {
-                let _ = crate::recovery::discard_current();
-            } else if let Err(error) = crate::recovery::save(entries) {
-                self.message = format!("Recovery checkpoint failed: {error}");
-            }
+            self.persistence_worker
+                .recovery(self.editor.recovery_snapshots());
             self.last_recovery_checkpoint = Instant::now();
         }
         if let Err(error) = self.checkpoint_session(false) {
@@ -896,27 +941,38 @@ impl App {
     }
 
     fn current_session_state(&self) -> crate::session::SessionState {
+        let exported = self.editor.export_session();
         crate::session::SessionState {
             project_root: self.project.root.clone(),
-            tabs: self.editor.session_tabs(),
-            active_tab: self.editor.active_index(),
+            tabs: exported.tabs,
+            active_tab: exported.active,
             sidebar_visible: self.project.visible,
             sidebar_outline: self.sidebar_view == SidebarView::Outline,
-            split: self.split_views.map(|split| crate::session::SplitState {
-                primary: crate::session::ViewState {
-                    tab_index: split.primary.tab_index,
-                    cursor: split.primary.cursor.into(),
-                    scroll_line: split.primary.scroll_line,
-                    scroll_column: split.primary.scroll_column,
-                },
-                secondary: crate::session::ViewState {
-                    tab_index: split.secondary.tab_index,
-                    cursor: split.secondary.cursor.into(),
-                    scroll_line: split.secondary.scroll_line,
-                    scroll_column: split.secondary.scroll_column,
-                },
-                secondary_active: split.secondary_active,
-                vertical: split.vertical,
+            split: self.split_views.and_then(|split| {
+                Some(crate::session::SplitState {
+                    primary: crate::session::ViewState {
+                        tab_index: exported
+                            .index_map
+                            .get(split.primary.tab_index)
+                            .copied()
+                            .flatten()?,
+                        cursor: split.primary.cursor.into(),
+                        scroll_line: split.primary.scroll_line,
+                        scroll_column: split.primary.scroll_column,
+                    },
+                    secondary: crate::session::ViewState {
+                        tab_index: exported
+                            .index_map
+                            .get(split.secondary.tab_index)
+                            .copied()
+                            .flatten()?,
+                        cursor: split.secondary.cursor.into(),
+                        scroll_line: split.secondary.scroll_line,
+                        scroll_column: split.secondary.scroll_column,
+                    },
+                    secondary_active: split.secondary_active,
+                    vertical: split.vertical,
+                })
             }),
             file_manager: Some(
                 self.file_manager
@@ -934,10 +990,13 @@ impl App {
 
         let session = self.current_session_state();
         if self.last_session_state.as_ref() != Some(&session) {
-            crate::session::save(&session)?;
+            self.persistence_worker.session(session.clone());
             self.last_session_state = Some(session);
         }
         self.last_session_checkpoint = Instant::now();
+        if force {
+            self.persistence_worker.flush()?;
+        }
         Ok(())
     }
 
@@ -1087,7 +1146,53 @@ impl App {
 
     pub fn poll_background(&mut self) -> bool {
         let message = self.message.clone();
+        if let Some(error) = self.persistence_worker.poll_error() {
+            self.last_session_state = None;
+            self.message = error;
+        }
         let mut changed = self.file_manager.poll();
+        changed |= self.poll_plugin();
+        if let Some(results) = self.project_search_worker.poll().filter(|_| {
+            self.search_root.as_ref() == Some(&self.project.root)
+                && self.project_search.query == self.project_search.ran_query
+        }) {
+            self.project_search.results = results.matches;
+            self.project_search.truncated = results.truncated;
+            self.project_search.files_with_matches = results.files_with_matches;
+            self.message = format!(
+                "Found {} project match(es)",
+                self.project_search.results.len()
+            );
+            changed = true;
+        }
+        if let Some((request, result)) = self.visual_loader.poll() {
+            if let Some(viewer) = self.visual_viewer.as_mut() {
+                if viewer.accept(request, result) {
+                    self.message = if viewer.error.is_some() {
+                        "Could not render this file; see the viewer error above".into()
+                    } else {
+                        viewer.label()
+                    };
+                    changed = true;
+                }
+            }
+        }
+        if let Some(result) = self.office_loader.poll() {
+            self.office_loading = None;
+            match result {
+                Ok(viewer) => {
+                    self.message = format!("Opened {} in Caret", viewer.path.display());
+                    self.office_viewer = Some(viewer);
+                }
+                Err(error) => {
+                    self.message = format!("Could not load Office document: {error}");
+                    if self.mode == Mode::OfficeViewer {
+                        self.mode = self.preferred_editor_mode();
+                    }
+                }
+            }
+            changed = true;
+        }
         if let Some(summary) = self.file_manager.last_operation.clone() {
             if summary.id != self.handled_manager_operation {
                 self.handled_manager_operation = summary.id;
@@ -1100,11 +1205,15 @@ impl App {
         }
         self.poll_lsp();
         self.checkpoint_persistence();
-        if self.mode != Mode::ReloadConfirm && self.editor.changed_on_disk() {
+        if let Some(observed) = self
+            .disk_monitor
+            .poll(&self.editor)
+            .filter(|_| self.mode != Mode::ReloadConfirm)
+        {
             // Record the conflict immediately. Choosing "Later" must not
             // acknowledge the new disk version and silently allow a later
             // save to overwrite it.
-            self.editor.keep_disk_change();
+            self.editor.keep_disk_state(observed);
             self.mode = Mode::ReloadConfirm;
             self.message =
                 "File changed on disk — [R] Reload   [K] Keep buffer   [C] Compare   [Esc] Later"
@@ -1762,31 +1871,31 @@ impl App {
             return;
         }
 
+        let Some(pane) = crate::ui::editor_panes(self, width, height)
+            .into_iter()
+            .find(|pane| pane.contains(column as u16, row))
+        else {
+            return;
+        };
         if let Some(mut views) = self.split_views {
-            views.secondary_active = if views.vertical {
-                column > layout.editor_x + layout.editor_width.saturating_sub(1) / 2
-            } else {
-                row > layout.content_top + layout.content_height.saturating_sub(1) as u16 / 2
-            };
+            views.secondary_active = pane.secondary;
             self.split_views = Some(views);
             self.activate_focused_view();
         }
-
         let before = self.current_location();
         self.explorer_focused = false;
         self.follow_cursor = true;
         self.mode = self.preferred_editor_mode();
         self.pending_key = None;
 
-        let screen_row = (row - layout.content_top) as usize;
+        let screen_row = (row - pane.top) as usize;
         let line = self
             .editor
             .visible_line_at(self.editor.scroll_line, screen_row)
             .unwrap_or_else(|| self.editor.line_count().saturating_sub(1));
-        let local_x = column.saturating_sub(layout.editor_x);
-        let clicked_fold_control = layout.gutter_width >= 2
-            && local_x >= layout.gutter_width.saturating_sub(2)
-            && local_x < layout.gutter_width;
+        let local_x = column.saturating_sub(pane.x);
+        let clicked_fold_control =
+            pane.gutter >= 2 && local_x >= pane.gutter.saturating_sub(2) && local_x < pane.gutter;
 
         if clicked_fold_control {
             self.editor.clear_selection();
@@ -1798,10 +1907,10 @@ impl App {
             return;
         }
 
-        let display_column = if local_x < layout.gutter_width {
+        let display_column = if local_x < pane.gutter {
             0
         } else {
-            self.editor.scroll_column + local_x - layout.gutter_width
+            self.editor.scroll_column + local_x - pane.gutter
         };
 
         let multi_cursor_modifier = if self.settings.multi_cursor_ctrl_click {
@@ -1878,32 +1987,29 @@ impl App {
     }
 
     fn handle_editor_drag(&mut self, column: u16, row: u16, width: u16, height: u16) {
-        let layout = crate::ui::screen_layout(self, width, height);
-        let content_end = layout.content_top as usize + layout.content_height;
-        let column = column as usize;
-        if row < layout.content_top
-            || row as usize >= content_end
-            || column < layout.editor_x
-            || column >= layout.editor_x + layout.editor_width
-        {
+        let secondary = self.split_views.is_some_and(|views| views.secondary_active);
+        let Some(pane) = crate::ui::editor_panes(self, width, height)
+            .into_iter()
+            .find(|pane| pane.secondary == secondary && pane.contains(column, row))
+        else {
             return;
-        }
-
+        };
+        let column = column as usize;
         self.explorer_focused = false;
         self.follow_cursor = true;
         self.mode = self.preferred_editor_mode();
         self.editor.finish_undo_group();
         self.editor.begin_selection();
-        let screen_row = (row - layout.content_top) as usize;
+        let screen_row = (row - pane.top) as usize;
         let line = self
             .editor
             .visible_line_at(self.editor.scroll_line, screen_row)
             .unwrap_or_else(|| self.editor.line_count().saturating_sub(1));
-        let local_x = column - layout.editor_x;
-        let display_column = if local_x < layout.gutter_width {
+        let local_x = column - pane.x;
+        let display_column = if local_x < pane.gutter {
             0
         } else {
-            self.editor.scroll_column + local_x - layout.gutter_width
+            self.editor.scroll_column + local_x - pane.gutter
         };
         self.editor
             .set_cursor_from_display_position(line, display_column);
@@ -2143,13 +2249,33 @@ impl App {
         } else {
             views.primary
         };
-        self.editor.select(view.tab_index);
+        if !self.editor.select(view.tab_index) {
+            return;
+        }
+        let cursor_changed = self.editor.cursor != view.cursor;
+        if cursor_changed {
+            self.editor.clear_selection();
+        }
         self.editor.cursor = view.cursor;
-        self.editor.scroll_line = view.scroll_line;
+        self.editor.cursor.line = self
+            .editor
+            .cursor
+            .line
+            .min(self.editor.line_count().saturating_sub(1));
+        if cursor_changed {
+            self.editor.cursor.column = self
+                .editor
+                .cursor
+                .column
+                .min(self.editor.line_len_chars(self.editor.cursor.line));
+        }
+        self.editor.scroll_line = view
+            .scroll_line
+            .min(self.editor.line_count().saturating_sub(1));
         self.editor.scroll_column = view.scroll_column;
     }
 
-    fn sync_focused_view(&mut self) {
+    pub(crate) fn sync_focused_view(&mut self) {
         let Some(mut views) = self.split_views else {
             return;
         };
@@ -2270,6 +2396,12 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.plugin_quit_pending && key.code == KeyCode::Esc {
+            self.plugin_quit_pending = false;
+            self.message = "Quit cancelled; save hooks continue in the background".to_string();
+            return;
+        }
+
         // Quit confirmation gets first chance at every key so terminal/editor
         // shortcuts cannot accidentally dismiss or bypass the prompt.
         if self.mode == Mode::QuitConfirm {
@@ -3141,7 +3273,7 @@ impl App {
             .sum()
     }
 
-    fn available_fold_ranges(&self) -> Vec<(usize, usize)> {
+    fn available_fold_ranges(&self) -> std::sync::Arc<[(usize, usize)]> {
         self.editor.syntax_fold_ranges()
     }
 
@@ -3155,7 +3287,7 @@ impl App {
     }
 
     pub fn outline_symbols(&self) -> Vec<crate::syntax::Symbol> {
-        self.editor.syntax_symbols()
+        self.editor.syntax_symbols().to_vec()
     }
 
     fn show_symbols(&mut self) {
@@ -3164,7 +3296,7 @@ impl App {
             "No symbols in this file".to_string()
         } else {
             symbols
-                .into_iter()
+                .iter()
                 .take(8)
                 .map(|symbol| format!("{}:{}", symbol.name, symbol.start_line + 1))
                 .collect::<Vec<_>>()
@@ -3906,8 +4038,38 @@ impl App {
     }
 
     fn close_active_tab(&mut self, force: bool) {
+        let closed = self.editor.active_index();
         match self.editor.close_active(force) {
             Ok(title) => {
+                if let Some(mut views) = self.split_views {
+                    for view in [&mut views.primary, &mut views.secondary] {
+                        if view.tab_index == closed {
+                            *view = EditorView {
+                                tab_index: self.editor.active_index(),
+                                cursor: self.editor.cursor,
+                                scroll_line: self.editor.scroll_line,
+                                scroll_column: self.editor.scroll_column,
+                            };
+                        } else if view.tab_index > closed {
+                            view.tab_index -= 1;
+                        }
+                        if let Some(editor) = self.editor.editor_at(view.tab_index) {
+                            view.cursor.line =
+                                view.cursor.line.min(editor.line_count().saturating_sub(1));
+                            view.cursor.column = view
+                                .cursor
+                                .column
+                                .min(editor.line_len_chars(view.cursor.line));
+                            view.scroll_line =
+                                view.scroll_line.min(editor.line_count().saturating_sub(1));
+                            view.scroll_column = view
+                                .scroll_column
+                                .min(editor.line_len_chars(view.cursor.line));
+                        }
+                    }
+                    self.split_views = Some(views);
+                    self.activate_focused_view();
+                }
                 self.pending_key = None;
                 self.search_origin = self.editor.cursor;
                 self.mode = self.preferred_editor_mode();
@@ -4330,24 +4492,44 @@ impl App {
         }
         let path = entry.path.clone();
         if !self.open_office_document(&path) {
-            self.message = "Use v with a .docx or .xlsx document".to_string();
+            self.message = "Use v with a PDF, image, document, or spreadsheet".to_string();
         }
     }
 
     fn open_office_document(&mut self, path: &Path) -> bool {
+        if crate::visual_viewer::supports(path) {
+            self.office_loader.cancel();
+            self.visual_loader.cancel();
+            self.office_viewer = None;
+            self.office_loading = None;
+            self.visual_viewer = Some(crate::visual_viewer::VisualViewer::new(path));
+            self.split_views = None;
+            self.explorer_focused = false;
+            self.terminal_focused = false;
+            self.mode = Mode::OfficeViewer;
+            self.message = "Opening visual viewer · Esc closes".into();
+            return true;
+        }
         if !office_viewer::supports(path) {
             return false;
         }
-        match OfficeViewer::open(path) {
-            Ok(viewer) => {
-                self.office_viewer = Some(viewer);
+        self.visual_loader.cancel();
+        self.visual_viewer = None;
+        match self.office_loader.start(path) {
+            Ok(()) => {
+                self.office_viewer = None;
+                self.office_loading = Some(path.to_path_buf());
                 self.split_views = None;
                 self.explorer_focused = false;
                 self.terminal_focused = false;
                 self.mode = Mode::OfficeViewer;
-                self.message = format!("Opened {} in Caret", path.display());
+                self.message = format!("Loading {} · Esc cancels", path.display());
             }
             Err(error) => {
+                self.office_loading = None;
+                if self.mode == Mode::OfficeViewer && self.office_viewer.is_none() {
+                    self.mode = self.preferred_editor_mode();
+                }
                 self.message = format!("Could not open {}: {error}", path.display());
             }
         }
@@ -4355,11 +4537,41 @@ impl App {
     }
 
     fn handle_office_viewer_key(&mut self, key: KeyEvent) {
+        if let Some(viewer) = self.visual_viewer.as_mut() {
+            if viewer.handle_key(key) {
+                self.visual_loader.cancel();
+                self.visual_viewer = None;
+                self.mode = self.preferred_editor_mode();
+                self.message = "Closed visual viewer".into();
+            }
+            return;
+        }
+        if self.office_loading.is_some() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.office_loader.cancel();
+                self.office_loading = None;
+                self.mode = self.preferred_editor_mode();
+                self.message = "Office loading cancelled".into();
+            }
+            return;
+        }
         let Some(viewer) = self.office_viewer.as_mut() else {
             self.mode = self.preferred_editor_mode();
             return;
         };
-        let action = viewer.handle_key(key, self.viewport_rows.saturating_sub(3));
+        let page_rows = match &viewer.content {
+            OfficeContent::Spreadsheet(_) => {
+                office_viewer::ViewerViewport::spreadsheet(
+                    self.viewport_rows,
+                    self.viewport_columns,
+                )
+                .rows
+            }
+            OfficeContent::Document(_) => {
+                office_viewer::ViewerViewport::document(self.viewport_rows).rows
+            }
+        };
+        let action = viewer.handle_key(key, page_rows);
         let status = viewer.status.clone();
         match action {
             ViewerAction::None => {
@@ -4383,6 +4595,33 @@ impl App {
     }
 
     fn handle_office_viewer_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) {
+        let layout = crate::ui::screen_layout(self, width, height);
+        if let Some(viewer) = self.visual_viewer.as_mut() {
+            if mouse.column < layout.editor_x as u16
+                || mouse.row <= layout.content_top
+                || usize::from(mouse.row)
+                    >= usize::from(layout.content_top) + layout.content_height.saturating_sub(1)
+            {
+                return;
+            }
+            let code = match mouse.kind {
+                MouseEventKind::ScrollUp if mouse.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(KeyCode::Char('+'))
+                }
+                MouseEventKind::ScrollDown if mouse.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(KeyCode::Char('-'))
+                }
+                MouseEventKind::ScrollUp => Some(KeyCode::Up),
+                MouseEventKind::ScrollDown => Some(KeyCode::Down),
+                MouseEventKind::ScrollLeft => Some(KeyCode::Left),
+                MouseEventKind::ScrollRight => Some(KeyCode::Right),
+                _ => None,
+            };
+            if let Some(code) = code {
+                viewer.handle_key(KeyEvent::from(code));
+            }
+            return;
+        }
         let navigation = match mouse.kind {
             MouseEventKind::ScrollUp => Some(KeyCode::Up),
             MouseEventKind::ScrollDown => Some(KeyCode::Down),
@@ -4430,6 +4669,17 @@ impl App {
                     viewer.status = format!("Line {} selected", line + 1);
                 }
             }
+        }
+    }
+
+    pub fn prepare_visual_viewer(&mut self, columns: usize, rows: usize) {
+        if let Some(viewer) = self.visual_viewer.as_mut() {
+            viewer.prepare(
+                columns,
+                rows,
+                crate::visual_viewer::cell_size(),
+                &mut self.visual_loader,
+            );
         }
     }
 
@@ -6015,6 +6265,7 @@ impl App {
     }
 
     fn run_project_search(&mut self) {
+        self.project_search_worker.cancel();
         self.project_search.results.clear();
         self.project_search.excluded.clear();
         self.project_search.selected = 0;
@@ -6036,10 +6287,14 @@ impl App {
             }
         };
         let limit = self.settings.max_search_results.max(50);
-        let results = crate::project_search::search(&self.project.root, &search, limit);
-        self.project_search.results = results.matches;
-        self.project_search.truncated = results.truncated;
-        self.project_search.files_with_matches = results.files_with_matches;
+        self.search_root = Some(self.project.root.clone());
+        self.project_search_worker
+            .submit(crate::project_search::SearchRequest {
+                root: self.project.root.clone(),
+                query: search,
+                limit,
+            });
+        self.message = "Searching project…".to_string();
     }
 
     fn open_selected_project_match(&mut self) {
@@ -6123,15 +6378,13 @@ impl App {
                 skipped_dirty += 1;
                 continue;
             }
-            let excluded: std::collections::HashSet<(usize, usize)> = self
-                .project_search
-                .excluded
+            let matches: Vec<_> = included
                 .iter()
-                .filter_map(|index| self.project_search.results.get(*index))
+                .map(|index| &self.project_search.results[*index])
                 .filter(|found| found.path == path)
-                .map(|found| (found.line, found.byte_start))
+                .cloned()
                 .collect();
-            match crate::project_search::replace_in_file(&path, &search, &replacement, &excluded) {
+            match crate::project_search::replace_previewed(&path, &search, &replacement, &matches) {
                 Ok(count) if count > 0 => {
                     replaced += count;
                     changed_files += 1;
@@ -6161,8 +6414,8 @@ impl App {
         if errors > 0 {
             summary.push_str(&format!(" · {errors} file(s) failed"));
         }
-        self.message = summary;
         self.run_project_search();
+        self.message = summary;
     }
 
     fn handle_command_input(&mut self, key: KeyEvent) {
@@ -7318,6 +7571,8 @@ impl App {
 
     fn start_lsp_for_active_document(&mut self, automatic: bool) {
         self.lsp_requests.clear();
+        self.lsp_edit_contexts.clear();
+        self.lsp_panel_origin = None;
         self.lsp_format_requests.clear();
         self.lsp_panel = None;
         self.lsp_status = LspStatus::Off;
@@ -7383,6 +7638,8 @@ impl App {
         self.lsp_started_at = None;
         self.lsp_open_path = None;
         self.lsp_requests.clear();
+        self.lsp_edit_contexts.clear();
+        self.lsp_panel_origin = None;
         self.lsp_format_requests.clear();
         self.diagnostic_count = 0;
         self.diagnostics.clear();
@@ -7419,6 +7676,25 @@ impl App {
         let Some(item) = panel.items.get(panel.selected).cloned() else {
             return;
         };
+        if matches!(
+            panel.kind,
+            LspPanelKind::CodeActions | LspPanelKind::Completion
+        ) {
+            if let Some(context) = self.lsp_panel_origin.take() {
+                let changed = self.editor.path.as_ref() != Some(&context.path)
+                    || self.editor.stamp() != context.stamp
+                    || (matches!(panel.kind, LspPanelKind::Completion)
+                        && (self.editor.cursor != context.cursor
+                            || self.editor.selection_anchor != context.anchor))
+                    || (matches!(panel.kind, LspPanelKind::CodeActions)
+                        && !self.editor.matches_document_states(&context.documents));
+                if changed {
+                    self.message =
+                        "LSP action ignored: document, cursor, or selection changed".to_string();
+                    return;
+                }
+            }
+        }
         match panel.kind {
             LspPanelKind::Completion => self.apply_lsp_completion(&item.payload),
             LspPanelKind::Locations | LspPanelKind::Diagnostics => {
@@ -7495,6 +7771,9 @@ impl App {
             Ok(id) => {
                 self.lsp_requests
                     .insert(id, "textDocument/rename".to_string());
+                if let Some(path) = self.editor.path.clone() {
+                    self.lsp_edit_contexts.insert(id, self.lsp_context(path));
+                }
                 self.message = format!("Renaming symbol to {new_name}…");
             }
             Err(error) => self.message = error,
@@ -7610,55 +7889,100 @@ impl App {
     }
 
     fn apply_workspace_edit(&mut self, edit: &Value) -> Result<usize, String> {
-        let mut documents = Vec::<(String, Vec<Value>)>::new();
+        let mut documents = Vec::<(String, Vec<Value>, Option<i64>)>::new();
         if let Some(changes) = edit["changes"].as_object() {
             for (uri, edits) in changes {
-                documents.push((uri.clone(), edits.as_array().cloned().unwrap_or_default()));
+                documents.push((
+                    uri.clone(),
+                    edits.as_array().ok_or("Invalid LSP edits")?.clone(),
+                    None,
+                ));
             }
         }
         if let Some(changes) = edit["documentChanges"].as_array() {
             for change in changes {
-                if let (Some(uri), Some(edits)) = (
-                    change["textDocument"]["uri"].as_str(),
-                    change["edits"].as_array(),
-                ) {
-                    documents.push((uri.to_string(), edits.clone()));
-                }
+                let uri = change["textDocument"]["uri"]
+                    .as_str()
+                    .ok_or("Unsupported LSP resource operation")?;
+                let edits = change["edits"].as_array().ok_or("Invalid LSP edits")?;
+                let version = if change["textDocument"]["version"].is_null() {
+                    None
+                } else {
+                    Some(
+                        change["textDocument"]["version"]
+                            .as_i64()
+                            .ok_or("Invalid LSP document version")?,
+                    )
+                };
+                documents.push((uri.to_owned(), edits.clone(), version));
             }
         }
-        let mut applied = 0;
-        for (uri, edits) in documents {
+        let mut seen = std::collections::HashSet::new();
+        let mut prepared = Vec::new();
+        // Validate the complete response before changing any buffer or file.
+        for (uri, edits, version) in documents {
             let path =
                 lsp::path_from_uri(&uri).ok_or_else(|| format!("Unsupported LSP URI: {uri}"))?;
+            if !seen.insert(lsp::file_uri(&path)) {
+                return Err("Duplicate LSP document edits".to_string());
+            }
+            if let Some(version) = version {
+                let tracked = self
+                    .lsp_open_path
+                    .as_ref()
+                    .is_some_and(|open| lsp::file_uri(open) == lsp::file_uri(&path));
+                if !tracked || version != self.lsp_version {
+                    return Err(format!(
+                        "LSP edit rejected: stale or unverifiable version for {}",
+                        path.display()
+                    ));
+                }
+                if self
+                    .editor
+                    .editor_for_path_mut(&path)
+                    .is_none_or(|editor| editor.text() != self.lsp_last_text)
+                {
+                    return Err(
+                        "LSP edit rejected: document changed since synchronization".to_string()
+                    );
+                }
+            }
             if let Some(editor) = self.editor.editor_for_path_mut(&path) {
-                let text = apply_lsp_text_edits(&editor.text(), &edits)
-                    .ok_or_else(|| format!("Invalid text edits for {}", path.display()))?;
-                editor.replace_text(&text);
+                let text = apply_lsp_text_edits(&editor.text(), &edits).ok_or_else(|| {
+                    format!("Invalid or overlapping LSP edits for {}", path.display())
+                })?;
+                prepared.push((path, text, None));
             } else {
-                let expected_fingerprint = crate::document::fingerprint(&path)
-                    .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
-                let (text, format) = crate::document::read_text(&path)
-                    .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
-                let text = apply_lsp_text_edits(&text, &edits)
-                    .ok_or_else(|| format!("Invalid text edits for {}", path.display()))?;
-                let mut bytes = Vec::with_capacity(text.len() + 3);
-                if format.utf8_bom {
+                let snapshot =
+                    crate::document::read_snapshot(&path).map_err(|error| error.to_string())?;
+                let text = apply_lsp_text_edits(&snapshot.text, &edits)
+                    .ok_or("Invalid or overlapping LSP edits")?;
+                prepared.push((path, text, Some(snapshot)));
+            }
+        }
+        let count = prepared.len();
+        for (path, text, snapshot) in prepared {
+            if let Some(snapshot) = snapshot {
+                let mut bytes = Vec::new();
+                if snapshot.format.utf8_bom {
                     bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
                 }
                 bytes.extend_from_slice(text.as_bytes());
-                crate::document::atomic_write_if_unchanged(
+                crate::document::atomic_write_resolved(
                     &path,
-                    Some(expected_fingerprint),
+                    &snapshot.resolved_path,
+                    Some(Some(snapshot.fingerprint)),
                     &bytes,
                 )
                 .map_err(|error| format!("Could not update {}: {error}", path.display()))?;
+            } else if let Some(editor) = self.editor.editor_for_path_mut(&path) {
+                editor.replace_text(&text);
             }
-            applied += 1;
         }
         let _ = self.project.refresh();
         self.project.request_git_refresh();
         self.refresh_git_line_changes();
-        Ok(applied)
+        Ok(count)
     }
 
     fn request_hover(&mut self) {
@@ -7692,6 +8016,16 @@ impl App {
                 self.message = "Hover requested".to_string();
             }
             Err(error) => self.message = format!("Hover request failed: {error}"),
+        }
+    }
+
+    fn lsp_context(&self, path: PathBuf) -> LspEditContext {
+        LspEditContext {
+            path,
+            stamp: self.editor.stamp(),
+            cursor: self.editor.cursor,
+            anchor: self.editor.selection_anchor,
+            documents: self.editor.document_states().into(),
         }
     }
 
@@ -7786,6 +8120,9 @@ impl App {
             }) {
             Ok(id) => {
                 self.lsp_requests.insert(id, method.to_string());
+                if let Some(path) = self.editor.path.clone() {
+                    self.lsp_edit_contexts.insert(id, self.lsp_context(path));
+                }
                 self.message = format!("LSP request: {method}");
             }
             Err(error) => self.message = error,
@@ -7850,6 +8187,8 @@ impl App {
             Some(id) => {
                 self.lsp_requests
                     .insert(id, "textDocument/rangeFormatting".to_string());
+                self.lsp_edit_contexts
+                    .insert(id, self.lsp_context(path.clone()));
                 self.lsp_format_requests.insert(id, (path, requested_text));
                 self.message = "Selection formatting requested".to_string();
             }
@@ -7880,6 +8219,8 @@ impl App {
             Ok(id) => {
                 self.lsp_requests
                     .insert(id, "textDocument/formatting".to_string());
+                self.lsp_edit_contexts
+                    .insert(id, self.lsp_context(path.clone()));
                 self.lsp_format_requests.insert(id, (path, requested_text));
                 self.message = "LSP formatting requested".to_string();
             }
@@ -7908,6 +8249,8 @@ impl App {
             self.lsp_workspace_ready = false;
             self.lsp_open_path = None;
             self.lsp_requests.clear();
+            self.lsp_edit_contexts.clear();
+            self.lsp_panel_origin = None;
             self.lsp_format_requests.clear();
             if !self.lsp_auto_disabled && self.lsp_restart_count < 3 {
                 self.lsp_restart_count += 1;
@@ -7986,6 +8329,36 @@ impl App {
         let response_id = message.get("id").and_then(|id| id.as_u64());
         let request = response_id.and_then(|id| self.lsp_requests.remove(&id));
         let format_request = response_id.and_then(|id| self.lsp_format_requests.remove(&id));
+        let origin = response_id.and_then(|id| self.lsp_edit_contexts.remove(&id));
+        if let Some(context) = origin.as_ref() {
+            let changed = self
+                .editor
+                .editor_for_path_mut(&context.path)
+                .is_none_or(|editor| editor.stamp() != context.stamp);
+            let workspace_changed = matches!(
+                request.as_deref(),
+                Some("textDocument/codeAction" | "textDocument/rename")
+            ) && !self.editor.matches_document_states(&context.documents);
+            let panel_moved = matches!(
+                request.as_deref(),
+                Some("textDocument/codeAction" | "textDocument/completion")
+            ) && (self.editor.path.as_ref() != Some(&context.path)
+                || (request.as_deref() == Some("textDocument/completion")
+                    && (self.editor.cursor != context.cursor
+                        || self.editor.selection_anchor != context.anchor)));
+            if changed || workspace_changed || panel_moved {
+                self.message =
+                    "LSP result ignored: document or cursor changed while request was running"
+                        .to_string();
+                return;
+            }
+        }
+        if matches!(
+            request.as_deref(),
+            Some("textDocument/codeAction" | "textDocument/completion")
+        ) {
+            self.lsp_panel_origin = origin;
+        }
         if message.get("id").and_then(|id| id.as_u64()) == Some(1) {
             if message.get("error").is_some() {
                 self.lsp_status = LspStatus::Error;
@@ -8281,44 +8654,8 @@ impl App {
                 path.display()
             ));
         }
-        let mut text = requested_text.to_string();
-        let mut changes = Vec::new();
-        for edit in edits {
-            let Some(replacement) = edit["newText"].as_str() else {
-                continue;
-            };
-            let range = &edit["range"];
-            let Some(start_line) = range["start"]["line"].as_u64() else {
-                continue;
-            };
-            let Some(start_character) = range["start"]["character"].as_u64() else {
-                continue;
-            };
-            let Some(end_line) = range["end"]["line"].as_u64() else {
-                continue;
-            };
-            let Some(end_character) = range["end"]["character"].as_u64() else {
-                continue;
-            };
-            let Some(start) = lsp_text_offset(&text, start_line as usize, start_character as usize)
-            else {
-                continue;
-            };
-            let Some(end) = lsp_text_offset(&text, end_line as usize, end_character as usize)
-            else {
-                continue;
-            };
-            changes.push((start, end, replacement.to_string()));
-        }
-        changes.sort_by_key(|(start, _, _)| *start);
-        if changes.is_empty() {
-            return Ok(false);
-        }
-        for (start, end, replacement) in changes.into_iter().rev() {
-            if start <= end && end <= text.len() {
-                text.replace_range(start..end, &replacement);
-            }
-        }
+        let text = apply_lsp_text_edits(requested_text, edits)
+            .ok_or("Formatting rejected: invalid or overlapping edits")?;
         if text == requested_text {
             return Ok(false);
         }
@@ -8327,88 +8664,6 @@ impl App {
             .save()
             .map_err(|error| format!("Formatted but save failed: {error}"))?;
         Ok(true)
-    }
-
-    fn plugin_context(&self, arguments: Vec<String>, event: &str) -> PluginContext {
-        PluginContext {
-            project: self.project.root.display().to_string(),
-            file: self
-                .editor
-                .path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            language: self.language_name(),
-            text: self.editor.text(),
-            selection: self.editor.selected_text(),
-            cursor_line: self.editor.cursor.line,
-            cursor_column: self.editor.cursor.column,
-            arguments,
-            event: event.to_string(),
-        }
-    }
-
-    fn run_plugin_command(&mut self, name: &str, arguments: Vec<String>, event: &str) {
-        let context = self.plugin_context(arguments, event);
-        match self.plugins.run(name, &context) {
-            Ok(response) => self.apply_plugin_response(response),
-            Err(error) => self.message = error,
-        }
-    }
-
-    fn apply_plugin_response(&mut self, response: PluginResponse) {
-        if let Some(text) = response.replace_document {
-            self.editor.replace_text(&text);
-        } else if let Some(text) = response.replace_selection {
-            if self.editor.selection_range().is_some() {
-                self.editor.checkpoint();
-                self.editor.delete_selection();
-                self.editor.insert_text(&text);
-            } else {
-                self.message =
-                    "Plugin requested replace_selection, but nothing is selected".to_string();
-            }
-        } else if let Some(text) = response.insert_text {
-            self.editor.checkpoint();
-            self.editor.delete_selection();
-            self.editor.insert_text(&text);
-        }
-
-        if let Some(path) = response.open {
-            let path = PathBuf::from(path);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                self.project.root.join(path)
-            };
-            match self.editor.open_or_switch(&path) {
-                Ok(_) => {
-                    self.explorer_focused = false;
-                    self.mode = self.preferred_editor_mode();
-                    self.after_tab_switch();
-                }
-                Err(error) => {
-                    self.message = format!("Plugin could not open {}: {error}", path.display())
-                }
-            }
-        }
-        if let Some(message) = response.message {
-            self.message = message;
-        }
-    }
-
-    fn run_save_hooks(&mut self) -> Result<usize, String> {
-        let commands = self.plugins.on_save_commands();
-        for command in &commands {
-            let context = self.plugin_context(Vec::new(), "on_save");
-            let response = self.plugins.run(command, &context)?;
-            self.apply_plugin_response(response);
-        }
-        if self.editor.dirty {
-            self.editor
-                .save()
-                .map_err(|error| format!("Plugin save hook failed to save changes: {error}"))?;
-        }
-        Ok(commands.len())
     }
 
     fn execute_theme(&mut self, argument: &str) {
@@ -8681,7 +8936,9 @@ fn lsp_text_offset(text: &str, line: usize, character: usize) -> Option<usize> {
     let line_end = text[line_start..]
         .find('\n')
         .map_or(text.len(), |offset| line_start + offset);
-    let prefix = &text[line_start..line_end];
+    let prefix = text[line_start..line_end]
+        .strip_suffix('\r')
+        .unwrap_or(&text[line_start..line_end]);
     let mut utf16_column = 0;
     let mut byte_offset = prefix.len();
     for (offset, value) in prefix.char_indices() {
@@ -8693,6 +8950,9 @@ fn lsp_text_offset(text: &str, line: usize, character: usize) -> Option<usize> {
         if utf16_column > character {
             return None;
         }
+    }
+    if character > utf16_column && byte_offset == prefix.len() {
+        return None;
     }
     Some(line_start + byte_offset)
 }
@@ -8718,6 +8978,9 @@ fn apply_lsp_text_edits(text: &str, edits: &[Value]) -> Option<String> {
         changes.push((start, end, replacement.to_string()));
     }
     changes.sort_by_key(|(start, _, _)| *start);
+    if changes.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return None;
+    }
     let mut result = text.to_string();
     for (start, end, replacement) in changes.into_iter().rev() {
         result.replace_range(start..end, &replacement);
@@ -8938,6 +9201,23 @@ mod tests {
     }
 
     #[test]
+    fn visual_viewer_preserves_dirty_editor_and_closes_during_loading() {
+        let mut app = App::new(None).unwrap();
+        app.editor.insert_text("unsaved source");
+        let original = app.editor.text();
+        assert!(app.open_office_document(Path::new("pending.pdf")));
+        assert_eq!(app.mode, Mode::OfficeViewer);
+        assert!(app.visual_viewer.is_some());
+        app.handle_office_viewer_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.visual_viewer.is_none());
+        assert_eq!(app.editor.text(), original);
+        assert!(app.editor.dirty);
+        assert!(app.open_office_document(Path::new("picture.PNG")));
+        assert!(app.visual_viewer.is_some());
+        assert!(!app.open_office_document(Path::new("source.rs")));
+    }
+
+    #[test]
     fn office_viewer_mouse_clicks_select_cells_without_closing() {
         let mut app = App::new(None).expect("create app");
         app.mode = Mode::OfficeViewer;
@@ -8945,15 +9225,13 @@ mod tests {
             path: PathBuf::from("orders.xlsx"),
             title: "orders.xlsx".to_string(),
             content: OfficeContent::Spreadsheet(office_viewer::SpreadsheetView {
-                sheets: vec![office_viewer::SheetView {
-                    name: "Sheet1".to_string(),
-                    cells: vec![
+                sheets: vec![office_viewer::SheetView::from_rows(
+                    "Sheet1",
+                    vec![
                         vec!["A1".to_string(), "B1".to_string()],
                         vec!["A2".to_string(), "B2".to_string()],
                     ],
-                    formulas: Vec::new(),
-                    truncated: false,
-                }],
+                )],
                 active_sheet: 0,
                 row: 0,
                 column: 0,
@@ -8982,6 +9260,37 @@ mod tests {
             panic!("expected spreadsheet");
         };
         assert_eq!((view.row, view.column), (1, 1));
+        app.project.visible = false;
+        if let OfficeContent::Spreadsheet(view) = &mut app.office_viewer.as_mut().unwrap().content {
+            view.sheets[0] =
+                office_viewer::SheetView::from_rows("big", vec![vec!["x".into(); 10]; 100]);
+        }
+        for (width, height) in [(30, 12), (55, 15), (80, 30), (120, 40)] {
+            let layout = crate::ui::screen_layout(&app, width, height);
+            let viewport = office_viewer::ViewerViewport::spreadsheet(
+                layout.content_height,
+                layout.editor_width,
+            );
+            let partial_column = layout.editor_x + 7 + viewport.columns * 24;
+            if partial_column < layout.editor_x + layout.editor_width {
+                assert!(crate::ui::office_viewer_hit_at(
+                    &app,
+                    width,
+                    height,
+                    partial_column as u16,
+                    layout.content_top + 3
+                )
+                .is_none());
+            }
+            assert!(crate::ui::office_viewer_hit_at(
+                &app,
+                width,
+                height,
+                (layout.editor_x + 8) as u16,
+                layout.content_top + layout.content_height as u16 - 2
+            )
+            .is_none());
+        }
 
         app.handle_office_viewer_mouse(
             MouseEvent {
@@ -9032,7 +9341,11 @@ mod tests {
         let mut app = App::new(Some(&path)).expect("create app");
         std::fs::write(&path, "external").unwrap();
 
-        app.poll_background();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.mode != Mode::ReloadConfirm && Instant::now() < deadline {
+            app.poll_background();
+            std::thread::yield_now();
+        }
         assert_eq!(app.mode, Mode::ReloadConfirm);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.editor.has_pending_external_change());
@@ -9169,6 +9482,7 @@ mod tests {
         app.last_recovery_checkpoint = Instant::now() - Duration::from_secs(3);
         app.checkpoint_persistence();
 
+        app.persistence_worker.flush().unwrap();
         let journal_exists = std::fs::read_dir(crate::document::recovery_dir())
             .expect("recovery directory")
             .filter_map(Result::ok)
@@ -9353,6 +9667,8 @@ mod tests {
 
         type_text(&mut app, "alpha");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.project_search_worker.wait_idle();
+        app.poll_background();
         assert_eq!(app.project_search.results.len(), 3);
         assert_eq!(app.project_search.files_with_matches, 2);
 
@@ -9392,6 +9708,8 @@ mod tests {
         app.open_project_search();
         type_text(&mut app, "target");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.project_search_worker.wait_idle();
+        app.poll_background();
         assert_eq!(app.project_search.results.len(), 1);
 
         // Second Enter (query unchanged) opens the selected result.
@@ -10125,5 +10443,447 @@ mod tests {
         assert_eq!(lsp_workspace_root(&source), Some(project));
 
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn session_export_remaps_both_named_panes_and_discards_untitled_splits() {
+        let root = std::env::temp_dir().join(format!("caret-app-split-map-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let mut app = App::new(Some(&root)).unwrap();
+        app.editor.insert_char('u');
+        app.editor.open_or_switch(&a).unwrap();
+        app.editor.new_buffer();
+        app.editor.open_or_switch(&b).unwrap();
+        let view = EditorView {
+            tab_index: 1,
+            cursor: crate::editor::Cursor::default(),
+            scroll_line: 0,
+            scroll_column: 0,
+        };
+        app.split_views = Some(SplitViews {
+            primary: view,
+            secondary: EditorView {
+                tab_index: 3,
+                ..view
+            },
+            secondary_active: true,
+            vertical: true,
+        });
+        let state = app.current_session_state();
+        assert_eq!(state.active_tab, 1);
+        let split = state.split.unwrap();
+        assert_eq!(split.primary.tab_index, 0);
+        assert_eq!(split.secondary.tab_index, 1);
+        app.split_views.as_mut().unwrap().secondary.tab_index = 2;
+        assert!(app.current_session_state().split.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod repair_regressions {
+    use super::*;
+    use std::fs;
+    fn fixture(name: &str, text: &str) -> (PathBuf, PathBuf, App) {
+        let root = std::env::temp_dir().join(format!("audit-{name}-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.txt");
+        fs::write(&path, text).unwrap();
+        let mut app = App::new(Some(&path)).unwrap();
+        app.project.visible = false;
+        app.explorer_focused = false;
+        app.mode = Mode::Insert;
+        (root, path, app)
+    }
+    #[test]
+    fn right_split_click_uses_the_pane_origin() {
+        let (_root, _path, mut app) = fixture("split-mouse", &"a".repeat(110));
+        app.open_split(true);
+        let layout = crate::ui::screen_layout(&app, 120, 30);
+        let x =
+            layout.editor_x + layout.editor_width.saturating_sub(1) / 2 + 1 + layout.gutter_width;
+        app.handle_left_click(x as u16, layout.content_top, 120, 30, KeyModifiers::NONE);
+        eprintln!(
+            "Right pane first text cell: actual column {}, expected 0",
+            app.editor.cursor.column
+        );
+        assert_eq!(app.editor.cursor.column, 0);
+    }
+    #[test]
+    fn closing_tabs_preserves_split_documents() {
+        let (root, _path, mut app) = fixture("split-close", "A");
+        let second = root.join("b.txt");
+        let third = root.join("c.txt");
+        fs::write(&second, "B").unwrap();
+        fs::write(&third, "C").unwrap();
+        app.editor.open_or_switch(&second).unwrap();
+        app.editor.open_or_switch(&third).unwrap();
+        app.editor.select(0);
+        app.open_split(true);
+        app.split_views.as_mut().unwrap().secondary.tab_index = 1;
+        app.close_active_tab(true);
+        app.split_views.as_mut().unwrap().secondary_active = true;
+        app.activate_focused_view();
+        eprintln!(
+            "After closing A, secondary pane points to {:?}, expected B",
+            app.editor.path
+        );
+        assert_eq!(app.editor.text(), "B");
+    }
+    #[test]
+    fn project_replace_respects_the_truncated_preview() {
+        let (_root, path, mut app) = fixture("replace", &"needle\n".repeat(51));
+        app.project_search.query = "needle".to_owned();
+        app.project_search.replacement = "changed".to_owned();
+        app.settings.max_search_results = 50;
+        app.run_project_search();
+        app.project_search_worker.wait_idle();
+        app.poll_background();
+        assert_eq!(app.project_search.results.len(), 50);
+        assert!(app.project_search.truncated);
+        app.project_replace_all();
+        eprintln!("Confirmation: {}", app.message);
+        app.project_replace_all();
+        let replaced = fs::read_to_string(path).unwrap().matches("changed").count();
+        eprintln!("Confirmed 50 matches; actually replaced {replaced}");
+        assert_eq!(replaced, 50);
+    }
+    #[test]
+    fn workspace_edit_rejects_stale_versions() {
+        let (_root, path, mut app) = fixture("lsp-version", "new content");
+        app.lsp_version = 2;
+        let result = app.apply_workspace_edit(&json!({"documentChanges":[{
+            "textDocument":{"uri":lsp::file_uri(&path),"version":1},
+            "edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"OLD"}]
+        }]}));
+        eprintln!(
+            "Version 1 edit against version 2: {:?}, text {:?}",
+            result,
+            app.editor.text()
+        );
+        assert!(result.is_err());
+        assert_eq!(app.editor.text(), "new content");
+    }
+    #[test]
+    fn overlapping_lsp_edits_return_error_without_panicking() {
+        let edits = json!([
+            {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":4}},"newText":""},
+            {"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":5}},"newText":""}
+        ]);
+        let outcome =
+            std::panic::catch_unwind(|| apply_lsp_text_edits("abcde", edits.as_array().unwrap()));
+
+        assert!(outcome.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod worker_and_edit_regressions {
+    use super::*;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+    fn fixture(name: &str, text: &str) -> (PathBuf, PathBuf, App) {
+        let root =
+            std::env::temp_dir().join(format!("caret-workers-{name}-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.txt");
+        fs::write(&path, text).unwrap();
+        let mut app = App::new(Some(&path)).unwrap();
+        app.project.visible = false;
+        app.explorer_focused = false;
+        app.mode = Mode::Insert;
+        (root, path, app)
+    }
+    fn responses(app: &mut App, responses: Vec<Result<PluginResponse, String>>) {
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        app.plugin_worker = crate::plugin::PluginWorker::new("test-plugin", move |_, _| {
+            responses.lock().unwrap().pop_front().unwrap()
+        });
+    }
+    fn finish_one(app: &mut App) {
+        app.plugin_worker.wait_idle();
+        assert!(app.poll_plugin());
+    }
+    #[test]
+    fn plugin_updates_its_origin_without_switching_the_users_tab() {
+        let (root, path, mut app) = fixture("plugin-origin", "original");
+        responses(
+            &mut app,
+            vec![Ok(PluginResponse {
+                replace_document: Some("updated".into()),
+                ..Default::default()
+            })],
+        );
+        app.start_plugin_task(vec!["test".into()], vec![], "command", false)
+            .unwrap();
+        let other = root.join("b.txt");
+        fs::write(&other, "other").unwrap();
+        app.editor.open_or_switch(&other).unwrap();
+        finish_one(&mut app);
+        assert_eq!(app.editor.text(), "other");
+        assert_eq!(
+            app.editor.editor_for_path_mut(&path).unwrap().text(),
+            "updated"
+        );
+    }
+    #[test]
+    fn plugin_cannot_replace_newer_edits_or_a_reopened_document() {
+        let (_root, path, mut app) = fixture("plugin-stale", "original");
+        responses(
+            &mut app,
+            vec![Ok(PluginResponse {
+                replace_document: Some("obsolete".into()),
+                ..Default::default()
+            })],
+        );
+        app.start_plugin_task(vec!["test".into()], vec![], "command", false)
+            .unwrap();
+        app.editor.insert_text("new ");
+        finish_one(&mut app);
+        assert_eq!(app.editor.text(), "new original");
+        assert!(app.message.contains("ignored"));
+        responses(
+            &mut app,
+            vec![Ok(PluginResponse {
+                replace_document: Some("obsolete".into()),
+                ..Default::default()
+            })],
+        );
+        app.start_plugin_task(vec!["test".into()], vec![], "command", false)
+            .unwrap();
+        app.close_active_tab(true);
+        app.editor.open_or_switch(&path).unwrap();
+        finish_one(&mut app);
+        assert_eq!(app.editor.text(), "original");
+        assert!(app.message.contains("closed"));
+    }
+    #[test]
+    fn selection_plugins_reject_cursor_changes_even_without_text_edits() {
+        let (_root, _path, mut app) = fixture("plugin-selection", "original");
+        responses(
+            &mut app,
+            vec![Ok(PluginResponse {
+                insert_text: Some("wrong place".into()),
+                ..Default::default()
+            })],
+        );
+        app.start_plugin_task(vec!["test".into()], vec![], "command", false)
+            .unwrap();
+        app.editor.move_right();
+        finish_one(&mut app);
+        assert_eq!(app.editor.text(), "original");
+        assert!(app.message.contains("selection changed"));
+    }
+    #[test]
+    fn save_hooks_keep_order_save_only_final_output_and_delay_quit() {
+        let (_root, path, mut app) = fixture("plugin-hooks", "original");
+        responses(
+            &mut app,
+            vec![
+                Ok(PluginResponse {
+                    replace_document: Some("first".into()),
+                    ..Default::default()
+                }),
+                Ok(PluginResponse {
+                    replace_document: Some("second".into()),
+                    ..Default::default()
+                }),
+            ],
+        );
+        app.start_plugin_task(
+            vec!["first".into(), "second".into()],
+            vec![],
+            "on_save",
+            true,
+        )
+        .unwrap();
+        app.request_quit(false);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.plugin_quit_pending);
+        app.request_quit(false);
+
+        assert!(!app.should_quit);
+        finish_one(&mut app);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert!(app.editor.dirty);
+        assert!(!app.should_quit);
+        finish_one(&mut app);
+        assert_eq!(fs::read_to_string(path).unwrap(), "second");
+        assert!(!app.editor.dirty);
+        assert!(app.should_quit);
+    }
+    #[test]
+    fn hook_failure_preserves_unsaved_output_and_cancels_pending_quit() {
+        let (_root, path, mut app) = fixture("plugin-hook-failure", "original");
+        responses(
+            &mut app,
+            vec![
+                Ok(PluginResponse {
+                    replace_document: Some("first".into()),
+                    ..Default::default()
+                }),
+                Err("hook failed".into()),
+            ],
+        );
+        app.start_plugin_task(
+            vec!["first".into(), "second".into()],
+            vec![],
+            "on_save",
+            true,
+        )
+        .unwrap();
+        app.request_quit(false);
+        finish_one(&mut app);
+        finish_one(&mut app);
+        assert!(!app.should_quit);
+        assert!(app.editor.dirty);
+        assert_eq!(app.editor.text(), "first");
+        assert_eq!(fs::read_to_string(path).unwrap(), "original");
+    }
+    #[test]
+    fn invalid_workspace_edit_does_not_partially_change_other_documents() {
+        let (root, path, mut app) = fixture("lsp-preflight", "original");
+        let other = root.join("b.txt");
+        fs::write(&other, "other").unwrap();
+        let edit = json!({"documentChanges":[
+            {"textDocument":{"uri":lsp::file_uri(&path),"version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"newText":"updated"}]},
+            {"textDocument":{"uri":lsp::file_uri(&other),"version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":999}},"newText":"bad"}]}
+        ]});
+        assert!(app.apply_workspace_edit(&edit).is_err());
+        assert_eq!(app.editor.text(), "original");
+        assert_eq!(fs::read_to_string(other).unwrap(), "other");
+    }
+    #[test]
+    fn utf16_boundaries_and_valid_versioned_edits_are_checked() {
+        assert!(lsp_text_offset("a😀b\r\n", 0, 2).is_none());
+        assert_eq!(lsp_text_offset("a😀b\r\n", 0, 4), Some(6));
+        assert!(lsp_text_offset("a😀b\r\n", 0, 5).is_none());
+        let (_root, path, mut app) = fixture("lsp-valid", "original");
+        app.lsp_open_path = Some(path.clone());
+        app.lsp_last_text = "original".into();
+        app.lsp_version = 2;
+        let edit = json!({"documentChanges":[{"textDocument":{"uri":lsp::file_uri(&path),"version":2},
+            "edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":8}},"newText":"updated"}]}]});
+        assert_eq!(app.apply_workspace_edit(&edit), Ok(1));
+        assert_eq!(app.editor.text(), "updated");
+    }
+    #[test]
+    fn clicks_and_drags_use_each_panes_scrolled_origin_and_ignore_dividers() {
+        let (_root, _path, mut app) =
+            fixture("pane-geometry", &("x".repeat(100) + "\n").repeat(100));
+        for vertical in [true, false] {
+            for (width, height) in [(120, 30), (60, 12)] {
+                app.split_views = None;
+                app.last_editor_click = None;
+                app.open_split(vertical);
+                let views = app.split_views.as_mut().unwrap();
+                views.secondary.scroll_line = 3;
+                views.secondary.scroll_column = 4;
+                let panes = crate::ui::editor_panes(&app, width, height);
+                let pane = panes[1];
+                app.handle_left_click(
+                    (pane.x + pane.gutter + 2) as u16,
+                    pane.top + 1,
+                    width,
+                    height,
+                    KeyModifiers::NONE,
+                );
+                assert_eq!(app.editor.cursor, Cursor { line: 4, column: 6 });
+                app.sync_focused_view();
+                app.handle_editor_drag(
+                    (pane.x + pane.gutter + 5) as u16,
+                    pane.top + 2,
+                    width,
+                    height,
+                );
+                assert_eq!(app.editor.cursor, Cursor { line: 5, column: 9 });
+                assert!(app.editor.selected_text().is_some());
+                let before = app.editor.cursor;
+                let divider = if vertical {
+                    ((panes[0].x + panes[0].width) as u16, panes[0].top)
+                } else {
+                    (panes[0].x as u16, panes[0].top + panes[0].rows as u16)
+                };
+                app.handle_left_click(divider.0, divider.1, width, height, KeyModifiers::NONE);
+                assert_eq!(app.editor.cursor, before);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lsp_context_regressions {
+    use super::*;
+    #[test]
+    fn completion_cannot_target_another_tab_or_a_moved_cursor() {
+        let root =
+            std::env::temp_dir().join(format!("caret-completion-context-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        fs::write(&a, "original").unwrap();
+        fs::write(&b, "other").unwrap();
+        let mut app = App::new(Some(&a)).unwrap();
+        for switch in [false, true] {
+            app.editor.open_or_switch(&a).unwrap();
+            app.editor.move_line_start();
+            app.lsp_panel_origin = Some(app.lsp_context(app.editor.path.clone().unwrap()));
+            app.lsp_panel = Some(LspPanel {
+                title: "Completion".into(),
+                selected: 0,
+                kind: LspPanelKind::Completion,
+                items: vec![LspPanelItem {
+                    label: "bad".into(),
+                    detail: String::new(),
+                    payload: json!({"insertText":"wrong"}),
+                }],
+            });
+            if switch {
+                app.editor.open_or_switch(&b).unwrap();
+            } else {
+                app.editor.move_right();
+            }
+            app.activate_lsp_panel_item();
+            assert!(app.message.contains("ignored"));
+        }
+        assert_eq!(
+            app.editor.editor_for_path_mut(&a).unwrap().text(),
+            "original"
+        );
+        assert_eq!(app.editor.editor_for_path_mut(&b).unwrap().text(), "other");
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod split_activation_regressions {
+    use super::*;
+    #[test]
+    fn inactive_shared_views_clamp_after_edits_and_do_not_extend_another_views_selection() {
+        let mut app = App::new(None).unwrap();
+        app.editor.replace_text(&"long line\n".repeat(100));
+        app.open_split(true);
+        let view = &mut app.split_views.as_mut().unwrap().secondary;
+        view.cursor = Cursor {
+            line: 90,
+            column: 90,
+        };
+        view.scroll_line = 90;
+        app.editor.replace_text("short");
+        app.split_views.as_mut().unwrap().secondary_active = true;
+        app.activate_focused_view();
+        assert_eq!(app.editor.cursor, Cursor { line: 0, column: 5 });
+        assert_eq!(app.editor.scroll_line, 0);
+        app.editor.selection_anchor = Some(Cursor { line: 0, column: 0 });
+        app.split_views.as_mut().unwrap().secondary.cursor = Cursor { line: 0, column: 2 };
+        app.activate_focused_view();
+        assert!(app.editor.selection_anchor.is_none());
+        app.editor.insert_text("ok");
+        assert_eq!(app.editor.text(), "shokort");
     }
 }

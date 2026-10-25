@@ -12,8 +12,9 @@ and the compatibility checks required for releases.
 - Focus and selection use text markers, bold text, and color. Meaning is never
   conveyed by color alone: Git changes use `+`, `~`, and `-`; notifications use
   an icon and message; LSP state is written as text.
-- The Monochrome theme provides a high-contrast fallback. Use `:theme mono` or
-  launch with the standard `NO_COLOR` environment variable.
+- The Monochrome theme provides a high-contrast fallback. Use `:theme mono`.
+  `NO_COLOR` selects monochrome on an unconfigured launch; a saved theme takes
+  precedence. Selection backgrounds remain visible in either case.
 - `:set reducedmotion` disables the animated LSP activity indicator. The
   `CARET_REDUCED_MOTION=1` environment variable enables the same behavior for a
   session. Use `:set noreducedmotion` to restore animation.

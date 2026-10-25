@@ -66,8 +66,68 @@ It was reconciled against the repository on 2026-07-25.
   atomic saves, external-change confirmation, idle recovery checkpointing,
   forced termination, recovery discovery, restore, and re-save on every CI
   platform.
+- [x] Verify distinct Rust syntax colors, visible mouse drag selection, and
+  Shift-End selection with replacement and save in a real terminal, including
+  launches inheriting `NO_COLOR`; honor the configured interactive theme.
 - [x] Windows, macOS, and Linux CI build/test/diagnostic matrix plus Ubuntu
   locked-install and PTY startup smoke coverage, with warnings denied.
+
+### Repository reliability and performance repairs
+
+- [x] Track current and saved document revisions through undo/redo, saves,
+  history branching, and eviction; failed saves leave unsaved work dirty.
+- [x] Decode text and establish disk fingerprints from the same document
+  snapshot; retain the fingerprint and length of bytes actually saved.
+- [x] Exclusively reserve copy staging, install through no-replace boundaries,
+  clean up only owned output, and retain completed cross-device copies when
+  source removal partially fails.
+- [x] Preserve independent absolute value/formula ranges in sparse workbook
+  maps with cached dimensions; share viewport geometry across drawing,
+  navigation, paging, resizing, and mouse selection.
+- [x] Drain both plugin output pipes concurrently with stdin and enforce the
+  deadline through input, execution, output collection, termination, and reap.
+- [x] Map named session tabs and split panes across untitled/missing tabs while
+  preserving the session JSON format and clamping restored views.
+- [x] Coalesce active-file fingerprint checks on one bounded background worker
+  every two seconds, reject obsolete paths/save generations, and poll background
+  services during input as well as idle periods.
+- [x] Cache syntax line-start byte offsets and update them after edits so
+  highlighting does not scan preceding document text.
+- [x] Supervise cancellable Office helper loads, reject obsolete results, and
+  enforce input, allocation, deadline, cell-count, and response budgets; document
+  the defaults and retain supported formats and display limits.
+- [x] Record Windows/Linux/macOS formatting, warnings-denied Clippy, full tests,
+  release builds, PTY smoke tests, and release performance measurements for these
+  repairs in `docs/RELIABILITY_VALIDATION.md`.
+
+### Confirmed-defect and responsiveness repairs
+
+- [x] Retry transient Windows replacement sharing failures with bounded backoff
+  and repeat conflict validation before every attempt.
+- [x] Save through symbolic links without replacing aliases; reject changed
+  targets and dangling links while preserving save conflict checks.
+- [x] Apply only reviewed project replacement ranges against previewed bytes,
+  preserving BOMs, mixed line endings, exclusions, and truncated result limits.
+- [x] Validate LSP versions, request revisions, UTF-16 boundaries, and overlapping
+  ranges before applying edits; preflight complete workspace responses.
+- [x] Share split-pane geometry across rendering, cursor placement, clicking,
+  and dragging; retain automatic scrolling and remap/clamp pane state after tab
+  closure or shared-document edits.
+- [x] Cache newline policy through edits, replacement, undo, redo, and reload;
+  use it for both open-line commands.
+- [x] Share cached syntax folds/symbols by revision, recognize Rust function
+  items, and derive parser edit positions from Rope byte offsets and line caches.
+- [x] Coalesce obsolete file-manager scans, prioritize current panes and
+  operations, cancel scans between entries, use native invalidation with bounded
+  fallback polling, and isolate previews with execution-time deadlines.
+- [x] Run plugin commands and ordered save hooks asynchronously, reject stale
+  results, bound stdout/stderr, supervise process groups/jobs, and wait for save
+  hooks and child cleanup before quitting.
+- [x] Run cancellable project searches and coalesced recovery/session writes
+  outside the input thread; order final checkpoints and journal removal.
+- [x] Complete expanded regressions, release benchmarks, PTY checks, and
+  Windows/Linux/macOS CI verification; record results and remaining parser
+  scaling costs in `docs/RELIABILITY_VALIDATION.md`.
 
 ### Remaining release work
 
@@ -229,7 +289,15 @@ not satisfy the roadmap's safe operation layer.
   copy.
 - [x] Guarantee that previews never execute untrusted files or block editor
   input.
-- [x] Defer terminal images, PDF/archive previews, media metadata, and
+- [x] Add full-page PDF and raster-image viewers with terminal graphics,
+  fit/zoom/pan/page controls, cancellable supervised rendering, bounded input,
+  native memory, decode pixels, response and time budgets, and stale-result
+  rejection. Preserve dirty buffers and clear graphics on close/resize/error.
+- [x] Provide pinned PDFium setup/packaging with verified archive checksums and
+  third-party licenses; retain an image-only path when PDFium is unavailable.
+- [x] Validate visual PDF/image opening, navigation, and cleanup in PTYs and
+  the complete test suite; retain Windows/Linux/macOS CI coverage.
+- [x] Defer archive previews, media metadata, and
   extension-provided previewers until the initial provider API is stable.
 
 ### UI, settings, and test completion
@@ -379,6 +447,9 @@ not satisfy the roadmap's safe operation layer.
 
 ## Known release-blocking or tracked defects
 
+- [x] Resolve four Windows file-manager failures caused by queued parent scans:
+  background scan completion, operation undo, restored selection, and watcher
+  invalidation. Tests now synchronize on worker events and cover large parents.
 - [x] Fix C# `:def`: solution discovery now prefers an ancestor `.sln`/`.slnx`
   over a nested `.csproj`, existing Windows and UNC paths produce valid file
   URIs, and a real `csharp-ls` definition round trip verifies the fix.

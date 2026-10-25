@@ -1,5 +1,6 @@
 /target
 /target-*/
+/runtime/pdfium/
 *.swp
 *.tmp
 .DS_Store

@@ -22,6 +22,7 @@ crossterm = "0.29"
 directories = "6.0"
 flate2 = "1.1"
 ignore = "0.4"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "ico", "tiff", "pnm", "tga"] }
 libc = "0.2"
 notify = "8.2"
 portable-pty = "0.9"
@@ -47,6 +48,10 @@ vt100 = "0.16"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
     "Win32_Storage_FileSystem",
 ] }
 

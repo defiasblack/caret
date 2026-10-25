@@ -32,6 +32,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Install PDF renderer
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Set up PDFium
+        run: python scripts/setup_pdfium.py
+
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
@@ -60,6 +68,14 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked
+
+      - name: Install PDF renderer
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Set up PDFium
+        run: python scripts/setup_pdfium.py
 
       - name: Run platform test suite
         run: cargo test --locked --all-targets --all-features

@@ -54,7 +54,7 @@ pub fn report(version: &str) -> String {
     };
     let ansi = terminal != "dumb" && terminal != "not set";
     let color_mode = if std::env::var_os("NO_COLOR").is_some() {
-        "disabled by NO_COLOR"
+        "NO_COLOR set; saved theme takes precedence"
     } else if color.to_ascii_lowercase().contains("truecolor")
         || color.to_ascii_lowercase().contains("24bit")
     {

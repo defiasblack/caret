@@ -18,6 +18,20 @@ pub struct RecoveryEntry {
     pub saved_unix_secs: u64,
 }
 
+pub struct Snapshot {
+    pub path: Option<PathBuf>,
+    pub text: ropey::Rope,
+    pub cursor: Cursor,
+}
+pub fn save_snapshots(snapshots: Vec<Snapshot>) -> io::Result<()> {
+    save(
+        snapshots
+            .into_iter()
+            .map(|snapshot| entry(snapshot.path, snapshot.text.to_string(), snapshot.cursor))
+            .collect(),
+    )
+}
+
 pub fn save(entries: Vec<RecoveryEntry>) -> io::Result<()> {
     save_at(&journal_path(), entries)
 }

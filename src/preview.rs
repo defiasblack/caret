@@ -86,10 +86,9 @@ impl PreviewRequest {
         }
     }
 
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+    pub fn start_timeout(&mut self, timeout: Duration) {
+        self.deadline = Instant::now() + timeout;
     }
-
     fn interrupted(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed) || Instant::now() >= self.deadline
     }
@@ -938,9 +937,8 @@ fn structured_kind(path: &Path, text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
-    use flate2::{write::DeflateEncoder, Compression};
+    use crate::test_support::write_deflated_zip;
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -961,62 +959,6 @@ mod tests {
             Duration::from_secs(1),
             Arc::new(AtomicBool::new(false)),
         )
-    }
-
-    fn write_deflated_zip(path: &Path, files: &[(&str, &str)]) {
-        let mut bytes = Vec::new();
-        let mut central = Vec::new();
-        for (name, contents) in files {
-            let offset = bytes.len() as u32;
-            let name = name.as_bytes();
-            let contents = contents.as_bytes();
-            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(contents).unwrap();
-            let compressed = encoder.finish().unwrap();
-            bytes.extend_from_slice(b"PK\x03\x04");
-            bytes.extend_from_slice(&20u16.to_le_bytes());
-            bytes.extend_from_slice(&0u16.to_le_bytes());
-            bytes.extend_from_slice(&8u16.to_le_bytes());
-            bytes.extend_from_slice(&0u16.to_le_bytes());
-            bytes.extend_from_slice(&0u16.to_le_bytes());
-            bytes.extend_from_slice(&0u32.to_le_bytes());
-            bytes.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(&(contents.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            bytes.extend_from_slice(&0u16.to_le_bytes());
-            bytes.extend_from_slice(name);
-            bytes.extend_from_slice(&compressed);
-
-            central.extend_from_slice(b"PK\x01\x02");
-            central.extend_from_slice(&20u16.to_le_bytes());
-            central.extend_from_slice(&20u16.to_le_bytes());
-            central.extend_from_slice(&0u16.to_le_bytes());
-            central.extend_from_slice(&8u16.to_le_bytes());
-            central.extend_from_slice(&0u16.to_le_bytes());
-            central.extend_from_slice(&0u16.to_le_bytes());
-            central.extend_from_slice(&0u32.to_le_bytes());
-            central.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
-            central.extend_from_slice(&(contents.len() as u32).to_le_bytes());
-            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            central.extend_from_slice(&0u16.to_le_bytes());
-            central.extend_from_slice(&0u16.to_le_bytes());
-            central.extend_from_slice(&0u16.to_le_bytes());
-            central.extend_from_slice(&0u16.to_le_bytes());
-            central.extend_from_slice(&0u32.to_le_bytes());
-            central.extend_from_slice(&offset.to_le_bytes());
-            central.extend_from_slice(name);
-        }
-        let central_offset = bytes.len() as u32;
-        bytes.extend_from_slice(&central);
-        bytes.extend_from_slice(b"PK\x05\x06");
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&(files.len() as u16).to_le_bytes());
-        bytes.extend_from_slice(&(files.len() as u16).to_le_bytes());
-        bytes.extend_from_slice(&(central.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&central_offset.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        fs::write(path, bytes).unwrap();
     }
 
     #[test]
@@ -1132,5 +1074,27 @@ mod tests {
             .unwrap()
             .is_some_and(|text| text.contains("A1=Ship it")));
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod deadline_regressions {
+    use super::*;
+    #[test]
+    fn queued_time_does_not_consume_execution_budget_or_revive_cancelled_requests() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut request = PreviewRequest::new(
+            PathBuf::from("unused"),
+            100,
+            10,
+            Duration::ZERO,
+            Arc::clone(&cancelled),
+        );
+        assert!(request.interrupted());
+        request.start_timeout(Duration::from_secs(1));
+        assert!(!request.interrupted());
+        cancelled.store(true, Ordering::Release);
+        request.start_timeout(Duration::from_secs(1));
+        assert!(request.interrupted());
     }
 }

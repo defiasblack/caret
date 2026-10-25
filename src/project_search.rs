@@ -3,12 +3,14 @@
 //! rewrites files atomically so replacements stay predictable.
 
 use std::{
-    collections::HashSet,
-    fs, io,
+    io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::search::CompiledSearch;
+#[cfg(test)]
+use std::{collections::HashSet, fs};
 
 /// Files larger than this are skipped; they are almost never sources.
 const MAX_FILE_BYTES: u64 = 2_000_000;
@@ -17,6 +19,9 @@ const MAX_FILE_BYTES: u64 = 2_000_000;
 #[derive(Debug, Clone)]
 pub struct ProjectMatch {
     pub path: PathBuf,
+    pub fingerprint: u64,
+    pub document_start: usize,
+    pub document_end: usize,
     /// 0-based line number.
     pub line: usize,
     /// Byte range of the match within `line_text`.
@@ -35,7 +40,16 @@ pub struct ProjectSearchResults {
 
 /// Searches every text file under `root`, honoring .gitignore, skipping
 /// hidden and binary files, and stopping after `max_results` matches.
+#[cfg(test)]
 pub fn search(root: &Path, query: &CompiledSearch, max_results: usize) -> ProjectSearchResults {
+    search_cancelled(root, query, max_results, &AtomicBool::new(false))
+}
+pub fn search_cancelled(
+    root: &Path,
+    query: &CompiledSearch,
+    max_results: usize,
+    cancelled: &AtomicBool,
+) -> ProjectSearchResults {
     let mut results = ProjectSearchResults::default();
     let walker = ignore::WalkBuilder::new(root)
         .sort_by_file_path(std::cmp::Ord::cmp)
@@ -43,7 +57,7 @@ pub fn search(root: &Path, query: &CompiledSearch, max_results: usize) -> Projec
         .require_git(false)
         .build();
     for entry in walker.flatten() {
-        if results.truncated {
+        if results.truncated || cancelled.load(Ordering::Relaxed) {
             break;
         }
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -56,18 +70,21 @@ pub fn search(root: &Path, query: &CompiledSearch, max_results: usize) -> Projec
         {
             continue;
         }
-        let Ok(bytes) = fs::read(entry.path()) else {
+        let Ok(snapshot) = crate::document::read_snapshot(entry.path()) else {
             continue;
         };
-        if bytes.contains(&0) {
-            continue;
-        }
-        let Ok(text) = String::from_utf8(bytes) else {
-            continue;
-        };
-
+        let text = snapshot.text;
         let mut matched_file = false;
-        for (line_index, line) in text.lines().enumerate() {
+        let mut line_start = 0;
+        for (line_index, raw_line) in text.split_inclusive('\n').enumerate() {
+            if cancelled.load(Ordering::Relaxed) {
+                return results;
+            }
+            let line = raw_line
+                .strip_suffix('\n')
+                .unwrap_or(raw_line)
+                .strip_suffix('\r')
+                .unwrap_or(raw_line.strip_suffix('\n').unwrap_or(raw_line));
             for (start, end) in query.find_byte_ranges(line) {
                 if results.matches.len() >= max_results {
                     results.truncated = true;
@@ -76,12 +93,16 @@ pub fn search(root: &Path, query: &CompiledSearch, max_results: usize) -> Projec
                 matched_file = true;
                 results.matches.push(ProjectMatch {
                     path: entry.path().to_path_buf(),
+                    fingerprint: snapshot.fingerprint,
+                    document_start: line_start + start,
+                    document_end: line_start + end,
                     line: line_index,
                     byte_start: start,
                     byte_end: end,
                     line_text: line.to_string(),
                 });
             }
+            line_start += raw_line.len();
             if results.truncated {
                 break;
             }
@@ -96,6 +117,7 @@ pub fn search(root: &Path, query: &CompiledSearch, max_results: usize) -> Projec
 /// Applies `replacement` to every match in `text`, skipping matches whose
 /// (line, byte_start) is in `excluded`.  Returns the new text and the number
 /// of replacements.  Matching is line-based, mirroring `search`.
+#[cfg(test)]
 pub fn replace_in_text(
     text: &str,
     query: &CompiledSearch,
@@ -136,14 +158,16 @@ pub fn replace_in_text(
 }
 
 /// Rewrites one file on disk atomically.  Returns the number of replacements.
+#[cfg(test)]
 pub fn replace_in_file(
     path: &Path,
     query: &CompiledSearch,
     replacement: &str,
     excluded: &HashSet<(usize, usize)>,
 ) -> io::Result<usize> {
-    let expected_fingerprint = crate::document::fingerprint(path)?;
-    let (text, format) = crate::document::read_text(path)?;
+    let snapshot = crate::document::read_snapshot(path)?;
+    let expected_fingerprint = snapshot.fingerprint;
+    let (text, format) = (snapshot.text, snapshot.format);
     let (new_text, replaced) = replace_in_text(&text, query, replacement, excluded);
     if replaced > 0 && new_text != text {
         // read_text strips a BOM; put it back so the file round-trips.
@@ -155,6 +179,73 @@ pub fn replace_in_file(
         crate::document::atomic_write_if_unchanged(path, Some(expected_fingerprint), &bytes)?;
     }
     Ok(replaced)
+}
+
+/// Apply only reviewed ranges against exactly the bytes displayed by search.
+pub fn replace_previewed(
+    path: &Path,
+    query: &CompiledSearch,
+    replacement: &str,
+    matches: &[ProjectMatch],
+) -> io::Result<usize> {
+    let snapshot = crate::document::read_snapshot(path)?;
+    if matches
+        .iter()
+        .any(|found| found.fingerprint != snapshot.fingerprint)
+    {
+        return Err(io::Error::other(
+            "file changed since replacement preview; search again",
+        ));
+    }
+    let mut sorted: Vec<_> = matches.iter().collect();
+    sorted.sort_by_key(|found| found.document_start);
+    if sorted
+        .windows(2)
+        .any(|pair| pair[0].document_end > pair[1].document_start)
+    {
+        return Err(io::Error::other(
+            "replacement preview contains overlapping ranges",
+        ));
+    }
+    let mut text = snapshot.text;
+    for found in sorted.into_iter().rev() {
+        if text.get(found.document_start..found.document_end)
+            != found.line_text.get(found.byte_start..found.byte_end)
+        {
+            return Err(io::Error::other("invalid replacement preview"));
+        }
+        let replacement = query.expand_replacement(
+            &found.line_text,
+            found.byte_start,
+            found.byte_end,
+            replacement,
+        );
+        text.replace_range(found.document_start..found.document_end, &replacement);
+    }
+    let mut bytes = Vec::new();
+    if snapshot.format.utf8_bom {
+        bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+    }
+    bytes.extend_from_slice(text.as_bytes());
+    crate::document::atomic_write_resolved(
+        path,
+        &snapshot.resolved_path,
+        Some(Some(snapshot.fingerprint)),
+        &bytes,
+    )?;
+    Ok(matches.len())
+}
+
+pub struct SearchRequest {
+    pub root: PathBuf,
+    pub query: CompiledSearch,
+    pub limit: usize,
+}
+pub type SearchWorker = crate::worker::LatestWorker<SearchRequest, ProjectSearchResults>;
+pub fn search_worker() -> SearchWorker {
+    SearchWorker::new("caret-project-search", |request, cancelled| {
+        search_cancelled(&request.root, &request.query, request.limit, cancelled)
+    })
 }
 
 #[cfg(test)]
@@ -230,5 +321,50 @@ mod tests {
         assert_eq!(replaced, 2);
         assert_eq!(fs::read_to_string(&file).unwrap(), "total(); total();\n");
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod replacement_regressions {
+    use super::*;
+    fn fixture(name: &str, bytes: &[u8]) -> (PathBuf, PathBuf, CompiledSearch) {
+        let root =
+            std::env::temp_dir().join(format!("caret-preview-{name}-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("test.txt");
+        fs::write(&path, bytes).unwrap();
+        (
+            root,
+            path,
+            CompiledSearch::compile("needle", Default::default()).unwrap(),
+        )
+    }
+    #[test]
+    fn preserves_bom_mixed_endings_and_unselected_matches() {
+        let (root, path, query) = fixture("endings", b"\xef\xbb\xbfneedle\r\nneedle\nneedle\r\n");
+        let results = search(&root, &query, 50);
+        replace_previewed(&path, &query, "changed", &results.matches[1..2]).unwrap();
+        assert_eq!(
+            fs::read(path).unwrap(),
+            b"\xef\xbb\xbfneedle\r\nchanged\nneedle\r\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn rejects_new_matches_or_rewritten_files_after_preview() {
+        let (root, path, query) = fixture("stale", b"needle\n");
+        let results = search(&root, &query, 50);
+        fs::write(&path, "needle\nneedle\n").unwrap();
+        assert!(replace_previewed(&path, &query, "changed", &results.matches).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "needle\nneedle\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cancelled_search_does_not_walk_the_project() {
+        let (root, _path, query) = fixture("cancelled", b"needle\n");
+        assert_eq!(search(&root, &query, 50).matches.len(), 1);
+        let results = search_cancelled(&root, &query, 50, &AtomicBool::new(true));
+        assert!(results.matches.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 }
