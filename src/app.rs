@@ -2231,13 +2231,33 @@ impl App {
         } else {
             views.primary
         };
-        self.editor.select(view.tab_index);
+        if !self.editor.select(view.tab_index) {
+            return;
+        }
+        let cursor_changed = self.editor.cursor != view.cursor;
+        if cursor_changed {
+            self.editor.clear_selection();
+        }
         self.editor.cursor = view.cursor;
-        self.editor.scroll_line = view.scroll_line;
+        self.editor.cursor.line = self
+            .editor
+            .cursor
+            .line
+            .min(self.editor.line_count().saturating_sub(1));
+        if cursor_changed {
+            self.editor.cursor.column = self
+                .editor
+                .cursor
+                .column
+                .min(self.editor.line_len_chars(self.editor.cursor.line));
+        }
+        self.editor.scroll_line = view
+            .scroll_line
+            .min(self.editor.line_count().saturating_sub(1));
         self.editor.scroll_column = view.scroll_column;
     }
 
-    fn sync_focused_view(&mut self) {
+    pub(crate) fn sync_focused_view(&mut self) {
         let Some(mut views) = self.split_views else {
             return;
         };
@@ -10740,5 +10760,33 @@ mod lsp_context_regressions {
         );
         assert_eq!(app.editor.editor_for_path_mut(&b).unwrap().text(), "other");
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod split_activation_regressions {
+    use super::*;
+    #[test]
+    fn inactive_shared_views_clamp_after_edits_and_do_not_extend_another_views_selection() {
+        let mut app = App::new(None).unwrap();
+        app.editor.replace_text(&"long line\n".repeat(100));
+        app.open_split(true);
+        let view = &mut app.split_views.as_mut().unwrap().secondary;
+        view.cursor = Cursor {
+            line: 90,
+            column: 90,
+        };
+        view.scroll_line = 90;
+        app.editor.replace_text("short");
+        app.split_views.as_mut().unwrap().secondary_active = true;
+        app.activate_focused_view();
+        assert_eq!(app.editor.cursor, Cursor { line: 0, column: 5 });
+        assert_eq!(app.editor.scroll_line, 0);
+        app.editor.selection_anchor = Some(Cursor { line: 0, column: 0 });
+        app.split_views.as_mut().unwrap().secondary.cursor = Cursor { line: 0, column: 2 };
+        app.activate_focused_view();
+        assert!(app.editor.selection_anchor.is_none());
+        app.editor.insert_text("ok");
+        assert_eq!(app.editor.text(), "shokort");
     }
 }

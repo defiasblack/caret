@@ -11,8 +11,8 @@ newline policy, syntax caches, and background scan/search/plugin/persistence wor
 The existing theme and selection repair is retained and exercised with `NO_COLOR`.
 
 Windows passes formatting, warnings-denied Clippy, debug/release tests, the Office
-isolation test, and six real-PTY tests. The expanded suite contains 302 passing
-unit tests and seven passing integration tests. Five tests are ignored normally:
+isolation test, and seven real-PTY tests. The expanded suite contains 306 passing
+unit tests and eight passing integration tests. Five tests are ignored normally:
 two optional external-LSP checks and three manual benchmarks, all three benchmarks
 having been run explicitly in release mode. Tests also pass with default parallel
 execution and the normal Windows temp directory containing roughly 47,000 entries;
@@ -29,7 +29,10 @@ and explicit before-install hooks rather than fixed sleeps for file races,
 coalescing, shutdown ordering, and file-manager loading. Tests cover stale/reopened
 plugin documents, changing selections, ordered/failing save hooks and pending
 quit, output overflow, changed/truncated replacement previews, BOM/mixed endings,
-malformed UTF-16/overlapping LSP edits, and both split orientations at narrow sizes.
+malformed UTF-16/overlapping LSP edits, both split orientations at narrow sizes, and automatic split scrolling in a real PTY.
+Windows transient sharing/access failures use at most 635 ms of replacement retry
+backoff. Every retry revalidates fingerprints and alias resolution; deterministic
+regressions cover an external change during backoff and permanent-error bounds.
 
 Windows release measurements (parsing/setup excluded for metadata reads):
 

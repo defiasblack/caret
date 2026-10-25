@@ -293,6 +293,7 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     if app.follow_cursor {
         app.editor
             .ensure_cursor_visible(app.viewport_rows, app.viewport_columns);
+        app.sync_focused_view();
     }
     app.project
         .ensure_selected_visible(content_height.saturating_sub(1));

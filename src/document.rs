@@ -209,8 +209,11 @@ fn atomic_write_resolved_with(
     bytes: &[u8],
     before_validate: impl FnOnce(),
 ) -> io::Result<()> {
+    let mut before_validate = Some(before_validate);
     atomic_write_impl(target, bytes, |_| {
-        before_validate();
+        if let Some(hook) = before_validate.take() {
+            hook();
+        }
         if resolve_write_target(alias)? != target {
             return Err(io::Error::other(
                 "save target changed; reload before saving",
@@ -232,7 +235,7 @@ fn atomic_write_resolved_with(
 
 fn atomic_write_impl<F>(path: &Path, bytes: &[u8], before_replace: F) -> io::Result<()>
 where
-    F: FnOnce(&Path) -> io::Result<()>,
+    F: FnMut(&Path) -> io::Result<()>,
 {
     atomic_write_impl_with_writer(path, bytes, before_replace, |file, bytes| {
         use std::io::Write;
@@ -247,7 +250,7 @@ fn atomic_write_impl_with_writer<F, W>(
     write: W,
 ) -> io::Result<()>
 where
-    F: FnOnce(&Path) -> io::Result<()>,
+    F: FnMut(&Path) -> io::Result<()>,
     W: FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
 {
     let parent = path
@@ -271,16 +274,48 @@ where
             file.sync_all()?;
         }
         drop(file);
-        before_replace(&temp)?;
-        // The platform boundary handles replacement semantics. A failure
-        // deliberately leaves the original intact.
-        crate::platform::replace_file(&temp, path)?;
+        install_replacement(
+            &temp,
+            path,
+            before_replace,
+            crate::platform::replace_file,
+            std::thread::sleep,
+            cfg!(windows),
+        )?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Windows scanners can briefly deny rename/delete sharing. Every retry must
+/// validate again: sleeping after a single fingerprint check would lose edits.
+fn install_replacement(
+    temporary: &Path,
+    destination: &Path,
+    mut validate: impl FnMut(&Path) -> io::Result<()>,
+    mut replace: impl FnMut(&Path, &Path) -> io::Result<()>,
+    mut pause: impl FnMut(std::time::Duration),
+    windows_sharing: bool,
+) -> io::Result<()> {
+    let delays = [5, 10, 20, 40, 80, 160, 320];
+    for attempt in 0..=delays.len() {
+        validate(temporary)?;
+        match replace(temporary, destination) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if windows_sharing
+                    && matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    && attempt < delays.len() =>
+            {
+                pause(std::time::Duration::from_millis(delays[attempt]));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 fn create_temporary_file(parent: &Path, name: &str) -> io::Result<(PathBuf, fs::File)> {
@@ -631,5 +666,97 @@ mod resolved_save_races {
             .is_symlink());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod replacement_retry_regressions {
+    use super::*;
+    use std::cell::Cell;
+    #[test]
+    fn transient_sharing_failures_revalidate_before_retrying() {
+        let validations = Cell::new(0);
+        let attempts = Cell::new(0);
+        let waits = Cell::new(0);
+        install_replacement(
+            Path::new("temp"),
+            Path::new("destination"),
+            |_| {
+                validations.set(validations.get() + 1);
+                Ok(())
+            },
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| waits.set(waits.get() + 1),
+            true,
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(validations.get(), 3);
+        assert_eq!(waits.get(), 2);
+    }
+    #[test]
+    fn an_external_change_during_retry_prevents_replacement() {
+        let changed = Cell::new(false);
+        let attempts = Cell::new(0);
+        let error = install_replacement(
+            Path::new("temp"),
+            Path::new("destination"),
+            |_| {
+                if changed.get() {
+                    Err(io::Error::other("external edit"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from_raw_os_error(5))
+            },
+            |_| changed.set(true),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("external edit"));
+        assert_eq!(attempts.get(), 1);
+    }
+    #[test]
+    fn retries_are_bounded_and_other_failures_are_not_retried() {
+        let attempts = Cell::new(0);
+        let waited = Cell::new(std::time::Duration::ZERO);
+        assert!(install_replacement(
+            Path::new("temp"),
+            Path::new("destination"),
+            |_| Ok(()),
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from_raw_os_error(33))
+            },
+            |delay| waited.set(waited.get() + delay),
+            true
+        )
+        .is_err());
+        assert_eq!(attempts.get(), 8);
+        assert_eq!(waited.get(), std::time::Duration::from_millis(635));
+        attempts.set(0);
+        assert!(install_replacement(
+            Path::new("temp"),
+            Path::new("destination"),
+            |_| Ok(()),
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from_raw_os_error(112))
+            },
+            |_| panic!("non-sharing failure was retried"),
+            true
+        )
+        .is_err());
+        assert_eq!(attempts.get(), 1);
     }
 }

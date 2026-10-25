@@ -479,3 +479,27 @@ fn office_helper_loads_and_closes_in_a_real_pty() {
 
 #[path = "../src/test_support.rs"]
 mod test_support;
+
+#[test]
+fn split_views_follow_edits_beyond_the_initial_viewport_in_a_real_pty() {
+    let root = temp_root();
+    fs::create_dir_all(root.join("config")).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        "keymap = 'vim'\ntheme = 'oxide'\n",
+    )
+    .unwrap();
+    let file = root.join("split.txt");
+    let source: String = (0..100).map(|line| format!("line{line}\n")).collect();
+    fs::write(&file, source).unwrap();
+    let mut process = PtyProcess::start(&file, &root.join("data"), &root.join("config"));
+    process.wait_for_output(b"Vim keys", Duration::from_secs(10));
+    process.send(b":vsplit\r:100\riVISIBLE_TAIL");
+    process.wait_for_output(b"VISIBLE_TAILline99", Duration::from_secs(10));
+    process.send(&[0x13, 0x11]);
+    assert!(process.wait_for_exit(Duration::from_secs(10)).success());
+    assert!(fs::read_to_string(file)
+        .unwrap()
+        .contains("VISIBLE_TAILline99"));
+    fs::remove_dir_all(root).unwrap();
+}

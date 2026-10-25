@@ -102,6 +102,8 @@ It was reconciled against the repository on 2026-07-25.
 
 ### Confirmed-defect and responsiveness repairs
 
+- [x] Retry transient Windows replacement sharing failures with bounded backoff
+  and repeat conflict validation before every attempt.
 - [x] Save through symbolic links without replacing aliases; reject changed
   targets and dangling links while preserving save conflict checks.
 - [x] Apply only reviewed project replacement ranges against previewed bytes,
@@ -109,7 +111,8 @@ It was reconciled against the repository on 2026-07-25.
 - [x] Validate LSP versions, request revisions, UTF-16 boundaries, and overlapping
   ranges before applying edits; preflight complete workspace responses.
 - [x] Share split-pane geometry across rendering, cursor placement, clicking,
-  and dragging; remap and clamp both panes after tab closure.
+  and dragging; retain automatic scrolling and remap/clamp pane state after tab
+  closure or shared-document edits.
 - [x] Cache newline policy through edits, replacement, undo, redo, and reload;
   use it for both open-line commands.
 - [x] Share cached syntax folds/symbols by revision, recognize Rust function
