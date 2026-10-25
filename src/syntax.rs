@@ -175,15 +175,8 @@ impl SyntaxDocument {
     pub fn apply_byte_edit(&mut self, start_byte: usize, old_end_byte: usize, inserted: &str) {
         self.folds.take();
         self.symbols_cache.take();
-        let point = |byte: usize| {
-            let row = self
-                .line_starts
-                .partition_point(|offset| *offset <= byte)
-                .saturating_sub(1);
-            Point::new(row, byte - self.line_starts[row])
-        };
-        let start_position = point(start_byte);
-        let old_end_position = point(old_end_byte);
+        let start_position = self.point_for_byte(start_byte);
+        let old_end_position = self.point_for_byte(old_end_byte);
         let new_end_position = point_after_text(start_position, inserted);
         let new_end_byte = start_byte + inserted.len();
         self.tree.edit(&InputEdit {
@@ -217,6 +210,14 @@ impl SyntaxDocument {
         if let Some(tree) = self.parser.parse(&self.source, Some(&self.tree)) {
             self.tree = tree;
         }
+    }
+
+    fn point_for_byte(&self, byte: usize) -> Point {
+        let row = self
+            .line_starts
+            .partition_point(|offset| *offset <= byte)
+            .saturating_sub(1);
+        Point::new(row, byte - self.line_starts[row])
     }
 
     pub fn highlight_line(&self, line_index: usize, line: &str, theme: &Theme) -> Vec<Color> {
@@ -1539,6 +1540,12 @@ mod cache_regressions {
                 black_box(syntax.symbols());
             }
             let metadata = start.elapsed();
+            let start = Instant::now();
+            for _ in 0..10_000 {
+                black_box(syntax.point_for_byte(black_box(source.len() - 1)));
+            }
+            let positions = start.elapsed();
+            eprintln!("{lines} lines, 10,000 cached EOF position lookups: {positions:?}");
             let start = Instant::now();
             for _ in 0..50 {
                 syntax.apply_byte_edit(source.len() - 1, source.len() - 1, " ");

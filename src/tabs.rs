@@ -17,6 +17,8 @@ pub struct BufferTab {
     untitled_id: usize,
 }
 
+pub type DocumentState = ((u64, u64), Option<PathBuf>);
+
 pub struct Tabs {
     tabs: Vec<BufferTab>,
     active: usize,
@@ -153,6 +155,19 @@ impl Tabs {
 
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
+    }
+
+    pub fn document_states(&self) -> Vec<DocumentState> {
+        self.tabs
+            .iter()
+            .map(|tab| (tab.editor.stamp(), tab.editor.path.clone()))
+            .collect()
+    }
+    pub fn matches_document_states(&self, states: &[DocumentState]) -> bool {
+        self.tabs.len() == states.len()
+            && self.tabs.iter().zip(states).all(|(tab, (stamp, path))| {
+                tab.editor.stamp() == *stamp && tab.editor.path == *path
+            })
     }
 
     pub fn index_for_document(&self, document: u64) -> Option<usize> {

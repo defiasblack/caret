@@ -262,7 +262,8 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
             out,
             MoveTo(0, 0),
             SetForegroundColor(app.theme.error),
-            Print("Terminal is too small for Caret.")
+            Print("Terminal is too small for Caret."),
+            EndSynchronizedUpdate
         )?;
         out.flush()?;
         return Ok(());

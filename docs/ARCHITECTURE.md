@@ -29,13 +29,24 @@ responsibilities live behind focused boundaries:
   and only requests background refreshes; it never launches Git itself.
 - `src/file_manager.rs` owns cached parent/current directory snapshots,
   responsive manager state, selection and history, background scans and safe
-  previews with a hard response timeout, generation-based stale-result
-  rejection, targeted polling-watcher invalidation, failed-item retry, and
+  previews in a separate bounded worker with execution-time response deadlines,
+  generation-based stale-result rejection, native invalidation with bounded
+  fallback polling, failed-item retry, and
   background operation coordination.
 - `src/file_ops.rs` is the filesystem-command boundary for recursive
   copy/move/duplicate, conflict policy, cancellation, OS trash, permanent
   deletion, cross-device fallback, partial-failure reporting, and
   copy-into-descendant rejection.
+- `src/worker.rs` provides one running and one replaceable pending job, bounded
+  result storage, cancellation, and generation-based result rejection.
+- `src/persistence_worker.rs` serializes coalesced recovery/session requests.
+  Recovery snapshots clone Rope storage cheaply; text conversion and disk writes
+  happen on the worker. Clean shutdown waits for ordered final writes and journal
+  removal, preventing a late checkpoint from recreating a discarded journal.
+- `src/app/plugin_actions.rs` binds asynchronous plugin results to document
+  identity, revision, path, and selection. Hook sequences retain their order and
+  save only the final successful output. Supervised process groups/Windows jobs
+  and output budgets live in `src/plugin.rs`.
 - `src/app/persistence.rs` owns application save/quit policy, while
   `src/app/settings.rs` owns settings inspection and validated `:set` changes.
 - `src/file_ops.rs` preserves the no-replace boundary for synchronous project

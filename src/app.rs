@@ -371,6 +371,15 @@ pub struct ProjectSearchState {
     pub confirm_replace: bool,
 }
 
+#[derive(Clone)]
+struct LspEditContext {
+    path: PathBuf,
+    stamp: (u64, u64),
+    cursor: Cursor,
+    anchor: Option<Cursor>,
+    documents: std::sync::Arc<[crate::tabs::DocumentState]>,
+}
+
 struct PluginTask {
     document: u64,
     path: Option<PathBuf>,
@@ -477,8 +486,8 @@ pub struct App {
     lsp_restart_count: u8,
     lsp_version: i64,
     lsp_requests: HashMap<u64, String>,
-    lsp_edit_contexts: HashMap<u64, (PathBuf, (u64, u64))>,
-    lsp_panel_origin: Option<(PathBuf, (u64, u64))>,
+    lsp_edit_contexts: HashMap<u64, LspEditContext>,
+    lsp_panel_origin: Option<LspEditContext>,
     lsp_format_requests: HashMap<u64, (PathBuf, String)>,
     lsp_initialized: bool,
     lsp_workspace_ready: bool,
@@ -2349,6 +2358,12 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.plugin_quit_pending && key.code == KeyCode::Esc {
+            self.plugin_quit_pending = false;
+            self.message = "Quit cancelled; save hooks continue in the background".to_string();
+            return;
+        }
+
         // Quit confirmation gets first chance at every key so terminal/editor
         // shortcuts cannot accidentally dismiss or bypass the prompt.
         if self.mode == Mode::QuitConfirm {
@@ -7565,13 +7580,17 @@ impl App {
             panel.kind,
             LspPanelKind::CodeActions | LspPanelKind::Completion
         ) {
-            if let Some((path, stamp)) = self.lsp_panel_origin.take() {
-                if self
-                    .editor
-                    .editor_for_path_mut(&path)
-                    .is_none_or(|editor| editor.stamp() != stamp)
-                {
-                    self.message = "LSP action ignored: document changed".to_string();
+            if let Some(context) = self.lsp_panel_origin.take() {
+                let changed = self.editor.path.as_ref() != Some(&context.path)
+                    || self.editor.stamp() != context.stamp
+                    || (matches!(panel.kind, LspPanelKind::Completion)
+                        && (self.editor.cursor != context.cursor
+                            || self.editor.selection_anchor != context.anchor))
+                    || (matches!(panel.kind, LspPanelKind::CodeActions)
+                        && !self.editor.matches_document_states(&context.documents));
+                if changed {
+                    self.message =
+                        "LSP action ignored: document, cursor, or selection changed".to_string();
                     return;
                 }
             }
@@ -7653,8 +7672,7 @@ impl App {
                 self.lsp_requests
                     .insert(id, "textDocument/rename".to_string());
                 if let Some(path) = self.editor.path.clone() {
-                    self.lsp_edit_contexts
-                        .insert(id, (path, self.editor.stamp()));
+                    self.lsp_edit_contexts.insert(id, self.lsp_context(path));
                 }
                 self.message = format!("Renaming symbol to {new_name}…");
             }
@@ -7901,6 +7919,16 @@ impl App {
         }
     }
 
+    fn lsp_context(&self, path: PathBuf) -> LspEditContext {
+        LspEditContext {
+            path,
+            stamp: self.editor.stamp(),
+            cursor: self.editor.cursor,
+            anchor: self.editor.selection_anchor,
+            documents: self.editor.document_states().into(),
+        }
+    }
+
     fn sync_lsp_document(&mut self) {
         if self.editor.path != self.lsp_open_path {
             self.sync_lsp_active_file();
@@ -7993,8 +8021,7 @@ impl App {
             Ok(id) => {
                 self.lsp_requests.insert(id, method.to_string());
                 if let Some(path) = self.editor.path.clone() {
-                    self.lsp_edit_contexts
-                        .insert(id, (path, self.editor.stamp()));
+                    self.lsp_edit_contexts.insert(id, self.lsp_context(path));
                 }
                 self.message = format!("LSP request: {method}");
             }
@@ -8061,7 +8088,7 @@ impl App {
                 self.lsp_requests
                     .insert(id, "textDocument/rangeFormatting".to_string());
                 self.lsp_edit_contexts
-                    .insert(id, (path.clone(), self.editor.stamp()));
+                    .insert(id, self.lsp_context(path.clone()));
                 self.lsp_format_requests.insert(id, (path, requested_text));
                 self.message = "Selection formatting requested".to_string();
             }
@@ -8093,7 +8120,7 @@ impl App {
                 self.lsp_requests
                     .insert(id, "textDocument/formatting".to_string());
                 self.lsp_edit_contexts
-                    .insert(id, (path.clone(), self.editor.stamp()));
+                    .insert(id, self.lsp_context(path.clone()));
                 self.lsp_format_requests.insert(id, (path, requested_text));
                 self.message = "LSP formatting requested".to_string();
             }
@@ -8203,14 +8230,26 @@ impl App {
         let request = response_id.and_then(|id| self.lsp_requests.remove(&id));
         let format_request = response_id.and_then(|id| self.lsp_format_requests.remove(&id));
         let origin = response_id.and_then(|id| self.lsp_edit_contexts.remove(&id));
-        if let Some((path, stamp)) = origin.as_ref() {
-            if self
+        if let Some(context) = origin.as_ref() {
+            let changed = self
                 .editor
-                .editor_for_path_mut(path)
-                .is_none_or(|editor| editor.stamp() != *stamp)
-            {
+                .editor_for_path_mut(&context.path)
+                .is_none_or(|editor| editor.stamp() != context.stamp);
+            let workspace_changed = matches!(
+                request.as_deref(),
+                Some("textDocument/codeAction" | "textDocument/rename")
+            ) && !self.editor.matches_document_states(&context.documents);
+            let panel_moved = matches!(
+                request.as_deref(),
+                Some("textDocument/codeAction" | "textDocument/completion")
+            ) && (self.editor.path.as_ref() != Some(&context.path)
+                || (request.as_deref() == Some("textDocument/completion")
+                    && (self.editor.cursor != context.cursor
+                        || self.editor.selection_anchor != context.anchor)));
+            if changed || workspace_changed || panel_moved {
                 self.message =
-                    "LSP result ignored: document changed while request was running".to_string();
+                    "LSP result ignored: document or cursor changed while request was running"
+                        .to_string();
                 return;
             }
         }
@@ -10343,7 +10382,7 @@ mod repair_regressions {
         (root, path, app)
     }
     #[test]
-    fn regression_right_split_mouse_offset() {
+    fn right_split_click_uses_the_pane_origin() {
         let (_root, _path, mut app) = fixture("split-mouse", &"a".repeat(110));
         app.open_split(true);
         let layout = crate::ui::screen_layout(&app, 120, 30);
@@ -10357,7 +10396,7 @@ mod repair_regressions {
         assert_eq!(app.editor.cursor.column, 0);
     }
     #[test]
-    fn regression_split_tab_close_indices() {
+    fn closing_tabs_preserves_split_documents() {
         let (root, _path, mut app) = fixture("split-close", "A");
         let second = root.join("b.txt");
         let third = root.join("c.txt");
@@ -10378,7 +10417,7 @@ mod repair_regressions {
         assert_eq!(app.editor.text(), "B");
     }
     #[test]
-    fn regression_project_replace_exceeds_preview() {
+    fn project_replace_respects_the_truncated_preview() {
         let (_root, path, mut app) = fixture("replace", &"needle\n".repeat(51));
         app.project_search.query = "needle".to_owned();
         app.project_search.replacement = "changed".to_owned();
@@ -10396,7 +10435,7 @@ mod repair_regressions {
         assert_eq!(replaced, 50);
     }
     #[test]
-    fn regression_workspace_edit_ignores_version() {
+    fn workspace_edit_rejects_stale_versions() {
         let (_root, path, mut app) = fixture("lsp-version", "new content");
         app.lsp_version = 2;
         let result = app.apply_workspace_edit(&json!({"documentChanges":[{
@@ -10412,7 +10451,7 @@ mod repair_regressions {
         assert_eq!(app.editor.text(), "new content");
     }
     #[test]
-    fn regression_overlapping_lsp_edits_panic() {
+    fn overlapping_lsp_edits_return_error_without_panicking() {
         let edits = json!([
             {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":4}},"newText":""},
             {"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":5}},"newText":""}
@@ -10547,6 +10586,10 @@ mod worker_and_edit_regressions {
         )
         .unwrap();
         app.request_quit(false);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.plugin_quit_pending);
+        app.request_quit(false);
+
         assert!(!app.should_quit);
         finish_one(&mut app);
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
@@ -10653,5 +10696,49 @@ mod worker_and_edit_regressions {
                 assert_eq!(app.editor.cursor, before);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lsp_context_regressions {
+    use super::*;
+    #[test]
+    fn completion_cannot_target_another_tab_or_a_moved_cursor() {
+        let root =
+            std::env::temp_dir().join(format!("caret-completion-context-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        fs::write(&a, "original").unwrap();
+        fs::write(&b, "other").unwrap();
+        let mut app = App::new(Some(&a)).unwrap();
+        for switch in [false, true] {
+            app.editor.open_or_switch(&a).unwrap();
+            app.editor.move_line_start();
+            app.lsp_panel_origin = Some(app.lsp_context(app.editor.path.clone().unwrap()));
+            app.lsp_panel = Some(LspPanel {
+                title: "Completion".into(),
+                selected: 0,
+                kind: LspPanelKind::Completion,
+                items: vec![LspPanelItem {
+                    label: "bad".into(),
+                    detail: String::new(),
+                    payload: json!({"insertText":"wrong"}),
+                }],
+            });
+            if switch {
+                app.editor.open_or_switch(&b).unwrap();
+            } else {
+                app.editor.move_right();
+            }
+            app.activate_lsp_panel_item();
+            assert!(app.message.contains("ignored"));
+        }
+        assert_eq!(
+            app.editor.editor_for_path_mut(&a).unwrap().text(),
+            "original"
+        );
+        assert_eq!(app.editor.editor_for_path_mut(&b).unwrap().text(), "other");
+        fs::remove_dir_all(root).unwrap();
     }
 }

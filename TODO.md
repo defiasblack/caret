@@ -122,8 +122,9 @@ It was reconciled against the repository on 2026-07-25.
   hooks and child cleanup before quitting.
 - [x] Run cancellable project searches and coalesced recovery/session writes
   outside the input thread; order final checkpoints and journal removal.
-- [ ] Complete expanded regressions, release benchmarks, PTY checks, and the
-  Windows/Linux/macOS CI verification for this repair pass.
+- [x] Complete expanded regressions, release benchmarks, PTY checks, and
+  Windows/Linux/macOS CI verification; record results and remaining parser
+  scaling costs in `docs/RELIABILITY_VALIDATION.md`.
 
 ### Remaining release work
 

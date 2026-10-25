@@ -1,9 +1,58 @@
 # Repository repair validation
 
-Validated on 2026-10-09. The changes preserve commands, keybindings, supported
+Validated on 2026-10-09, with the follow-up repair pass below on 2026-10-25. The changes preserve commands, keybindings, supported
 Office formats, configuration compatibility, and the session JSON schema.
 
-## Automated checks
+## 2026-10-25 follow-up
+
+The follow-up covers symbolic-link saves and retarget races, exact replacement
+previews, LSP version/range/request validation, split geometry and tab removal,
+newline policy, syntax caches, and background scan/search/plugin/persistence work.
+The existing theme and selection repair is retained and exercised with `NO_COLOR`.
+
+Windows passes formatting, warnings-denied Clippy, debug/release tests, the Office
+isolation test, and six real-PTY tests. The expanded suite contains 302 passing
+unit tests and seven passing integration tests. Five tests are ignored normally:
+two optional external-LSP checks and three manual benchmarks, all three benchmarks
+having been run explicitly in release mode. Tests also pass with default parallel
+execution and the normal Windows temp directory containing roughly 47,000 entries;
+the earlier isolated-temp workaround is no longer required.
+
+The [repair CI run](https://github.com/defiasblack/caret/actions/runs/40185483935)
+passes all four jobs: Ubuntu formatting/Clippy/tests and Windows, Linux, and macOS
+release builds, platform suites, PTY tests, and diagnostics. Follow-up completion
+context guards and documentation use the same checks on the
+[current pull-request head](https://github.com/defiasblack/caret/pull/22/checks).
+
+Regression synchronization uses worker completion events, condition variables,
+and explicit before-install hooks rather than fixed sleeps for file races,
+coalescing, shutdown ordering, and file-manager loading. Tests cover stale/reopened
+plugin documents, changing selections, ordered/failing save hooks and pending
+quit, output overflow, changed/truncated replacement previews, BOM/mixed endings,
+malformed UTF-16/overlapping LSP edits, and both split orientations at narrow sizes.
+
+Windows release measurements (parsing/setup excluded for metadata reads):
+
+| Measurement | 1,000 Rust lines | 20,000 Rust lines |
+| --- | ---: | ---: |
+| 50 uncached fold + symbol traversals, review baseline | 177.953 ms | 4,236.900 ms |
+| 50 cached fold + symbol lookups | 1.1 us | 1.3 us |
+| 10,000 cached EOF byte-position lookups | 91.8 us | 164.4 us |
+| 50 incremental byte edits near EOF | 20.865 ms | 581.194 ms |
+
+Cached metadata shares immutable results until a byte edit invalidates them.
+Rope supplies edit byte offsets and parser points use binary searches of cached
+line starts; neither calculation scans preceding document text. Overall editing
+still scales with Tree-sitter tree-edit/reparse work, as the EOF measurements show;
+this pass does not claim constant-time parsing or large-file mode.
+
+The repeated viewport benchmark measured 100 draws of 30 lines at 29.455 ms near
+line zero and 31.503 ms near line 19,970. Ten thousand coalesced disk polls took
+0.794 ms; twenty streaming 16 MiB fingerprints took 111.228 ms. These timings are
+diagnostic measurements, not CI timing assertions.
+
+## 2026-10-09 baseline automated checks
+
 
 Windows local validation passes formatting, warnings-denied Clippy, all-target
 and all-feature tests in debug and release, the real Office helper isolation

@@ -104,4 +104,4 @@ save. Each hook sees the previous hook's edits to the originating document;
 Caret saves the final output once the complete sequence succeeds. The event
 passed to the plugin is `on_save`. A failure leaves earlier hook edits unsaved
 and keeps the editor open. Normal quit waits for the sequence; forced quit
-cancels it. Continued typing rejects stale hook output and preserves newer edits.
+cancels it. Esc cancels a pending normal quit while hooks continue. Continued typing rejects stale hook output and preserves newer edits.

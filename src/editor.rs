@@ -3488,7 +3488,7 @@ mod tests {
 mod repair_regressions {
     use super::*;
     #[test]
-    fn regression_save_replaces_symlink_instead_of_target() {
+    fn saving_an_alias_updates_the_target_and_preserves_the_link() {
         let root = std::env::temp_dir().join(format!("audit-symlink-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let target = root.join("target.txt");
@@ -3526,7 +3526,7 @@ mod repair_regressions {
 mod newline_regressions {
     use super::*;
     #[test]
-    fn regression_open_line_ignores_crlf_format() {
+    fn open_line_below_preserves_crlf() {
         let root = std::env::temp_dir().join(format!("audit-crlf-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("crlf.txt");
