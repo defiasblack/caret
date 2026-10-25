@@ -66,6 +66,9 @@ It was reconciled against the repository on 2026-07-25.
   atomic saves, external-change confirmation, idle recovery checkpointing,
   forced termination, recovery discovery, restore, and re-save on every CI
   platform.
+- [x] Verify distinct Rust syntax colors, visible mouse drag selection, and
+  Shift-End selection with replacement and save in a real terminal, including
+  launches inheriting `NO_COLOR`; honor the configured interactive theme.
 - [x] Windows, macOS, and Linux CI build/test/diagnostic matrix plus Ubuntu
   locked-install and PTY startup smoke coverage, with warnings denied.
 
@@ -96,6 +99,31 @@ It was reconciled against the repository on 2026-07-25.
 - [x] Record Windows/Linux/macOS formatting, warnings-denied Clippy, full tests,
   release builds, PTY smoke tests, and release performance measurements for these
   repairs in `docs/RELIABILITY_VALIDATION.md`.
+
+### Confirmed-defect and responsiveness repairs
+
+- [x] Save through symbolic links without replacing aliases; reject changed
+  targets and dangling links while preserving save conflict checks.
+- [x] Apply only reviewed project replacement ranges against previewed bytes,
+  preserving BOMs, mixed line endings, exclusions, and truncated result limits.
+- [x] Validate LSP versions, request revisions, UTF-16 boundaries, and overlapping
+  ranges before applying edits; preflight complete workspace responses.
+- [x] Share split-pane geometry across rendering, cursor placement, clicking,
+  and dragging; remap and clamp both panes after tab closure.
+- [x] Cache newline policy through edits, replacement, undo, redo, and reload;
+  use it for both open-line commands.
+- [x] Share cached syntax folds/symbols by revision, recognize Rust function
+  items, and derive parser edit positions from Rope byte offsets and line caches.
+- [x] Coalesce obsolete file-manager scans, prioritize current panes and
+  operations, cancel scans between entries, use native invalidation with bounded
+  fallback polling, and isolate previews with execution-time deadlines.
+- [x] Run plugin commands and ordered save hooks asynchronously, reject stale
+  results, bound stdout/stderr, supervise process groups/jobs, and wait for save
+  hooks and child cleanup before quitting.
+- [x] Run cancellable project searches and coalesced recovery/session writes
+  outside the input thread; order final checkpoints and journal removal.
+- [ ] Complete expanded regressions, release benchmarks, PTY checks, and the
+  Windows/Linux/macOS CI verification for this repair pass.
 
 ### Remaining release work
 
@@ -407,6 +435,9 @@ not satisfy the roadmap's safe operation layer.
 
 ## Known release-blocking or tracked defects
 
+- [x] Resolve four Windows file-manager failures caused by queued parent scans:
+  background scan completion, operation undo, restored selection, and watcher
+  invalidation. Tests now synchronize on worker events and cover large parents.
 - [x] Fix C# `:def`: solution discovery now prefers an ancestor `.sln`/`.slnx`
   over a nested `.csproj`, existing Windows and UNC paths produce valid file
   URIs, and a real `csharp-ls` definition round trip verifies the fix.

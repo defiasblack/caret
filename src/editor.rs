@@ -107,6 +107,7 @@ pub struct Editor {
     pub scroll_line: usize,
     pub scroll_column: usize,
     pub dirty: bool,
+    document_id: u64,
     revision: u64,
     saved_revision: u64,
     next_revision: u64,
@@ -119,8 +120,10 @@ pub struct Editor {
     disk_modified: Option<SystemTime>,
     disk_len: Option<u64>,
     disk_fingerprint: Option<u64>,
+    disk_target: Option<PathBuf>,
     external_change_pending: bool,
     format: FileFormat,
+    crlf_count: usize,
     folded_ranges: BTreeMap<usize, usize>,
     undo: Vec<Transaction>,
     redo: Vec<Transaction>,
@@ -144,6 +147,7 @@ impl Editor {
                 scroll_line: 0,
                 scroll_column: 0,
                 dirty: false,
+                document_id: next_disk_epoch(),
                 revision: 0,
                 saved_revision: 0,
                 next_revision: 1,
@@ -156,7 +160,9 @@ impl Editor {
                 disk_modified: None,
                 disk_len: None,
                 disk_fingerprint: None,
+                disk_target: None,
                 external_change_pending: false,
+                crlf_count: 0,
                 format: FileFormat {
                     utf8_bom: false,
                     line_ending: LineEnding::Lf,
@@ -185,6 +191,7 @@ impl Editor {
             scroll_line: 0,
             scroll_column: 0,
             dirty: false,
+            document_id: next_disk_epoch(),
             revision: 0,
             saved_revision: 0,
             next_revision: 1,
@@ -197,7 +204,9 @@ impl Editor {
             disk_modified: None,
             disk_len: None,
             disk_fingerprint: None,
+            disk_target: None,
             external_change_pending: false,
+            crlf_count: 0,
             format: FileFormat {
                 utf8_bom: false,
                 line_ending: LineEnding::Lf,
@@ -230,6 +239,7 @@ impl Editor {
             scroll_line: 0,
             scroll_column: 0,
             dirty: false,
+            document_id: next_disk_epoch(),
             revision: 0,
             saved_revision: 0,
             next_revision: 1,
@@ -242,7 +252,9 @@ impl Editor {
             disk_modified: snapshot.modified,
             disk_len: Some(snapshot.len),
             disk_fingerprint: Some(snapshot.fingerprint),
+            disk_target: Some(snapshot.resolved_path),
             external_change_pending: false,
+            crlf_count: contents.matches("\r\n").count(),
             format,
             folded_ranges: BTreeMap::new(),
             undo: Vec::new(),
@@ -311,6 +323,18 @@ impl Editor {
             }
         }
 
+        let target = document::resolve_write_target(path)?;
+        if saving_current_path
+            && self
+                .disk_target
+                .as_ref()
+                .is_some_and(|previous| previous != &target)
+        {
+            return Err(io::Error::other(
+                "save target changed; reload before saving",
+            ));
+        }
+
         if fs::metadata(path)
             .map(|metadata| metadata.permissions().readonly())
             .unwrap_or(false)
@@ -344,17 +368,16 @@ impl Editor {
         for chunk in self.buffer.chunks() {
             bytes.extend_from_slice(chunk.as_bytes());
         }
-        if overwrite_confirmed {
-            document::atomic_write(path, &bytes)?;
-        } else {
-            let expected_fingerprint = saving_current_path
+        let expected = (!overwrite_confirmed).then_some(
+            saving_current_path
                 .then_some(self.disk_fingerprint)
-                .flatten();
-            document::atomic_write_if_unchanged(path, expected_fingerprint, &bytes)?;
-        }
+                .flatten(),
+        );
+        document::atomic_write_resolved(path, &target, expected, &bytes)?;
 
         after_write();
         self.path = Some(path.to_path_buf());
+        self.disk_target = Some(target);
         let source = self.buffer.to_string();
         if self
             .syntax
@@ -373,6 +396,22 @@ impl Editor {
         self.disk_fingerprint = Some(document::fingerprint_bytes(&bytes));
         self.external_change_pending = false;
         Ok(())
+    }
+
+    pub fn stamp(&self) -> (u64, u64) {
+        (self.document_id, self.revision)
+    }
+
+    pub fn remap_path(&mut self, source: &Path, destination: &Path) {
+        for path in [&mut self.path, &mut self.disk_target]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(relative) = path.strip_prefix(source) {
+                *path = destination.join(relative);
+            }
+        }
+        self.disk_epoch = next_disk_epoch();
     }
 
     pub fn disk_epoch(&self) -> u64 {
@@ -533,19 +572,8 @@ impl Editor {
         if end == at && inserted.is_empty() {
             return;
         }
-        if let Some(syntax) = self.syntax.as_mut() {
-            syntax.apply_edit(at, end - at, inserted);
-        }
-        let removed = if end > at {
-            let text = self.buffer.slice(at..end).to_string();
-            self.buffer.remove(at..end);
-            text
-        } else {
-            String::new()
-        };
-        if !inserted.is_empty() {
-            self.buffer.insert(at, inserted);
-        }
+        let removed = self.buffer.slice(at..end).to_string();
+        self.apply_buffer_change(at, end, inserted);
         self.revision = self.next_revision;
         self.next_revision = self
             .next_revision
@@ -579,6 +607,44 @@ impl Editor {
                 removed,
                 inserted: inserted.to_string(),
             });
+        }
+    }
+
+    fn apply_buffer_change(&mut self, at: usize, end: usize, inserted: &str) {
+        let begin = at.saturating_sub(1);
+        let old_stop = (end + 1).min(self.buffer.len_chars());
+        let before = self
+            .buffer
+            .slice(begin..old_stop)
+            .to_string()
+            .matches("\r\n")
+            .count();
+        if let Some(syntax) = self.syntax.as_mut() {
+            syntax.apply_byte_edit(
+                self.buffer.char_to_byte(at),
+                self.buffer.char_to_byte(end),
+                inserted,
+            );
+        }
+        if end > at {
+            self.buffer.remove(at..end);
+        }
+        if !inserted.is_empty() {
+            self.buffer.insert(at, inserted);
+        }
+        let stop = (at + inserted.chars().count() + 1).min(self.buffer.len_chars());
+        let after = self
+            .buffer
+            .slice(begin..stop)
+            .to_string()
+            .matches("\r\n")
+            .count();
+        self.crlf_count = self.crlf_count - before + after;
+        // Keep the original policy when the final line break is removed.
+        if self.crlf_count > 0 {
+            self.format.line_ending = LineEnding::Crlf;
+        } else if self.buffer.len_lines() > 1 {
+            self.format.line_ending = LineEnding::Lf;
         }
     }
 
@@ -618,15 +684,7 @@ impl Editor {
 
         for op in transaction.ops.iter().rev() {
             let inserted_chars = op.inserted.chars().count();
-            if let Some(syntax) = self.syntax.as_mut() {
-                syntax.apply_edit(op.at, inserted_chars, &op.removed);
-            }
-            if inserted_chars > 0 {
-                self.buffer.remove(op.at..op.at + inserted_chars);
-            }
-            if !op.removed.is_empty() {
-                self.buffer.insert(op.at, &op.removed);
-            }
+            self.apply_buffer_change(op.at, op.at + inserted_chars, &op.removed);
         }
 
         self.restore_cursor_state(&transaction.before);
@@ -645,15 +703,7 @@ impl Editor {
 
         for op in &transaction.ops {
             let removed_chars = op.removed.chars().count();
-            if let Some(syntax) = self.syntax.as_mut() {
-                syntax.apply_edit(op.at, removed_chars, &op.inserted);
-            }
-            if removed_chars > 0 {
-                self.buffer.remove(op.at..op.at + removed_chars);
-            }
-            if !op.inserted.is_empty() {
-                self.buffer.insert(op.at, &op.inserted);
-            }
+            self.apply_buffer_change(op.at, op.at + removed_chars, &op.inserted);
         }
 
         self.restore_cursor_state(&transaction.after);
@@ -682,25 +732,27 @@ impl Editor {
         )
     }
 
-    pub fn syntax_fold_ranges(&self) -> Vec<(usize, usize)> {
+    pub fn syntax_fold_ranges(&self) -> std::sync::Arc<[(usize, usize)]> {
         self.syntax.as_ref().map_or_else(
             || {
                 syntax::fold_ranges(
                     &self.text(),
                     syntax::Language::from_path(self.path.as_deref()),
                 )
+                .into()
             },
             SyntaxDocument::fold_ranges,
         )
     }
 
-    pub fn syntax_symbols(&self) -> Vec<syntax::Symbol> {
+    pub fn syntax_symbols(&self) -> std::sync::Arc<[syntax::Symbol]> {
         self.syntax.as_ref().map_or_else(
             || {
                 syntax::symbols(
                     &self.text(),
                     syntax::Language::from_path(self.path.as_deref()),
                 )
+                .into()
             },
             SyntaxDocument::symbols,
         )
@@ -708,8 +760,9 @@ impl Editor {
 
     pub fn syntax_breadcrumbs(&self, line: usize) -> Vec<syntax::Symbol> {
         self.syntax_symbols()
-            .into_iter()
+            .iter()
             .filter(|symbol| symbol.start_line <= line && line <= symbol.end_line)
+            .cloned()
             .collect()
     }
 
@@ -722,6 +775,10 @@ impl Editor {
 
     pub fn len_chars(&self) -> usize {
         self.buffer.len_chars()
+    }
+
+    pub fn snapshot_buffer(&self) -> Rope {
+        self.buffer.clone()
     }
 
     pub fn text(&self) -> String {
@@ -1953,6 +2010,7 @@ impl Editor {
 
     pub fn open_line_below(&mut self) {
         self.begin_undo_group();
+        let ending = self.line_ending();
         let indent = if self.auto_indent {
             self.line_indent(self.cursor.line)
         } else {
@@ -1960,10 +2018,10 @@ impl Editor {
         };
         if self.cursor.line + 1 < self.line_count() {
             let insertion = self.buffer.line_to_char(self.cursor.line + 1);
-            self.edit(insertion, 0, &format!("{indent}\n"));
+            self.edit(insertion, 0, &format!("{indent}{ending}"));
         } else {
             let insertion = self.buffer.len_chars();
-            self.edit(insertion, 0, &format!("\n{indent}"));
+            self.edit(insertion, 0, &format!("{ending}{indent}"));
         }
         self.cursor.line += 1;
         self.cursor.column = indent.chars().count();
@@ -1972,13 +2030,14 @@ impl Editor {
 
     pub fn open_line_above(&mut self) {
         self.begin_undo_group();
+        let ending = self.line_ending();
         let indent = if self.auto_indent {
             self.line_indent(self.cursor.line)
         } else {
             String::new()
         };
         let insertion = self.buffer.line_to_char(self.cursor.line);
-        self.edit(insertion, 0, &format!("{indent}\n"));
+        self.edit(insertion, 0, &format!("{indent}{ending}"));
         self.cursor.column = indent.chars().count();
         self.preferred_column = None;
     }
@@ -2514,7 +2573,7 @@ impl Editor {
     }
 
     fn line_ending(&self) -> &'static str {
-        if self.buffer.to_string().contains("\r\n") {
+        if self.format.line_ending == LineEnding::Crlf {
             "\r\n"
         } else {
             "\n"
@@ -3421,6 +3480,126 @@ mod tests {
         assert!(editor.changed_on_disk());
         assert!(editor.save().is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod repair_regressions {
+    use super::*;
+    #[test]
+    fn regression_save_replaces_symlink_instead_of_target() {
+        let root = std::env::temp_dir().join(format!("audit-symlink-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.txt");
+        let link = root.join("link.txt");
+        fs::write(&target, "original").unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        if let Err(error) = linked {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            return;
+        }
+        let mut editor = Editor::new(Some(&link)).unwrap();
+        editor.insert_text("edited ");
+        editor.save().unwrap();
+        eprintln!(
+            "After save: link remains symlink={}, target={:?}, link={:?}",
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            fs::read_to_string(&target).unwrap(),
+            fs::read_to_string(&link).unwrap()
+        );
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(target).unwrap(), "edited original");
+    }
+}
+
+#[cfg(test)]
+mod newline_regressions {
+    use super::*;
+    #[test]
+    fn regression_open_line_ignores_crlf_format() {
+        let root = std::env::temp_dir().join(format!("audit-crlf-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("crlf.txt");
+        fs::write(&path, "first\r\nsecond\r\n").unwrap();
+        let mut editor = Editor::from_file(&path).unwrap();
+        editor.open_line_below();
+        editor.save().unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        eprintln!("Open-line-below in CRLF file saved {:?}", saved);
+        assert_eq!(saved, "first\r\n\r\nsecond\r\n");
+    }
+}
+
+#[cfg(test)]
+mod save_target_regressions {
+    use super::*;
+    fn link(target: &Path, alias: &Path) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, alias)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, alias)
+        }
+    }
+    #[test]
+    fn retargeted_and_dangling_aliases_are_never_replaced_even_with_overwrite() {
+        let root =
+            std::env::temp_dir().join(format!("caret-alias-retarget-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        let alias = root.join("alias");
+        fs::write(&a, "same").unwrap();
+        fs::write(&b, "same").unwrap();
+        if let Err(error) = link(&a, &alias) {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            return;
+        }
+        let mut editor = Editor::from_file(&alias).unwrap();
+        editor.insert_text("edit ");
+        fs::remove_file(&alias).unwrap();
+        link(&b, &alias).unwrap();
+        assert!(editor.save_as_overwrite(&alias).is_err());
+        assert_eq!(fs::read_to_string(&a).unwrap(), "same");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "same");
+        fs::remove_file(&b).unwrap();
+        assert!(editor.save_as_overwrite(&alias).is_err());
+        assert!(fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn newline_policy_tracks_replacement_undo_redo_and_both_open_commands() {
+        let path = std::env::temp_dir().join(format!("caret-newlines-{}", std::process::id()));
+        fs::write(&path, "one\r\ntwo\r\n").unwrap();
+        let mut editor = Editor::from_file(&path).unwrap();
+        editor.replace_text("new\n");
+        assert_eq!(editor.line_ending(), "\n");
+        editor.undo();
+        assert_eq!(editor.line_ending(), "\r\n");
+        editor.redo();
+        assert_eq!(editor.line_ending(), "\n");
+        editor.undo();
+        editor.open_line_above();
+        assert_eq!(editor.text(), "\r\none\r\ntwo\r\n");
+        editor.finish_undo_group();
+        editor.undo();
+        editor.open_line_below();
+        assert_eq!(editor.text(), "one\r\n\r\ntwo\r\n");
         fs::remove_file(path).unwrap();
     }
 }

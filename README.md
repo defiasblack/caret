@@ -282,6 +282,18 @@ descriptions as well as names — typing `quit` finds `:q`.
 
 ## Search and settings
 
+Project replacement applies only included matches from the displayed preview,
+including when results are truncated. Files changed since the preview are
+rejected and searched again. Replacement preserves BOMs and existing line endings.
+Saving through a symbolic link updates its target and preserves the link;
+dangling or retargeted links require resolving the conflict before saving.
+
+The interactive UI uses the saved theme even when its launcher sets
+`NO_COLOR`, so syntax colors and selection backgrounds remain visible. Without
+a saved configuration, `NO_COLOR` selects the monochrome theme. Select
+`:theme mono` for a grayscale interface. Folder previews are read-only; press
+Enter on a text file to open it for selection, copying, and editing.
+
 - `Ctrl-F` opens find and `Ctrl-H` opens find-and-replace. Search supports case,
   whole-word, regex, selection scope, history, replace-one, and replace-all.
 - `Ctrl-Shift-F` or `:grep` searches the project with a reviewable replacement
@@ -401,6 +413,12 @@ Run `:plugindir` to find the plugin directory, add a TOML manifest, and run
 `:pluginreload`. Plugins can contribute commands, language comment rules,
 themes, and save hooks. See [Caret plugins](docs/PLUGINS.md) and the
 [sample plugin](examples/plugins/sample.toml).
+
+Plugin commands and save hooks run in the background. Responses target their
+original document and are ignored if its text, identity, path, or relevant
+selection changed. Stdout is limited to 64 MiB and stderr to 4 MiB; overflow,
+cancellation, and timeouts terminate the supervised command. Save hooks retain
+their declared order, and a normal quit waits for pending save hooks.
 
 ## Reliability verification
 

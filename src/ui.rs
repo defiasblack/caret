@@ -42,6 +42,62 @@ pub struct ScreenLayout {
     pub hotkey_row: u16,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EditorPane {
+    pub x: usize,
+    pub top: u16,
+    pub width: usize,
+    pub rows: usize,
+    pub gutter: usize,
+    pub secondary: bool,
+}
+impl EditorPane {
+    pub fn contains(self, column: u16, row: u16) -> bool {
+        (column as usize) >= self.x
+            && (column as usize) < self.x + self.width
+            && row >= self.top
+            && (row as usize) < self.top as usize + self.rows
+    }
+}
+pub fn editor_panes(app: &App, width: u16, height: u16) -> Vec<EditorPane> {
+    let layout = screen_layout(app, width, height);
+    let mut panes = vec![EditorPane {
+        x: layout.editor_x,
+        top: layout.content_top,
+        width: layout.editor_width,
+        rows: layout.content_height,
+        gutter: layout.gutter_width,
+        secondary: false,
+    }];
+    if let Some(views) = app.split_views {
+        let mut second = panes[0];
+        second.secondary = true;
+        if views.vertical {
+            panes[0].width = layout.editor_width.saturating_sub(1) / 2;
+            second.x += panes[0].width + 1;
+            second.width = layout.editor_width.saturating_sub(panes[0].width + 1);
+        } else {
+            panes[0].rows = layout.content_height.saturating_sub(1) / 2;
+            second.top += panes[0].rows as u16 + 1;
+            second.rows = layout.content_height.saturating_sub(panes[0].rows + 1);
+        }
+        panes.push(second);
+        for pane in &mut panes {
+            let index = if pane.secondary {
+                views.secondary.tab_index
+            } else {
+                views.primary.tab_index
+            };
+            pane.gutter = app
+                .editor
+                .editor_at(index)
+                .map_or(0, |editor| editor.line_number_width())
+                .min(pane.width.saturating_sub(1));
+        }
+    }
+    panes
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileManagerLayout {
     parent_x: usize,
@@ -222,10 +278,14 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
     let editor_x = layout.editor_x;
     let editor_width = layout.editor_width;
     let gutter_width = layout.gutter_width;
-    let content_width = editor_width.saturating_sub(gutter_width);
 
-    app.viewport_rows = content_height.max(1);
-    app.viewport_columns = content_width.max(1);
+    let panes = editor_panes(app, width, height);
+    let active_pane = panes
+        .iter()
+        .find(|pane| pane.secondary == app.split_views.is_some_and(|views| views.secondary_active))
+        .unwrap();
+    app.viewport_rows = active_pane.rows.max(1);
+    app.viewport_columns = active_pane.width.saturating_sub(active_pane.gutter).max(1);
     if let Some(viewer) = app.office_viewer.as_mut() {
         viewer.ensure_visible(content_height, editor_width);
     }
@@ -255,75 +315,41 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
             app.editor.scroll_line,
             app.editor.scroll_column,
         );
-        if views.vertical {
-            let pane_width = editor_width.saturating_sub(1) / 2;
-            let pane_gutter = app
-                .editor
-                .line_number_width()
-                .min(pane_width.saturating_sub(1));
-            app.editor.select(views.primary.tab_index);
-            app.editor.cursor = views.primary.cursor;
-            app.editor.scroll_line = views.primary.scroll_line;
-            app.editor.scroll_column = views.primary.scroll_column;
+        for pane in &panes {
+            let view = if pane.secondary {
+                views.secondary
+            } else {
+                views.primary
+            };
+            app.editor.select(view.tab_index);
+            app.editor.cursor = view.cursor;
+            app.editor.scroll_line = view.scroll_line;
+            app.editor.scroll_column = view.scroll_column;
             draw_editor(
                 out,
                 app,
-                content_top,
-                content_height,
-                editor_x as u16,
-                pane_width as u16,
-                pane_gutter,
+                pane.top,
+                pane.rows,
+                pane.x as u16,
+                pane.width as u16,
+                pane.gutter,
             )?;
-            let divider = editor_x + pane_width;
-            draw_vertical_separator(out, app, divider as u16, content_top, content_height)?;
-            app.editor.select(views.secondary.tab_index);
-            app.editor.cursor = views.secondary.cursor;
-            app.editor.scroll_line = views.secondary.scroll_line;
-            app.editor.scroll_column = views.secondary.scroll_column;
-            draw_editor(
+        }
+        if views.vertical {
+            draw_vertical_separator(
                 out,
                 app,
+                (panes[0].x + panes[0].width) as u16,
                 content_top,
                 content_height,
-                (divider + 1) as u16,
-                pane_width as u16,
-                pane_gutter,
             )?;
         } else {
-            let pane_rows = content_height.saturating_sub(1) / 2;
-            app.editor.select(views.primary.tab_index);
-            app.editor.cursor = views.primary.cursor;
-            app.editor.scroll_line = views.primary.scroll_line;
-            app.editor.scroll_column = views.primary.scroll_column;
-            draw_editor(
-                out,
-                app,
-                content_top,
-                pane_rows,
-                editor_x as u16,
-                editor_width as u16,
-                gutter_width,
-            )?;
-            let divider = content_top + pane_rows as u16;
             queue!(
                 out,
-                MoveTo(editor_x as u16, divider),
+                MoveTo(editor_x as u16, panes[0].top + panes[0].rows as u16),
                 SetBackgroundColor(app.theme.background),
                 SetForegroundColor(app.theme.border),
                 Print("─".repeat(editor_width))
-            )?;
-            app.editor.select(views.secondary.tab_index);
-            app.editor.cursor = views.secondary.cursor;
-            app.editor.scroll_line = views.secondary.scroll_line;
-            app.editor.scroll_column = views.secondary.scroll_column;
-            draw_editor(
-                out,
-                app,
-                divider + 1,
-                pane_rows,
-                editor_x as u16,
-                editor_width as u16,
-                gutter_width,
             )?;
         }
         app.editor.select(focused.0);
@@ -412,34 +438,11 @@ pub fn draw<W: Write>(out: &mut W, app: &mut App) -> io::Result<()> {
         draw_lsp_panel(out, app, width, height)?;
     }
 
-    let (cursor_editor_x, cursor_editor_width, cursor_gutter_width) =
-        if let Some(views) = app.split_views {
-            let pane_width = editor_width.saturating_sub(1) / 2;
-            let pane_gutter = app
-                .editor
-                .line_number_width()
-                .min(pane_width.saturating_sub(1));
-            let x = if views.vertical && views.secondary_active {
-                editor_x + pane_width + 1
-            } else {
-                editor_x
-            };
-            (x, pane_width, pane_gutter)
-        } else {
-            (editor_x, editor_width, gutter_width)
-        };
-    let (cursor_content_top, cursor_content_height) = if let Some(views) = app.split_views {
-        if !views.vertical && views.secondary_active {
-            let pane_rows = content_height.saturating_sub(1) / 2;
-            (content_top + pane_rows as u16 + 1, pane_rows)
-        } else if !views.vertical {
-            (content_top, content_height.saturating_sub(1) / 2)
-        } else {
-            (content_top, content_height)
-        }
-    } else {
-        (content_top, content_height)
-    };
+    let cursor_editor_x = active_pane.x;
+    let cursor_editor_width = active_pane.width;
+    let cursor_gutter_width = active_pane.gutter;
+    let cursor_content_top = active_pane.top;
+    let cursor_content_height = active_pane.rows;
     if app.lsp_panel.is_some() || app.mode == Mode::FileManager {
         queue!(out, Hide)?;
     } else if app.terminal_focused && layout.terminal_height > 0 {

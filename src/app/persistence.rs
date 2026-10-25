@@ -66,9 +66,11 @@ impl App {
                 self.message = if hooks == 0 {
                     format!("Saved {}", path.display())
                 } else {
-                    format!("Saved {} · ran {hooks} plugin hook(s)", path.display())
+                    format!("Saved {} · running {hooks} plugin hook(s)", path.display())
                 };
-                self.request_formatting_after_save();
+                if self.plugin_task.is_none() {
+                    self.request_formatting_after_save();
+                }
             }
             Err(error) => self.message = format!("Save failed: {error}"),
         }
@@ -108,9 +110,11 @@ impl App {
                 self.message = if hooks == 0 {
                     format!("Saved {name}")
                 } else {
-                    format!("Saved {name} · ran {hooks} plugin hook(s)",)
+                    format!("Saved {name} · running {hooks} plugin hook(s)",)
                 };
-                self.request_formatting_after_save();
+                if self.plugin_task.is_none() {
+                    self.request_formatting_after_save();
+                }
                 true
             }
             Err(error) => {
@@ -121,6 +125,11 @@ impl App {
     }
 
     pub(super) fn request_quit(&mut self, force: bool) {
+        if !force && self.plugin_task.as_ref().is_some_and(|task| task.save) {
+            self.plugin_quit_pending = true;
+            self.message = "Finishing save hooks before quitting…".to_string();
+            return;
+        }
         if force || !self.editor.any_dirty() {
             self.finish_quit();
             return;
@@ -133,16 +142,17 @@ impl App {
     }
 
     pub(super) fn finish_quit(&mut self) {
-        if let Err(error) = self.checkpoint_session(true) {
+        self.plugin_worker.cancel_and_wait();
+        self.plugin_task = None;
+        self.plugin_quit_pending = false;
+        let session = self
+            .settings
+            .restore_session
+            .then(|| self.current_session_state());
+        if let Err(error) = self.persistence_worker.finish(session) {
             let _ = crate::diagnostics::append(
-                "session",
-                &format!("final session checkpoint failed: {error}"),
-            );
-        }
-        if let Err(error) = crate::recovery::discard_current() {
-            let _ = crate::diagnostics::append(
-                "recovery",
-                &format!("clean-exit journal cleanup failed: {error}"),
+                "persistence",
+                &format!("final checkpoint failed: {error}"),
             );
         }
         self.should_quit = true;

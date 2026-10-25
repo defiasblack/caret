@@ -86,10 +86,9 @@ impl PreviewRequest {
         }
     }
 
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+    pub fn start_timeout(&mut self, timeout: Duration) {
+        self.deadline = Instant::now() + timeout;
     }
-
     fn interrupted(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed) || Instant::now() >= self.deadline
     }
@@ -1075,5 +1074,27 @@ mod tests {
             .unwrap()
             .is_some_and(|text| text.contains("A1=Ship it")));
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod deadline_regressions {
+    use super::*;
+    #[test]
+    fn queued_time_does_not_consume_execution_budget_or_revive_cancelled_requests() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut request = PreviewRequest::new(
+            PathBuf::from("unused"),
+            100,
+            10,
+            Duration::ZERO,
+            Arc::clone(&cancelled),
+        );
+        assert!(request.interrupted());
+        request.start_timeout(Duration::from_secs(1));
+        assert!(!request.interrupted());
+        cancelled.store(true, Ordering::Release);
+        request.start_timeout(Duration::from_secs(1));
+        assert!(request.interrupted());
     }
 }

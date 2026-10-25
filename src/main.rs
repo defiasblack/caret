@@ -14,6 +14,7 @@ mod lsp;
 mod memory_budget;
 mod office_loader;
 mod office_viewer;
+mod persistence_worker;
 mod platform;
 mod plugin;
 mod preview;
@@ -29,6 +30,7 @@ mod terminal;
 mod test_support;
 mod theme;
 mod ui;
+mod worker;
 
 use std::{
     env,
@@ -57,6 +59,9 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
+        // The interactive theme also paints selection backgrounds. Inherited
+        // NO_COLOR must not erase them; the mono theme provides grayscale UI.
+        crossterm::style::force_color_output(true);
         execute!(
             stdout(),
             EnterAlternateScreen,

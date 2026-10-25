@@ -38,6 +38,9 @@ impl PtyProcess {
         command.env("CARET_DATA_DIR", data_dir);
         command.env("CARET_CONFIG_DIR", config_dir);
         command.env("TERM", "xterm-256color");
+        // Launchers and CI commonly set this. The TUI must retain its chosen
+        // theme, including visible selection backgrounds, in that environment.
+        command.env("NO_COLOR", "1");
 
         let child = pair
             .slave
@@ -156,6 +159,105 @@ fn temp_root() -> PathBuf {
         std::process::id(),
         TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+#[test]
+fn syntax_colors_and_mouse_keyboard_selection_work_in_a_real_pty() {
+    let root = temp_root();
+    let file = root.join("highlight.rs");
+    fs::create_dir_all(&root).expect("create smoke directory");
+    fs::write(&file, "fn main() { let message = \"hello\"; }\n").expect("create Rust file");
+    fs::create_dir_all(root.join("config")).expect("create config directory");
+    fs::write(root.join("config/config.toml"), "theme = 'oxide'\n")
+        .expect("select color theme explicitly");
+    let mut process = PtyProcess::start(&file, &root.join("data"), &root.join("config"));
+    process.wait_for_output(b"-- INSERT --", Duration::from_secs(10));
+    process.wait_for_output(b"hello", Duration::from_secs(10));
+
+    let screen = process.parser.screen();
+    let (rows, columns) = screen.size();
+    let (row, column) = (0..rows)
+        .flat_map(|row| (0..columns.saturating_sub(9)).map(move |column| (row, column)))
+        .find(|&(row, column)| {
+            "fn main()".chars().enumerate().all(|(offset, character)| {
+                screen.cell(row, column + offset as u16).unwrap().contents()
+                    == character.to_string()
+            })
+        })
+        .expect("Rust source visible");
+    let column = column as usize;
+    let cell = |offset| {
+        process
+            .parser
+            .screen()
+            .cell(row, (column + offset) as u16)
+            .unwrap()
+    };
+    assert_ne!(
+        cell(0).fgcolor(),
+        cell(3).fgcolor(),
+        "keyword uses syntax color"
+    );
+    assert_ne!(
+        cell(26).fgcolor(),
+        cell(3).fgcolor(),
+        "string uses syntax color"
+    );
+
+    // SGR coordinates are one-based. Drag across the first two characters.
+    process.send(
+        format!(
+            "\x1b[<0;{};{}M\x1b[<32;{};{}M\x1b[<0;{};{}m",
+            column + 1,
+            row + 1,
+            column + 3,
+            row + 1,
+            column + 3,
+            row + 1
+        )
+        .as_bytes(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        process.poll_output();
+        let screen = process.parser.screen();
+        if screen.cell(row, column as u16).unwrap().bgcolor()
+            != screen.cell(row, (column + 2) as u16).unwrap().bgcolor()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mouse selection was not highlighted"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    process.send(b"pub fn");
+    process.send(&[0x13]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fs::read_to_string(&file).unwrap() != "pub fn main() { let message = \"hello\"; }\n" {
+        process.poll_output();
+        assert!(
+            Instant::now() < deadline,
+            "typing did not replace mouse selection"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Home clears the old selection; Shift-End selects the complete line.
+    process.send(b"\x1b[H\x1b[1;2Ffn replacement() {}\x13");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fs::read_to_string(&file).unwrap() != "fn replacement() {}\n" {
+        process.poll_output();
+        assert!(
+            Instant::now() < deadline,
+            "Shift-End did not select the line"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    process.send(&[0x11]);
+    assert!(process.wait_for_exit(Duration::from_secs(10)).success());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

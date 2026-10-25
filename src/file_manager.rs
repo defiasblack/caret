@@ -1,14 +1,14 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
-        Arc,
+        Arc, Mutex,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::file_ops::{
@@ -84,10 +84,6 @@ enum Request {
         directories_first: bool,
         sort: SortMode,
     },
-    Preview {
-        generation: u64,
-        request: PreviewRequest,
-    },
     Operation {
         request: OperationRequest,
         cancelled: Arc<AtomicBool>,
@@ -102,6 +98,8 @@ enum Request {
         pairs: Vec<(PathBuf, PathBuf)>,
         cancelled: Arc<AtomicBool>,
     },
+    Changed(PathBuf),
+    WatchFailed(PathBuf, String),
     Stop,
 }
 
@@ -111,11 +109,6 @@ enum WorkerEvent {
         pane: Pane,
         directory: PathBuf,
         result: io::Result<Vec<FileEntry>>,
-    },
-    Previewed {
-        generation: u64,
-        path: PathBuf,
-        preview: Preview,
     },
     Progress(OperationProgress),
     OperationFinished(OperationSummary),
@@ -128,152 +121,267 @@ enum WorkerEvent {
 struct Worker {
     tx: Sender<Request>,
     rx: Receiver<WorkerEvent>,
+    scan_generation: Arc<AtomicU64>,
+    buffered: VecDeque<WorkerEvent>,
 }
 
 impl Worker {
+    fn send_operation(&self, request: Request) -> Result<(), mpsc::SendError<Request>> {
+        self.scan_generation.fetch_add(1, Ordering::AcqRel);
+        self.tx.send(request)
+    }
     fn new() -> Self {
         let (request_tx, request_rx) = mpsc::channel::<Request>();
         let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
+        let watch_requests = request_tx.clone();
+        let scan_generation = Arc::new(AtomicU64::new(0));
+        let latest_scan = Arc::clone(&scan_generation);
         thread::Builder::new()
             .name("caret-file-manager".to_string())
             .spawn(move || {
+                use notify::Watcher;
                 let mut watched: Option<(u64, PathBuf, u64)> = None;
+                let mut native: Option<notify::RecommendedWatcher> = None;
+                let dirty = Arc::new(AtomicBool::new(false));
+                let mut fallback_at = Instant::now();
+                let mut queue = VecDeque::new();
                 loop {
-                    match request_rx.recv_timeout(Duration::from_millis(250)) {
-                        Ok(request) => match request {
-                            Request::Scan {
-                                generation,
-                                pane,
-                                directory,
-                                show_hidden,
-                                directories_first,
-                                sort,
-                            } => {
-                                let result = scan_directory(
-                                    &directory,
-                                    show_hidden,
-                                    directories_first,
-                                    sort,
-                                );
-                                if pane == Pane::Current {
-                                    watched = Some((
-                                        generation,
-                                        directory.clone(),
-                                        directory_signature(&directory),
-                                    ));
+                    let received = if queue.is_empty() {
+                        request_rx.recv_timeout(Duration::from_millis(250))
+                    } else {
+                        Ok(queue.pop_front().unwrap())
+                    };
+                    match received {
+                        Ok(request) => {
+                            queue.push_back(request);
+                            queue.extend(request_rx.try_iter());
+                            queue.retain(|request| match request {
+                                Request::Scan { generation, .. } => {
+                                    *generation == latest_scan.load(Ordering::Acquire)
                                 }
-                                let _ = event_tx.send(WorkerEvent::Scanned {
+                                _ => true,
+                            });
+                            let priority = |request: &Request| match request {
+                                Request::Changed(_) | Request::WatchFailed(_, _) => 1,
+                                Request::Stop => 0,
+                                Request::Operation { .. }
+                                | Request::Undo { .. }
+                                | Request::BulkRename { .. } => 1,
+                                Request::Scan {
+                                    pane: Pane::Current,
+                                    ..
+                                } => 2,
+                                Request::Scan { .. } => 3,
+                            };
+                            let Some(index) = queue
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, request)| priority(request))
+                                .map(|(index, _)| index)
+                            else {
+                                continue;
+                            };
+                            let request = queue.remove(index).unwrap();
+                            match request {
+                                Request::Scan {
                                     generation,
                                     pane,
                                     directory,
-                                    result,
-                                });
-                            }
-                            Request::Preview {
-                                generation,
-                                request,
-                            } => {
-                                let (preview_tx, preview_rx) = mpsc::sync_channel(1);
-                                let path = request.path.clone();
-                                let thread_request = request.clone();
-                                let spawn = thread::Builder::new()
-                                    .name("caret-file-preview".to_string())
-                                    .spawn(move || {
-                                        let _ = preview_tx.send(preview::generate(&thread_request));
+                                    show_hidden,
+                                    directories_first,
+                                    sort,
+                                } => {
+                                    if pane == Pane::Current
+                                        && watched
+                                            .as_ref()
+                                            .is_none_or(|(_, path, _)| path != &directory)
+                                    {
+                                        let changed = Arc::clone(&dirty);
+                                        let requests = watch_requests.clone();
+                                        let watch_path = directory.clone();
+                                        native = notify::recommended_watcher(
+                                            move |event: notify::Result<notify::Event>| match event
+                                            {
+                                                Err(error) => {
+                                                    let _ = requests.send(Request::WatchFailed(
+                                                        watch_path.clone(),
+                                                        error.to_string(),
+                                                    ));
+                                                }
+                                                Ok(event)
+                                                    if !matches!(
+                                                        event.kind,
+                                                        notify::EventKind::Access(_)
+                                                    ) && !changed
+                                                        .swap(true, Ordering::AcqRel) =>
+                                                {
+                                                    let _ = requests
+                                                        .send(Request::Changed(watch_path.clone()));
+                                                }
+                                                _ => {}
+                                            },
+                                        )
+                                        .ok()
+                                        .and_then(|mut watcher| {
+                                            watcher
+                                                .watch(
+                                                    &directory,
+                                                    notify::RecursiveMode::NonRecursive,
+                                                )
+                                                .ok()
+                                                .map(|()| watcher)
+                                        });
+                                    }
+                                    let result = scan_directory(
+                                        &directory,
+                                        show_hidden,
+                                        directories_first,
+                                        sort,
+                                        &latest_scan,
+                                        generation,
+                                        if pane == Pane::Parent {
+                                            Some(&dirty)
+                                        } else {
+                                            None
+                                        },
+                                    );
+                                    if generation != latest_scan.load(Ordering::Acquire) {
+                                        continue;
+                                    }
+                                    if pane == Pane::Current {
+                                        watched = Some((
+                                            generation,
+                                            directory.clone(),
+                                            if native.is_none() {
+                                                directory_signature(&directory, || {
+                                                    latest_scan.load(Ordering::Acquire)
+                                                        == generation
+                                                })
+                                            } else {
+                                                0
+                                            },
+                                        ));
+                                        fallback_at = Instant::now();
+                                    }
+                                    let _ = event_tx.send(WorkerEvent::Scanned {
+                                        generation,
+                                        pane,
+                                        directory,
+                                        result,
                                     });
-                                let preview = match spawn {
-                                    Ok(_) => match preview_rx.recv_timeout(PREVIEW_TIMEOUT) {
-                                        Ok(preview) => preview,
-                                        Err(_) => {
-                                            request.cancel();
-                                            Preview::Error(
-                                                "preview timed out after 1.5 seconds".to_string(),
-                                            )
+                                }
+                                Request::Operation { request, cancelled } => {
+                                    let id = request.id;
+                                    let kind = request.kind;
+                                    let summary = file_ops::execute(
+                                        &request,
+                                        &cancelled,
+                                        |completed, total, path| {
+                                            let _ = event_tx.send(WorkerEvent::Progress(
+                                                OperationProgress {
+                                                    id,
+                                                    kind,
+                                                    completed,
+                                                    total,
+                                                    current: path.to_path_buf(),
+                                                },
+                                            ));
+                                        },
+                                    );
+                                    let _ = event_tx.send(WorkerEvent::OperationFinished(summary));
+                                }
+                                Request::Undo {
+                                    id,
+                                    record,
+                                    cancelled,
+                                } => {
+                                    let summary = file_ops::execute_undo(
+                                        id,
+                                        &record,
+                                        &cancelled,
+                                        |completed, total, path| {
+                                            let _ = event_tx.send(WorkerEvent::Progress(
+                                                OperationProgress {
+                                                    id,
+                                                    kind: OperationKind::Undo,
+                                                    completed,
+                                                    total,
+                                                    current: path.to_path_buf(),
+                                                },
+                                            ));
+                                        },
+                                    );
+                                    let _ = event_tx.send(WorkerEvent::OperationFinished(summary));
+                                }
+                                Request::BulkRename {
+                                    id,
+                                    pairs,
+                                    cancelled,
+                                } => {
+                                    let summary = file_ops::execute_bulk_rename(
+                                        id,
+                                        &pairs,
+                                        &cancelled,
+                                        |completed, total, path| {
+                                            let _ = event_tx.send(WorkerEvent::Progress(
+                                                OperationProgress {
+                                                    id,
+                                                    kind: OperationKind::BulkRename,
+                                                    completed,
+                                                    total,
+                                                    current: path.to_path_buf(),
+                                                },
+                                            ));
+                                        },
+                                    );
+                                    let _ = event_tx.send(WorkerEvent::OperationFinished(summary));
+                                }
+                                Request::WatchFailed(directory, error) => {
+                                    if watched
+                                        .as_ref()
+                                        .is_some_and(|(_, path, _)| *path == directory)
+                                    {
+                                        native = None;
+                                        fallback_at = Instant::now() - Duration::from_secs(5);
+                                        let _ = crate::diagnostics::append(
+                                            "watcher",
+                                            &format!("file-manager watcher failed: {error}"),
+                                        );
+                                    }
+                                }
+                                Request::Changed(directory) => {
+                                    dirty.store(false, Ordering::Release);
+                                    if let Some((generation, path, _)) = &watched {
+                                        if *path == directory {
+                                            let _ = event_tx.send(WorkerEvent::DirectoryChanged {
+                                                generation: *generation,
+                                                directory,
+                                            });
                                         }
-                                    },
-                                    Err(error) => Preview::Error(format!(
-                                        "could not start preview worker: {error}"
-                                    )),
-                                };
-                                let _ = event_tx.send(WorkerEvent::Previewed {
-                                    generation,
-                                    path,
-                                    preview,
-                                });
+                                    }
+                                }
+                                Request::Stop => break,
                             }
-                            Request::Operation { request, cancelled } => {
-                                let id = request.id;
-                                let kind = request.kind;
-                                let summary = file_ops::execute(
-                                    &request,
-                                    &cancelled,
-                                    |completed, total, path| {
-                                        let _ = event_tx.send(WorkerEvent::Progress(
-                                            OperationProgress {
-                                                id,
-                                                kind,
-                                                completed,
-                                                total,
-                                                current: path.to_path_buf(),
-                                            },
-                                        ));
-                                    },
-                                );
-                                let _ = event_tx.send(WorkerEvent::OperationFinished(summary));
-                            }
-                            Request::Undo {
-                                id,
-                                record,
-                                cancelled,
-                            } => {
-                                let summary = file_ops::execute_undo(
-                                    id,
-                                    &record,
-                                    &cancelled,
-                                    |completed, total, path| {
-                                        let _ = event_tx.send(WorkerEvent::Progress(
-                                            OperationProgress {
-                                                id,
-                                                kind: OperationKind::Undo,
-                                                completed,
-                                                total,
-                                                current: path.to_path_buf(),
-                                            },
-                                        ));
-                                    },
-                                );
-                                let _ = event_tx.send(WorkerEvent::OperationFinished(summary));
-                            }
-                            Request::BulkRename {
-                                id,
-                                pairs,
-                                cancelled,
-                            } => {
-                                let summary = file_ops::execute_bulk_rename(
-                                    id,
-                                    &pairs,
-                                    &cancelled,
-                                    |completed, total, path| {
-                                        let _ = event_tx.send(WorkerEvent::Progress(
-                                            OperationProgress {
-                                                id,
-                                                kind: OperationKind::BulkRename,
-                                                completed,
-                                                total,
-                                                current: path.to_path_buf(),
-                                            },
-                                        ));
-                                    },
-                                );
-                                let _ = event_tx.send(WorkerEvent::OperationFinished(summary));
-                            }
-                            Request::Stop => break,
-                        },
+                        }
                         Err(RecvTimeoutError::Timeout) => {
                             let Some((generation, directory, signature)) = watched.as_mut() else {
                                 continue;
                             };
-                            let current = directory_signature(directory);
+                            let signalled = dirty.swap(false, Ordering::AcqRel);
+                            if native.is_some() && !signalled {
+                                continue;
+                            }
+                            if native.is_none() && fallback_at.elapsed() < Duration::from_secs(5) {
+                                continue;
+                            }
+                            fallback_at = Instant::now();
+                            let current = if native.is_some() {
+                                signature.wrapping_add(1)
+                            } else {
+                                directory_signature(directory, || {
+                                    latest_scan.load(Ordering::Acquire) == *generation
+                                })
+                            };
                             if current != *signature {
                                 *signature = current;
                                 let _ = event_tx.send(WorkerEvent::DirectoryChanged {
@@ -282,6 +390,7 @@ impl Worker {
                                 });
                             }
                         }
+
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
@@ -290,12 +399,15 @@ impl Worker {
         Self {
             tx: request_tx,
             rx: event_rx,
+            scan_generation,
+            buffered: VecDeque::new(),
         }
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        self.scan_generation.store(u64::MAX, Ordering::Release);
         let _ = self.tx.send(Request::Stop);
     }
 }
@@ -306,6 +418,8 @@ pub enum ActivateResult {
     OpenFile(PathBuf),
     EnteredDirectory(PathBuf),
 }
+
+type PreviewWorker = crate::worker::LatestWorker<(u64, PreviewRequest), (u64, PathBuf, Preview)>;
 
 pub struct FileManager {
     pub current_dir: PathBuf,
@@ -338,6 +452,8 @@ pub struct FileManager {
     max_preview_bytes: usize,
     max_preview_lines: usize,
     worker: Worker,
+    preview_worker: PreviewWorker,
+    preview_started: Arc<Mutex<Option<(u64, Instant)>>>,
     snapshots: HashMap<PathBuf, Vec<FileEntry>>,
     pending_selection: Option<PathBuf>,
     undo_stack: Vec<UndoRecord>,
@@ -346,6 +462,15 @@ pub struct FileManager {
 impl FileManager {
     pub fn new(root: PathBuf) -> io::Result<Self> {
         let current_dir = normalize_directory(root)?;
+        let preview_started = Arc::new(Mutex::new(None));
+        let started = Arc::clone(&preview_started);
+        let preview_worker =
+            PreviewWorker::new("caret-preview", move |(generation, mut request), _| {
+                request.start_timeout(PREVIEW_TIMEOUT);
+                *started.lock().unwrap() = Some((generation, Instant::now()));
+                let preview = preview::generate(&request);
+                (generation, request.path, preview)
+            });
         let mut manager = Self {
             current_dir,
             parent_entries: Vec::new(),
@@ -377,6 +502,8 @@ impl FileManager {
             max_preview_bytes: 256 * 1024,
             max_preview_lines: 200,
             worker: Worker::new(),
+            preview_worker,
+            preview_started,
             snapshots: HashMap::new(),
             pending_selection: None,
             undo_stack: Vec::new(),
@@ -451,6 +578,9 @@ impl FileManager {
 
     pub fn refresh(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.worker
+            .scan_generation
+            .store(self.generation, Ordering::Release);
         self.loading = true;
         self.error = None;
         let generation = self.generation;
@@ -464,8 +594,38 @@ impl FileManager {
 
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
+        if let Some((generation, path, preview)) = self.preview_worker.poll() {
+            if generation == self.preview_generation && self.selected_path() == Some(path.as_path())
+            {
+                self.preview = preview;
+                changed = true;
+            }
+        }
+        if matches!(self.preview, Preview::Loading)
+            && self
+                .preview_started
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(generation, started)| {
+                    *generation == self.preview_generation && started.elapsed() >= PREVIEW_TIMEOUT
+                })
+        {
+            if let Some(cancelled) = &self.preview_cancel {
+                cancelled.store(true, Ordering::Release);
+            }
+            self.preview_worker.cancel();
+            self.preview = Preview::Error("preview timed out after 1.5 seconds".to_string());
+            changed = true;
+        }
         loop {
-            match self.worker.rx.try_recv() {
+            match self
+                .worker
+                .buffered
+                .pop_front()
+                .map(Ok)
+                .unwrap_or_else(|| self.worker.rx.try_recv())
+            {
                 Ok(WorkerEvent::Scanned {
                     generation,
                     pane,
@@ -501,16 +661,6 @@ impl FileManager {
                     }
                     changed = true;
                 }
-                Ok(WorkerEvent::Previewed {
-                    generation,
-                    path,
-                    preview,
-                }) if generation == self.preview_generation
-                    && self.selected_path() == Some(path.as_path()) =>
-                {
-                    self.preview = preview;
-                    changed = true;
-                }
                 Ok(WorkerEvent::Progress(progress)) => {
                     self.progress = Some(progress);
                     changed = true;
@@ -540,6 +690,19 @@ impl FileManager {
             }
         }
         changed
+    }
+
+    #[cfg(test)]
+    fn wait_for_update(&mut self) {
+        if self.worker.buffered.is_empty() {
+            let event = self
+                .worker
+                .rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("file-manager event");
+            self.worker.buffered.push_back(event);
+        }
+        self.poll();
     }
 
     pub fn visible_entries(&self) -> Vec<&FileEntry> {
@@ -818,8 +981,7 @@ impl FileManager {
         let cancelled = Arc::new(AtomicBool::new(false));
         if self
             .worker
-            .tx
-            .send(Request::Undo {
+            .send_operation(Request::Undo {
                 id,
                 record: record.clone(),
                 cancelled: cancelled.clone(),
@@ -843,8 +1005,7 @@ impl FileManager {
         let cancelled = Arc::new(AtomicBool::new(false));
         if self
             .worker
-            .tx
-            .send(Request::BulkRename {
+            .send_operation(Request::BulkRename {
                 id,
                 pairs,
                 cancelled: cancelled.clone(),
@@ -893,8 +1054,7 @@ impl FileManager {
         let cancelled = Arc::new(AtomicBool::new(false));
         if self
             .worker
-            .tx
-            .send(Request::Operation {
+            .send_operation(Request::Operation {
                 request: request.clone(),
                 cancelled: cancelled.clone(),
             })
@@ -949,6 +1109,7 @@ impl FileManager {
             cancelled.store(true, Ordering::Relaxed);
         }
         self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.preview_worker.cancel();
         if !self.preview_enabled {
             self.preview = Preview::Empty;
             return;
@@ -960,16 +1121,16 @@ impl FileManager {
         self.preview = Preview::Loading;
         let cancelled = Arc::new(AtomicBool::new(false));
         self.preview_cancel = Some(cancelled.clone());
-        let _ = self.worker.tx.send(Request::Preview {
-            generation: self.preview_generation,
-            request: PreviewRequest::new(
+        self.preview_worker.submit((
+            self.preview_generation,
+            PreviewRequest::new(
                 path,
                 self.max_preview_bytes,
                 self.max_preview_lines,
                 PREVIEW_TIMEOUT,
                 cancelled,
             ),
-        });
+        ));
     }
 
     fn restore_selection(&mut self, selected_path: Option<&Path>) {
@@ -1007,6 +1168,17 @@ impl FileManager {
     }
 }
 
+impl Drop for FileManager {
+    fn drop(&mut self) {
+        if let Some(cancelled) = &self.preview_cancel {
+            cancelled.store(true, Ordering::Release);
+        }
+        if let Some(cancelled) = &self.cancel_operation {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
 fn normalize_directory(path: PathBuf) -> io::Result<PathBuf> {
     let path = if path.is_absolute() {
         path
@@ -1041,9 +1213,17 @@ fn scan_directory(
     show_hidden: bool,
     directories_first: bool,
     sort: SortMode,
+    latest: &AtomicU64,
+    generation: u64,
+    cancelled: Option<&AtomicBool>,
 ) -> io::Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
     for result in fs::read_dir(directory)?.take(MAX_DIRECTORY_ENTRIES) {
+        if latest.load(Ordering::Acquire) != generation
+            || cancelled.is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "obsolete scan"));
+        }
         let entry = result?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let hidden = is_hidden(&entry.path(), &name);
@@ -1065,47 +1245,42 @@ fn scan_directory(
                 .map(|duration| duration.as_secs()),
         });
     }
-    entries.sort_by(|left, right| {
-        let directory_order = if directories_first {
-            right.is_dir.cmp(&left.is_dir)
-        } else {
-            std::cmp::Ordering::Equal
-        };
-        directory_order.then_with(|| match sort {
-            SortMode::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
-            SortMode::Size => left
-                .size
-                .cmp(&right.size)
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase())),
-            SortMode::Modified => right
-                .modified_unix_secs
-                .cmp(&left.modified_unix_secs)
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase())),
-        })
+    entries.sort_by_cached_key(|entry| {
+        (
+            directories_first && !entry.is_dir,
+            match sort {
+                SortMode::Name => 0,
+                SortMode::Size => entry.size,
+                SortMode::Modified => u64::MAX - entry.modified_unix_secs.unwrap_or(0),
+            },
+            entry.name.to_lowercase(),
+        )
     });
     Ok(entries)
 }
 
-fn directory_signature(directory: &Path) -> u64 {
+fn directory_signature(directory: &Path, current: impl Fn() -> bool) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    let mut rows = match fs::read_dir(directory) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| {
-                let metadata = fs::symlink_metadata(entry.path()).ok();
-                (
-                    entry.file_name(),
-                    metadata.as_ref().map(|value| value.len()),
-                    metadata
-                        .and_then(|value| value.modified().ok())
-                        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                        .map(|value| value.as_nanos()),
-                )
-            })
-            .collect::<Vec<_>>(),
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
         Err(error) => return error.raw_os_error().unwrap_or(-1) as u64,
     };
+    let mut rows = Vec::new();
+    for entry in entries.take(MAX_DIRECTORY_ENTRIES).filter_map(Result::ok) {
+        if !current() {
+            break;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).ok();
+        rows.push((
+            entry.file_name(),
+            metadata.as_ref().map(|value| value.len()),
+            metadata
+                .and_then(|value| value.modified().ok())
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos()),
+        ));
+    }
     rows.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     rows.hash(&mut hasher);
@@ -1177,7 +1352,6 @@ pub fn unix_time_label(seconds: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1191,14 +1365,10 @@ mod tests {
     }
 
     fn poll_until_loaded(manager: &mut FileManager) {
-        for _ in 0..100 {
-            manager.poll();
-            if !manager.loading {
-                return;
-            }
-            thread::sleep(Duration::from_millis(5));
+        manager.poll();
+        while manager.loading {
+            manager.wait_for_update();
         }
-        panic!("manager did not finish scanning");
     }
 
     #[test]
@@ -1235,13 +1405,7 @@ mod tests {
             sort: SortMode::Size,
         });
 
-        for _ in 0..100 {
-            manager.poll();
-            if !manager.loading {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        poll_until_loaded(&mut manager);
 
         assert_eq!(manager.current_dir, nested.canonicalize().unwrap());
         let expected_selected = selected.canonicalize().unwrap();
@@ -1265,27 +1429,19 @@ mod tests {
             .position(|entry| entry.name == "note.txt")
             .unwrap();
         assert!(manager.duplicate(ConflictPolicy::Rename));
-        for _ in 0..100 {
-            manager.poll();
-            if manager.last_operation.is_some() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
+        while manager.last_operation.is_none() {
+            manager.wait_for_update();
         }
         let copy = root.join("note copy.txt");
         assert!(copy.exists());
 
         assert!(manager.undo_last_operation());
-        for _ in 0..100 {
-            manager.poll();
-            if manager
-                .last_operation
-                .as_ref()
-                .is_some_and(|summary| summary.kind == OperationKind::Undo)
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
+        while manager
+            .last_operation
+            .as_ref()
+            .is_none_or(|summary| summary.kind != OperationKind::Undo)
+        {
+            manager.wait_for_update();
         }
         assert!(!copy.exists());
         assert_eq!(
@@ -1371,19 +1527,40 @@ mod tests {
         poll_until_loaded(&mut manager);
         fs::write(root.join("after.txt"), "after").unwrap();
 
-        for _ in 0..200 {
-            manager.poll();
-            if manager
-                .entries
-                .iter()
-                .any(|entry| entry.name == "after.txt")
-            {
-                let _ = fs::remove_dir_all(root);
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
+        while !manager
+            .entries
+            .iter()
+            .any(|entry| entry.name == "after.txt")
+        {
+            manager.wait_for_update();
         }
         let _ = fs::remove_dir_all(root);
-        panic!("watcher did not invalidate the active directory");
+    }
+    #[test]
+    fn large_parent_scans_do_not_block_current_navigation_or_operations() {
+        let parent = temp_dir("large-parent");
+        for index in 0..1_000 {
+            fs::write(parent.join(format!("entry-{index}")), "data").unwrap();
+        }
+        let a = parent.join("a");
+        let b = parent.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(b.join("latest.txt"), "latest").unwrap();
+        let mut manager = FileManager::new(a.clone()).unwrap();
+        for _ in 0..10 {
+            manager.go_to(b.clone()).unwrap();
+            manager.go_to(a.clone()).unwrap();
+        }
+        manager.go_to(b.clone()).unwrap();
+        poll_until_loaded(&mut manager);
+        assert_eq!(manager.current_dir, b.canonicalize().unwrap());
+        assert_eq!(manager.entries.len(), 1);
+        assert!(manager.duplicate(ConflictPolicy::Rename));
+        while manager.last_operation.is_none() {
+            manager.wait_for_update();
+        }
+        assert!(b.join("latest copy.txt").exists());
+        fs::remove_dir_all(parent).unwrap();
     }
 }

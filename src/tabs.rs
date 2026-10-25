@@ -155,6 +155,16 @@ impl Tabs {
         self.tabs.is_empty()
     }
 
+    pub fn index_for_document(&self, document: u64) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.editor.stamp().0 == document)
+    }
+
+    pub fn editor_at(&self, index: usize) -> Option<&Editor> {
+        self.tabs.get(index).map(|tab| &tab.editor)
+    }
+
     pub fn active_index(&self) -> usize {
         self.active
     }
@@ -214,14 +224,7 @@ impl Tabs {
     /// moved directory. Buffer contents and dirty state are preserved.
     pub fn remap_paths(&mut self, source: &Path, destination: &Path) {
         for tab in &mut self.tabs {
-            let Some(path) = tab.editor.path.as_mut() else {
-                continue;
-            };
-            if path == source {
-                *path = destination.to_path_buf();
-            } else if let Ok(relative) = path.strip_prefix(source) {
-                *path = destination.join(relative);
-            }
+            tab.editor.remap_path(source, destination);
         }
     }
 
@@ -396,20 +399,17 @@ impl Tabs {
         (saved, errors)
     }
 
-    pub fn dirty_recovery_entries(&self) -> Vec<crate::recovery::RecoveryEntry> {
+    pub fn recovery_snapshots(&self) -> Vec<crate::recovery::Snapshot> {
         self.tabs
             .iter()
             .filter(|tab| tab.editor.dirty)
-            .map(|tab| {
-                crate::recovery::entry(
-                    tab.editor.path.clone(),
-                    tab.editor.text(),
-                    tab.editor.cursor,
-                )
+            .map(|tab| crate::recovery::Snapshot {
+                path: tab.editor.path.clone(),
+                text: tab.editor.snapshot_buffer(),
+                cursor: tab.editor.cursor,
             })
             .collect()
     }
-
     fn active_options(&self) -> crate::editor::EditorOptions {
         self.tabs
             .get(self.active)

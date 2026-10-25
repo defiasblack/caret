@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use crossterm::style::Color;
 use tree_sitter::{
@@ -133,6 +134,8 @@ pub struct SyntaxDocument {
     indent_query: Option<Query>,
     source: String,
     line_starts: Vec<usize>,
+    folds: OnceLock<Arc<[(usize, usize)]>>,
+    symbols_cache: OnceLock<Arc<[Symbol]>>,
 }
 
 impl SyntaxDocument {
@@ -153,6 +156,8 @@ impl SyntaxDocument {
             indent_query,
             source: source.to_string(),
             line_starts: line_start_offsets(source),
+            folds: OnceLock::new(),
+            symbols_cache: OnceLock::new(),
         })
     }
 
@@ -160,11 +165,25 @@ impl SyntaxDocument {
         self.language
     }
 
+    #[cfg(test)]
     pub fn apply_edit(&mut self, at: usize, removed_chars: usize, inserted: &str) {
-        let start_byte = char_index_to_byte(&self.source, at);
-        let old_end_byte = char_index_to_byte(&self.source, at.saturating_add(removed_chars));
-        let start_position = point_at_byte(&self.source, start_byte);
-        let old_end_position = point_at_byte(&self.source, old_end_byte);
+        let start = char_index_to_byte(&self.source, at);
+        let end = char_index_to_byte(&self.source, at.saturating_add(removed_chars));
+        self.apply_byte_edit(start, end, inserted);
+    }
+
+    pub fn apply_byte_edit(&mut self, start_byte: usize, old_end_byte: usize, inserted: &str) {
+        self.folds.take();
+        self.symbols_cache.take();
+        let point = |byte: usize| {
+            let row = self
+                .line_starts
+                .partition_point(|offset| *offset <= byte)
+                .saturating_sub(1);
+            Point::new(row, byte - self.line_starts[row])
+        };
+        let start_position = point(start_byte);
+        let old_end_position = point(old_end_byte);
         let new_end_position = point_after_text(start_position, inserted);
         let new_end_byte = start_byte + inserted.len();
         self.tree.edit(&InputEdit {
@@ -230,19 +249,23 @@ impl SyntaxDocument {
         colors
     }
 
-    pub fn fold_ranges(&self) -> Vec<(usize, usize)> {
-        let root = self.tree.root_node();
-        let mut ranges = Vec::new();
-        collect_fold_ranges(root, root.id(), &mut ranges);
-        ranges.sort_unstable();
-        ranges.dedup();
-        ranges
+    pub fn fold_ranges(&self) -> Arc<[(usize, usize)]> {
+        Arc::clone(self.folds.get_or_init(|| {
+            let root = self.tree.root_node();
+            let mut ranges = Vec::new();
+            collect_fold_ranges(root, root.id(), &mut ranges);
+            ranges.sort_unstable();
+            ranges.dedup();
+            ranges.into()
+        }))
     }
 
-    pub fn symbols(&self) -> Vec<Symbol> {
-        let mut output = Vec::new();
-        collect_symbols(self.tree.root_node(), &self.source, 0, &mut output);
-        output
+    pub fn symbols(&self) -> Arc<[Symbol]> {
+        Arc::clone(self.symbols_cache.get_or_init(|| {
+            let mut output = Vec::new();
+            collect_symbols(self.tree.root_node(), &self.source, 0, &mut output);
+            output.into()
+        }))
     }
 
     pub fn matching_bracket(&self, cursor_char: usize) -> Option<usize> {
@@ -696,6 +719,7 @@ fn symbol_kind(kind: &str) -> Option<&'static str> {
         | "enum_declaration"
         | "record_declaration" => Some("type"),
         "function_declaration"
+        | "function_item"
         | "function_definition"
         | "method_declaration"
         | "constructor_declaration" => Some("function"),
@@ -745,16 +769,6 @@ fn char_index_to_byte(text: &str, index: usize) -> usize {
     text.char_indices()
         .nth(index)
         .map_or(text.len(), |(byte, _)| byte)
-}
-
-fn point_at_byte(text: &str, byte: usize) -> Point {
-    let byte = byte.min(text.len());
-    let prefix = &text[..byte];
-    let row = prefix.bytes().filter(|byte| *byte == b'\n').count();
-    let column = prefix
-        .rfind('\n')
-        .map_or(prefix.len(), |newline| prefix.len() - newline - 1);
-    Point::new(row, column)
 }
 
 fn point_after_text(start: Point, text: &str) -> Point {
@@ -1490,6 +1504,46 @@ mod tests {
                 }
             }
             eprintln!("100 draws of 30 lines near {start}: {:?}", at.elapsed());
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_regressions {
+    use super::*;
+    #[test]
+    fn metadata_is_shared_until_a_byte_edit_invalidates_it() {
+        let mut syntax =
+            SyntaxDocument::new(Some(Path::new("test.rs")), "fn old() {\n}\n").unwrap();
+        let folds = syntax.fold_ranges();
+        let symbols = syntax.symbols();
+        assert!(Arc::ptr_eq(&folds, &syntax.fold_ranges()));
+        assert!(Arc::ptr_eq(&symbols, &syntax.symbols()));
+        syntax.apply_byte_edit(0, 0, "fn added() {}\n");
+        assert!(!Arc::ptr_eq(&folds, &syntax.fold_ranges()));
+        assert!(!Arc::ptr_eq(&symbols, &syntax.symbols()));
+        assert!(syntax.symbols().iter().any(|symbol| symbol.name == "added"));
+    }
+    #[test]
+    #[ignore = "manual release performance benchmark"]
+    fn benchmark_cached_metadata_and_byte_edits() {
+        use std::{hint::black_box, time::Instant};
+        for lines in [1_000, 20_000] {
+            let source = "fn f() { let value = 1; }\n".repeat(lines);
+            let mut syntax = SyntaxDocument::new(Some(Path::new("bench.rs")), &source).unwrap();
+            black_box(syntax.fold_ranges());
+            black_box(syntax.symbols());
+            let start = Instant::now();
+            for _ in 0..50 {
+                black_box(syntax.fold_ranges());
+                black_box(syntax.symbols());
+            }
+            let metadata = start.elapsed();
+            let start = Instant::now();
+            for _ in 0..50 {
+                syntax.apply_byte_edit(source.len() - 1, source.len() - 1, " ");
+            }
+            eprintln!("{lines} lines, 50 warm fold+symbol lookups: {metadata:?}; 50 byte edits near EOF: {:?}", start.elapsed());
         }
     }
 }

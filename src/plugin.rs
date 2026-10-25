@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -78,7 +79,7 @@ struct LoadedPlugin {
     manifest: PluginManifest,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PluginRegistry {
     plugins: Vec<LoadedPlugin>,
     errors: Vec<String>,
@@ -241,7 +242,16 @@ impl PluginRegistry {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn run(&self, name: &str, context: &PluginContext) -> Result<PluginResponse, String> {
+        self.run_cancelled(name, context, &AtomicBool::new(false))
+    }
+    pub fn run_cancelled(
+        &self,
+        name: &str,
+        context: &PluginContext,
+        cancelled: &AtomicBool,
+    ) -> Result<PluginResponse, String> {
         let (plugin, command) = self
             .plugins
             .iter()
@@ -254,11 +264,28 @@ impl PluginRegistry {
                     .map(|command| (plugin, command))
             })
             .ok_or_else(|| format!("Unknown plugin command: {name}"))?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(format!("Plugin {name} cancelled"));
+        }
         let program = resolve_program(&plugin.directory, &command.program);
         let payload =
             serde_json::to_vec(context).map_err(|error| format!("Plugin input failed: {error}"))?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(format!("Plugin {name} cancelled"));
+        }
         let deadline = Instant::now() + Duration::from_millis(command.timeout_ms.max(100));
-        let child = Command::new(&program)
+        let mut process = Command::new(&program);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            process.process_group(0);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            process.creation_flags(0x08000000);
+        }
+        let child = process
             .args(&command.args)
             .current_dir(&plugin.directory)
             .stdin(Stdio::piped())
@@ -266,10 +293,11 @@ impl PluginRegistry {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("Could not start plugin command {name}: {error}"))?;
-        let mut guard = PluginChild(child);
-        let mut input = guard.0.stdin.take().expect("piped stdin");
-        let output = guard.0.stdout.take().expect("piped stdout");
-        let errors = guard.0.stderr.take().expect("piped stderr");
+        let mut guard = PluginChild::new(child)
+            .map_err(|error| format!("Could not supervise plugin: {error}"))?;
+        let mut input = guard.child.stdin.take().expect("piped stdin");
+        let output = guard.child.stdout.take().expect("piped stdout");
+        let errors = guard.child.stderr.take().expect("piped stderr");
         let (sender, receiver) = std::sync::mpsc::channel();
         let writer_sender = sender.clone();
         thread::spawn(move || {
@@ -284,6 +312,9 @@ impl PluginRegistry {
         drain_plugin_pipe(errors, sender, 2);
         let mut streams: [Option<Vec<u8>>; 3] = [None, None, None];
         let status = loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(format!("Plugin {name} cancelled"));
+            }
             if Instant::now() >= deadline {
                 return Err(format!(
                     "Plugin {name} timed out after {} ms",
@@ -295,7 +326,7 @@ impl PluginRegistry {
                     Some(result.map_err(|error| format!("Plugin I/O failed: {error}"))?);
             }
             let exited = guard
-                .0
+                .child
                 .try_wait()
                 .map_err(|error| format!("Plugin command failed: {error}"))?;
             if let Some(status) = exited {
@@ -324,24 +355,114 @@ impl PluginRegistry {
     }
 }
 
-struct PluginChild(std::process::Child);
+struct PluginChild {
+    child: std::process::Child,
+    #[cfg(windows)]
+    job: Option<std::os::windows::io::OwnedHandle>,
+}
+impl PluginChild {
+    fn new(child: std::process::Child) -> io::Result<Self> {
+        let guard = Self {
+            child,
+            #[cfg(windows)]
+            job: None,
+        };
+        #[cfg(windows)]
+        let mut guard = guard;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            use windows_sys::Win32::System::JobObjects::*;
+            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if job.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            guard.job = Some(unsafe { OwnedHandle::from_raw_handle(job) });
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &limits as *const _ as *const _,
+                    std::mem::size_of_val(&limits) as u32,
+                )
+            } == 0
+                || unsafe { AssignProcessToJobObject(job, guard.child.as_raw_handle()) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(guard)
+    }
+}
 impl Drop for PluginChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        #[cfg(windows)]
+        {
+            self.job.take();
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(self.child.id() as i32, libc::SIGKILL);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
+fn read_plugin_pipe(pipe: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::other(format!(
+            "plugin output exceeds {} byte budget",
+            limit
+        )));
+    }
+    Ok(bytes)
+}
+
 fn drain_plugin_pipe(
-    mut pipe: impl Read + Send + 'static,
+    pipe: impl Read + Send + 'static,
     sender: std::sync::mpsc::Sender<(usize, io::Result<Vec<u8>>)>,
     index: usize,
 ) {
     thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        let result = read_plugin_pipe(
+            pipe,
+            if index == 1 {
+                STDOUT_BYTES
+            } else {
+                STDERR_BYTES
+            },
+        );
         let _ = sender.send((index, result));
     });
+}
+
+pub const STDOUT_BYTES: usize = 64 * 1024 * 1024;
+pub const STDERR_BYTES: usize = 4 * 1024 * 1024;
+pub struct PluginRun {
+    pub registry: PluginRegistry,
+    pub name: String,
+    pub context: PluginContext,
+    pub text: ropey::Rope,
+    pub selection: Option<(usize, usize)>,
+}
+pub type PluginWorker = crate::worker::LatestWorker<PluginRun, Result<PluginResponse, String>>;
+pub fn worker() -> PluginWorker {
+    PluginWorker::new("caret-plugin", |mut run, cancelled| {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("Plugin cancelled".to_string());
+        }
+        run.context.text = run.text.to_string();
+        run.context.selection = run
+            .selection
+            .map(|(start, end)| run.text.slice(start..end).to_string());
+        run.registry
+            .run_cancelled(&run.name, &run.context, cancelled)
+    })
 }
 
 fn default_timeout_ms() -> u64 {
@@ -535,7 +656,7 @@ mod tests {
             .spawn()
             .unwrap();
         let id = child.id();
-        drop(PluginChild(child));
+        drop(PluginChild::new(child).unwrap());
         #[cfg(unix)]
         unsafe {
             assert_eq!(
@@ -557,5 +678,26 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "timed-out child still running");
         }
+    }
+    #[test]
+    fn pipe_output_budget_accepts_boundary_and_stops_unbounded_streams() {
+        assert_eq!(read_plugin_pipe(&b"12345678"[..], 8).unwrap(), b"12345678");
+        assert!(read_plugin_pipe(std::io::repeat(b'x'), 8)
+            .unwrap_err()
+            .to_string()
+            .contains("budget"));
+    }
+    #[test]
+    fn overflowing_stderr_terminates_the_command() {
+        #[cfg(windows)]
+        let script = "[Console]::Error.Write(('e' * 4194305)); Start-Sleep -Seconds 30";
+        #[cfg(unix)]
+        let script = "head -c 4194305 /dev/zero >&2; sleep 30";
+        let (registry, mut context) = shell_registry(script, 15000);
+        context.text.clear();
+        assert!(registry
+            .run("test", &context)
+            .unwrap_err()
+            .contains("budget"));
     }
 }
